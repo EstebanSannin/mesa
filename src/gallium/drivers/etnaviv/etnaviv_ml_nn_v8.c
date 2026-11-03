@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include <time.h>
 #include "util/u_inlines.h"
 #include "util/u_math.h"
@@ -110,8 +111,10 @@ etna_ml_calculate_tiling_v8(struct etna_screen *screen, const struct etna_operat
    unsigned input_width = operation->input_width;
    unsigned input_height = operation->input_height;
    unsigned input_channels = operation->input_channels;
-   unsigned output_width = operation->output_width;
-   unsigned output_height = operation->output_height;
+   /* Local experiment: with ETNA_PW_RESHAPE, tile in the hardware orientation (create_nn_config swaps width and height) */
+   bool hw_orient = getenv("ETNA_PW_RESHAPE") != NULL;
+   unsigned output_width = hw_orient ? operation->output_height : operation->output_width;
+   unsigned output_height = hw_orient ? operation->output_width : operation->output_height;
    unsigned output_channels = operation->output_channels;
    unsigned tile_width;
    unsigned tile_height;
@@ -136,9 +139,17 @@ etna_ml_calculate_tiling_v8(struct etna_screen *screen, const struct etna_operat
 
    /* This gets us the best performance on MobileDet */
    /* TODO: Find the optimal value, or at least let the user override it */
-   tile_height = MIN2(tile_height, 4);
+   /* Local experiment: ETNA_TILE_H_MAX caps all layers. ETNA_TILE_BIG_KB=<n> uses 16-row tiles for layers with
+    * more than n KB of weights (each tile re-reads the kernels that don't fit in SRAM), 4 rows otherwise. */
+   const char *thm = getenv("ETNA_TILE_H_MAX");
+   const char *big = getenv("ETNA_TILE_BIG_KB");
+   unsigned cap = thm ? MAX2(atoi(thm), 1) : 4;
+   if (big && operation->weight_tensor_size > (unsigned)atoi(big) * 1024)
+      cap = getenv("ETNA_TILE_BIG_ROWS") ? MAX2(atoi(getenv("ETNA_TILE_BIG_ROWS")), 1) : 16;
+   tile_height = MIN2(tile_height, cap);
 
-   if (operation->stride > 1 && tile_height % 2 > 0)
+   if (operation->stride > 1 && tile_height % 2 > 0 &&
+       !(getenv("ETNA_ODD_TILE") && tile_height == output_height))
       tile_height -= 1;
 
    tile_height = MAX2(tile_height, 1);

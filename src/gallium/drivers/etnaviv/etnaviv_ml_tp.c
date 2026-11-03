@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include "hw/state.xml.h"
 #include "util/u_inlines.h"
 
@@ -1303,6 +1304,133 @@ create_log_lut_bo(struct etna_ml_subgraph *subgraph,
    return pwl_lut;
 }
 
+/* Max pooling on the TP ALU, with the fields the blob uses for 3x3 windows: processing 3 for stride 2 and 1 for
+ * stride 1, count = window - 1, stride - 1. Input tiles of up to 64 columns, 16 output rows, channels split
+ * among the TP cores. The input window covers TFLite's SAME padding. */
+#define MAXPOOL_TILE_ROWS 32
+
+static struct etna_bo *
+create_maxpool_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation,
+                      unsigned tp_core, unsigned tp_cores_used)
+{
+   struct etna_bo *bo = etna_ml_create_bo(subgraph->screen, sizeof(struct etna_tp_params));
+   unsigned W = operation->input_height, H = operation->input_width;
+   unsigned Wo = operation->output_height, Ho = operation->output_width;
+   unsigned k = operation->weight_width, s = operation->stride;
+   unsigned cols = (64 - k) / s + 1, rows = getenv("ETNA_MP_ROWS") ? atoi(getenv("ETNA_MP_ROWS")) : MAXPOOL_TILE_ROWS;
+   unsigned z0 = 0, zc = 0, remaining = operation->input_channels;
+
+   for (unsigned i = 0; i <= tp_core; i++) {
+      z0 += zc;
+      zc = DIV_ROUND_UP(remaining, tp_cores_used - i);
+      remaining -= zc;
+   }
+
+   etna_bo_cpu_prep(bo, DRM_ETNA_PREP_WRITE);
+   struct etna_tp_params *map = etna_bo_map(bo);
+   set_default_tp_config(map);
+
+   map->in_image_x_size = W;
+   map->in_image_y_size = H;
+   map->in_image_z_size = zc;
+   map->in_image_stride = W;
+   map->in_image_slice = W * H;
+   map->in_window_x_start = (uint16_t)(0 - operation->pad_before_x);
+   map->in_window_y_start = (uint16_t)(0 - operation->pad_before_y);
+   map->in_window_x_end = (Wo - 1) * s + k - 1 - operation->pad_before_x;
+   map->in_window_y_end = (Ho - 1) * s + k - 1 - operation->pad_before_y;
+   map->in_tile_x_size = (cols - 1) * s + k;
+   map->in_tile_x_inc = cols * s;
+   map->in_tile_y_size = (rows - 1) * s + k;
+   map->in_tile_y_inc = rows * s;
+   map->in_image_border_mode = 0x1;
+
+   /* 3 for overlapping stride-2 windows (3x3/2, from the blob), 1 otherwise (3x3/1 from the blob, 2x2/2 tested) */
+   unsigned proc = (s == 2 && k == 3) ? 0x3 : 0x1;
+   map->alu_horz_processing = proc;
+   map->alu_horz_proc_count = k - 1;
+   map->alu_horz_proc_stride = s - 1;
+   map->alu_vert_processing = proc;
+   map->alu_vert_proc_count = k - 1;
+   map->alu_vert_proc_stride = s - 1;
+   map->alu_load_pwl_lut_global_mem = 0x1;
+
+   struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
+   unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
+   map->in_image_base_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset + z0 * W * H;
+
+   struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
+   offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
+   map->out_image_base_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset + z0 * Wo * Ho;
+
+   map->out_loop_0_inc = 0x0;
+   map->out_loop_0_count = 0x1;
+   map->out_loop_1_inc = 0x1;
+   map->out_loop_1_count = 0x0;
+   map->out_loop_2_inc = Wo;
+   map->out_loop_2_count = 0x0;
+   map->out_loop_3_inc = cols;
+   map->out_loop_3_count = DIV_ROUND_UP(Wo, cols);
+   map->out_loop_4_inc = rows * Wo;
+   map->out_loop_4_count = DIV_ROUND_UP(Ho, rows);
+   map->out_loop_5_inc = 0x0;
+   map->out_loop_5_count = 0x1;
+   map->out_loop_6_inc = Wo * Ho;
+   map->out_loop_1_reset = 0x1;
+   map->out_loop_2_reset = 0x1;
+
+   map->in_image_circular_buf_size = 0x0;
+   map->in_image_circular_buf_end_address_plus_1 = 0xFFFFFFFF >> 6;
+   map->out_image_circular_buf_size = 0x0;
+   map->out_image_circular_buf_end_address_plus_1 = 0xFFFFFFFF >> 6;
+   map->in_zp = 0x0;
+   map->out_zp = 0x0;
+
+   if (tp_cores_used > 1)
+      map->no_flush = tp_core < tp_cores_used - 1;
+
+   etna_bo_cpu_fini(bo);
+
+   return bo;
+}
+
+void
+etna_ml_lower_maxpool(struct etna_ml_subgraph *subgraph,
+                      const struct pipe_ml_operation *pool,
+                      struct etna_operation *operation)
+{
+   const struct pipe_tensor *in = pool->input_tensors[0];
+   const struct pipe_tensor *out = pool->output_tensors[0];
+
+   operation->type = ETNA_JOB_TYPE_TP;
+   operation->tp_type = ETNA_ML_TP_MAXPOOL;
+
+   operation->input_tensors[0] = in->index;
+   operation->input_count = 1;
+   operation->input_width = in->dims[1];
+   operation->input_height = in->dims[2];
+   operation->input_channels = in->dims[3];
+   operation->input_zero_point = etna_tensor_zero_point(in);
+   operation->input_scale = in->scale;
+   operation->input_tensor_sizes[0] = in->dims[1] * in->dims[2] * in->dims[3];
+
+   operation->output_count = 1;
+   operation->output_width = out->dims[1];
+   operation->output_height = out->dims[2];
+   operation->output_channels = out->dims[3];
+   operation->output_zero_point = etna_tensor_zero_point(out);
+   operation->output_scale = out->scale;
+   operation->output_tensor_sizes[0] = out->dims[1] * out->dims[2] * out->dims[3];
+
+   operation->weight_width = pool->pooling.filter_width;
+   operation->weight_height = pool->pooling.filter_height;
+   operation->stride = pool->pooling.stride_x;
+   operation->pad_before_x = pool->pooling.padding_left;
+   operation->pad_after_x = pool->pooling.padding_right;
+   operation->pad_before_y = pool->pooling.padding_top;
+   operation->pad_after_y = pool->pooling.padding_bottom;
+}
+
 void
 etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
                              const struct etna_operation *operation,
@@ -1334,7 +1462,7 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
 
       /* TODO: Run among the 4 cores for faster performance */
       if ((operation->input_width == 320 || operation->input_width == 224) &&
-          operation->input_channels == 3)
+          operation->input_channels == 3 && !getenv("ETNA_RESHUFFLE_ALL_CORES"))
          tp_cores_used = 1;
 
       ML_DBG("reshuffle: input_width %d tp_cores_used %d\n", operation->input_width, tp_cores_used);
@@ -1378,6 +1506,15 @@ etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
       }
       break;
    }
+   case ETNA_ML_TP_MAXPOOL: {
+      unsigned tp_cores_used = MIN2(etna_ml_get_core_info(subgraph->screen)->tp_core_count,
+                                    operation->input_channels);
+      if (getenv("ETNA_MP_CORES"))
+         tp_cores_used = MIN2(tp_cores_used, atoi(getenv("ETNA_MP_CORES")));
+      for (unsigned i = 0; i < tp_cores_used; i++)
+         instruction->configs[i] = create_maxpool_config(subgraph, operation, i, tp_cores_used);
+      break;
+   }
    case ETNA_ML_TP_LOGISTIC: {
       unsigned tp_cores_used = etna_ml_get_core_info(subgraph->screen)->tp_core_count;
 
@@ -1414,24 +1551,38 @@ etna_ml_emit_operation_tp(struct pipe_context *pctx,
       if (more_than_one_tp_job && (j < tp_core_count - 1))
             offset = parallel ? 0x1f : 0x1;
 
+      if (subgraph->sram_window)
+         etna_set_state(stream, VIVS_GL_SRAM_REMAP_ADDRESS, subgraph->sram_window);
       etna_set_state(stream, VIVS_GL_OCB_REMAP_START, 0x0);
       etna_set_state(stream, VIVS_GL_OCB_REMAP_END, 0x0);
       etna_set_state(stream, VIVS_GL_TP_CONFIG, 0x0);
+      /* Local experiment ETNA_TP_NN_CONFIG: the blob writes GL_NN_CONFIG = 0x4000000 before every TP job */
+      static const char *tpc = (const char *)-1;
+      if (tpc == (const char *)-1)
+         tpc = getenv("ETNA_TP_NN_CONFIG");
+      if (tpc)
+         etna_set_state(stream, VIVS_GL_NN_CONFIG, strtoul(tpc, NULL, 0));
 
+      /* Local experiment: UNK03950 = 0x8 on every TP core but the last lets the cores run in parallel. The blob
+       * sets it for all multi-core TP jobs; ETNA_TP_3950_LEGACY=1 keeps it to PAD/RELU/ABSOLUTE as upstream. */
       if (more_than_one_tp_job &&
           (operation->tp_type == ETNA_ML_TP_PAD ||
            operation->tp_type == ETNA_ML_TP_RELU ||
-           operation->tp_type == ETNA_ML_TP_ABSOLUTE)) {
+           operation->tp_type == ETNA_ML_TP_ABSOLUTE ||
+           !getenv("ETNA_TP_3950_LEGACY"))) {
          etna_set_state(stream, VIVS_GL_UNK03950, j < tp_core_count - 1 ? 0x8 : 0x0);
       } else {
          etna_set_state(stream, VIVS_GL_UNK03950, 0x0);
       }
 
-      etna_set_state_reloc(stream, VIVS_PS_TP_INST_ADDR, &(struct etna_reloc) {
-         .bo = operation->configs[j],
-         .flags = ETNA_RELOC_READ,
-         .offset = offset,
-      });
+      if (ETNA_ML_ENV("ETNA_ML_LIST_ONCE") && subgraph->listed_once)
+         etna_set_state(stream, VIVS_PS_TP_INST_ADDR, etna_bo_gpu_va(operation->configs[j]) + offset);
+      else
+         etna_set_state_reloc(stream, VIVS_PS_TP_INST_ADDR, &(struct etna_reloc) {
+            .bo = operation->configs[j],
+            .flags = ETNA_RELOC_READ,
+            .offset = offset,
+         });
    }
    etna_set_state(stream, VIVS_PS_UNK10A4, parallel ? idx + 1 : 0x0);
 }

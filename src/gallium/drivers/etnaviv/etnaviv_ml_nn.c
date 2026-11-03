@@ -1,3 +1,6 @@
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 /*
  * Copyright (c) 2023-2024 Tomeu Vizoso <tomeu@tomeuvizoso.net>
  * SPDX-License-Identifier: MIT
@@ -621,6 +624,27 @@ etna_ml_lower_convolution(struct etna_ml_subgraph *subgraph,
    else if (operation->input_channels > 1)
       transpose(subgraph, operation);
 
+   /* ETNA_PW_RESHAPE=<max width>: run 1x1 stride-1 convolutions on a flattened plane, as the blob does
+    * (14x14 -> 98x2, 7x7 -> 49x1). Each channel plane is contiguous, so producers and consumers are unaffected.
+    * The hardware x size is operation->input_height (create_nn_config swaps them). */
+   const char *pwr = getenv("ETNA_PW_RESHAPE");
+   if (pwr && nn_core_version == 8 && !operation->depthwise && !operation->pooling_first_pixel &&
+       operation->weight_width == 1 && operation->weight_height == 1 && operation->stride == 1 &&
+       operation->input_width == operation->output_width &&
+       operation->input_height == operation->output_height &&
+       operation->input_width * operation->input_height <= 2 * MAX2(atoi(pwr), 1)) {
+      unsigned max_w = MAX2(atoi(pwr), 1);
+      unsigned pixels = operation->input_width * operation->input_height;
+      if (getenv("ETNA_PW_FIT") && pixels <= 128)
+         max_w = MIN2(max_w, 64);
+      unsigned k = 1;
+      while (pixels / k > max_w || pixels % k)
+         k++;
+      ML_DBG("PWRESHAPE %ux%u -> %ux%u\n", operation->input_height, operation->input_width, pixels / k, k);
+      operation->input_height = operation->output_height = pixels / k;
+      operation->input_width = operation->output_width = k;
+   }
+
    operation->input_tensor_sizes[0] = operation->input_width *
                                       operation->input_height *
                                       operation->input_channels;
@@ -986,6 +1010,18 @@ etna_ml_calculate_tiling(struct etna_screen *screen, const struct etna_operation
       return etna_ml_calculate_tiling_v8(screen, operation, tile_width_out, tile_height_out);
 }
 
+/* Local experiment: NPU address of a tensor, in the SRAM window if it was planned there */
+static uint32_t
+tensor_address(struct etna_ml_subgraph *subgraph, unsigned idx)
+{
+   struct etna_ml_tensor *t = etna_ml_get_tensor(subgraph, idx);
+
+   if (t->in_sram)
+      return subgraph->sram_window + t->sram_offset;
+
+   return etna_bo_gpu_va(etna_buffer_resource(t->resource)->bo) + t->offset;
+}
+
 static struct etna_bo *
 create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation *operation, struct etna_bo *coefficients, unsigned coef_cache_size)
 {
@@ -1074,7 +1110,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation 
 
    struct pipe_resource *input = etna_ml_get_resource(subgraph, operation->input_tensors[0]);
    unsigned offset = etna_ml_get_offset(subgraph, operation->input_tensors[0]);
-   map->in_image_address = etna_bo_gpu_va(etna_buffer_resource(input)->bo) + offset;
+   map->in_image_address = tensor_address(subgraph, operation->input_tensors[0]);
    map->in_image_x_size = input_width;
    map->in_image_y_size = input_height;
    map->in_image_x_stride = input_width;
@@ -1124,7 +1160,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation 
 
    struct pipe_resource *output = etna_ml_get_resource(subgraph, operation->output_tensors[0]);
    offset = etna_ml_get_offset(subgraph, operation->output_tensors[0]);
-   map->out_image_address = etna_bo_gpu_va(etna_buffer_resource(output)->bo) + offset;
+   map->out_image_address = tensor_address(subgraph, operation->output_tensors[0]);
    map->out_image_x_size = output_width;
    map->out_image_y_size = output_height;
    map->out_image_z_size = output_channels;
@@ -1139,7 +1175,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation 
    map->out_zero_point = operation->output_zero_point;
 
    if (operation->pooling_first_pixel) {
-      map->pooling = ETNA_NN_POOLING_FIRST_PIXEL;
+      map->pooling = operation->pooling_max ? ETNA_NN_POOLING_MAX : ETNA_NN_POOLING_FIRST_PIXEL;
       map->pooling_xy_size = 0x0;
 
       map->out_image_x_size *= 2;
@@ -1182,7 +1218,9 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation 
 
    ML_DBG("coefficients_size 0x%x (%d) image_size 0x%x (%d)\n", coef_cache_size, coef_cache_size, image_cache_size, image_cache_size);
 
-   map->kernel_cache_start_address = 0x800;
+   map->kernel_cache_start_address = operation->sram_cache_base ? operation->sram_cache_base : 0x800;
+   if (etna_ml_get_tensor(subgraph, operation->input_tensors[0])->in_sram)
+      image_cache_size = 0; /* already on chip */
 
    /* Get all the image tiles in the cache, then use the rest for the kernels */
    if (map->kernel_cache_start_address + coef_cache_size + image_cache_size < oc_sram_size) {
@@ -1230,7 +1268,7 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation 
       map->image_cache_end_address = 0x800;
    } else {
       map->image_caching_mode = SRAM_CACHE_MODE_FULL_CACHE;
-      if (image_cache_size >= map->kernel_cache_start_address) {
+      if (image_cache_size >= 0x800) {
          map->image_cache_start_address = map->kernel_cache_end_address;
          map->image_cache_end_address = MIN2(map->image_cache_start_address + image_cache_size, oc_sram_size);
          ML_DBG("image_cache_end_address %d image_cache_start_address %d image_cache_size %d oc_sram_size %d\n", map->image_cache_end_address, map->image_cache_start_address, image_cache_size, oc_sram_size);
@@ -1240,11 +1278,75 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation 
       }
    }
 
-   /* Caching is not supported yet on V8 */
+   /* Caching is not supported yet on V8 (local experiment: ETNA_V8_CACHE=1 keeps it on) */
+   /* ETNA_V8_CACHE: k = kernel cache, i = image cache, p = allow partial kernel cache */
    if (nn_core_version == 8) {
-      map->kernel_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
-      map->image_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+      const char *v8c = getenv("ETNA_V8_CACHE");
+      if (!v8c || !strchr(v8c, 'k'))
+         map->kernel_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+      if (v8c && !strchr(v8c, 'p') && map->kernel_caching_mode == SRAM_CACHE_MODE_PARTIAL_CACHE)
+         map->kernel_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+      if (!v8c || !strchr(v8c, 'i'))
+         map->image_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+      if (v8c && strchr(v8c, 'r') && map->kernel_caching_mode == SRAM_CACHE_MODE_PARTIAL_CACHE) {
+         unsigned cache = map->kernel_cache_end_address - map->kernel_cache_start_address;
+         unsigned best_k = 0, best_p = 1;
+         for (unsigned p = 1; p <= 64; p++) {
+            unsigned k = MIN2((uint64_t)cache * p / coef_cache_size, p);
+            if (k * best_p > best_k * p) {
+               best_k = k;
+               best_p = p;
+            }
+         }
+         uint64_t pat = 0;
+         if (2 * best_k <= best_p) {
+            for (unsigned i = 0; i < best_k; i++)
+               pat |= 1ull << (best_p - 1 - 2 * i);
+         } else {
+            pat = best_p == 64 ? ~0ull : (1ull << best_p) - 1;
+            for (unsigned i = 0; i < best_p - best_k; i++)
+               pat &= ~(1ull << (2 * i));
+         }
+         if (best_k == 0)
+            map->kernel_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+         map->kernel_pattern_msb = best_p - 1;
+         map->kernel_pattern_low = pat & 0xffffffff;
+         map->kernel_pattern_high = pat >> 32;
+         ML_DBG("KPATTERN cache %u coef %u -> %u/%u\n", cache, coef_cache_size, best_k, best_p);
+      }
    }
+   /* Local experiment: never let the caches reach below the live SRAM activations. The partial kernel cache
+    * branch places the image cache at oc_sram_size - image_cache_size, ignoring kernel_cache_start_address. */
+   unsigned cache_base = operation->sram_cache_base;
+   if (cache_base && map->image_caching_mode != SRAM_CACHE_MODE_NO_CACHE &&
+       map->image_cache_start_address < cache_base) {
+      if (map->kernel_caching_mode == SRAM_CACHE_MODE_NO_CACHE && cache_base + image_cache_size <= oc_sram_size) {
+         map->image_cache_start_address = cache_base;
+         map->image_cache_end_address = cache_base + image_cache_size;
+      } else {
+         map->image_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+         map->image_cache_start_address = 0x0;
+         map->image_cache_end_address = 0x800;
+      }
+   }
+   if (cache_base && map->kernel_caching_mode != SRAM_CACHE_MODE_NO_CACHE &&
+       map->kernel_cache_start_address < cache_base)
+      map->kernel_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+
+   /* An image cache in the low 2 KB (images smaller than 0x800 get placed at 0..0x800) hangs the NPU, seen on
+    * EfficientNet's depthwise layers with ETNA_V8_CACHE=ki. The blob only uses that range with caching off. */
+   if (map->image_caching_mode != SRAM_CACHE_MODE_NO_CACHE && map->image_cache_start_address < 0x800) {
+      map->image_caching_mode = SRAM_CACHE_MODE_NO_CACHE;
+      map->image_cache_start_address = 0x0;
+      map->image_cache_end_address = 0x800;
+   }
+
+   ML_DBG("NNMAP out %ux%ux%u tile %ux%u superblocks %u kpc %u kcache %u icache %u kc %u-%u ic %u-%u\n",
+          operation->output_width, operation->output_height, operation->output_channels,
+          map->out_image_tile_x_size, map->out_image_tile_y_size, superblocks, map->kernels_per_core,
+          map->kernel_caching_mode, map->image_caching_mode,
+          map->kernel_cache_start_address, map->kernel_cache_end_address,
+          map->image_cache_start_address, map->image_cache_end_address);
 
    float conv_scale = (operation->input_scale * operation->weight_scale) / operation->output_scale;
    uint32_t scale_bits = fui(conv_scale);
@@ -1272,6 +1374,16 @@ create_nn_config(struct etna_ml_subgraph *subgraph, const struct etna_operation 
    }
 
    map->per_channel_post_mul = 0x0;
+
+   /* Local experiment: dump the whole descriptor for diffing against NXP's NBG */
+   if (DBG_ENABLED(ETNA_DBG_ML_MSGS)) {
+      const uint32_t *w = (const uint32_t *)map;
+      char buf[sizeof(struct etna_nn_params) / 4 * 9 + 1];
+      unsigned n = 0;
+      for (unsigned i = 0; i < sizeof(struct etna_nn_params) / 4; i++)
+         n += snprintf(buf + n, sizeof(buf) - n, "%08x ", w[i]);
+      ML_DBG("NNDESC coef %u %s\n", coef_cache_size, buf);
+   }
 
    etna_bo_cpu_fini(bo);
 
@@ -1321,14 +1433,28 @@ etna_ml_emit_operation_nn(struct pipe_context *pctx,
       offset = 0;
    }
 
+   /* Local experiment: ETNA_NN_CONFIG overrides GL_NN_CONFIG (the blob writes 0x40: DDR_BURST_SIZE 2, no SMALL_BATCH) */
+   static const char *nnc = (const char *)-1;
+   if (nnc == (const char *)-1)
+      nnc = getenv("ETNA_NN_CONFIG");
+   if (nnc)
+      nn_config = strtoul(nnc, NULL, 0);
+
+   if (subgraph->sram_window)
+      etna_set_state(stream, VIVS_GL_SRAM_REMAP_ADDRESS, subgraph->sram_window);
    etna_set_state(stream, VIVS_GL_OCB_REMAP_START, 0x0);
    etna_set_state(stream, VIVS_GL_OCB_REMAP_END, 0x0);
 
    etna_set_state(stream, VIVS_GL_NN_CONFIG, nn_config);
-   etna_set_state_reloc(stream, VIVS_PS_NN_INST_ADDR, &(struct etna_reloc) {
-      .bo = operation->configs[0],
-      .flags = ETNA_RELOC_READ,
-      .offset = offset,
-   });
+   /* Local experiment ETNA_ML_LIST_ONCE: softpin addresses are fixed, so after the first complete submit
+    * the config BO doesn't need to be listed again */
+   if (ETNA_ML_ENV("ETNA_ML_LIST_ONCE") && subgraph->listed_once)
+      etna_set_state(stream, VIVS_PS_NN_INST_ADDR, etna_bo_gpu_va(operation->configs[0]) + offset);
+   else
+      etna_set_state_reloc(stream, VIVS_PS_NN_INST_ADDR, &(struct etna_reloc) {
+         .bo = operation->configs[0],
+         .flags = ETNA_RELOC_READ,
+         .offset = offset,
+      });
    etna_set_state(stream, VIVS_PS_UNK10A4, offset);
 }

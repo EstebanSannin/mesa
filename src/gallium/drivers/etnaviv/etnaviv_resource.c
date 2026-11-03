@@ -442,6 +442,10 @@ etna_buffer_bo_new(struct etna_screen *screen, const struct pipe_resource *prsc)
 {
    uint32_t flags = DRM_ETNA_GEM_CACHE_WC;
 
+   /* As for textures: cache maintenance is cheaper than reading write-combined memory on arm64 */
+   if (DETECT_ARCH_AARCH64 && (prsc->flags & ETNA_RESOURCE_FLAG_CPU_READ))
+      flags = DRM_ETNA_GEM_CACHE_CACHED;
+
    if (prsc->bind & PIPE_BIND_VERTEX_BUFFER)
       flags |= DRM_ETNA_GEM_FORCE_MMU;
 

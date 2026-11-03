@@ -25,7 +25,9 @@
  */
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "util/hash_table.h"
 #include "util/perf/cpu_trace.h"
@@ -245,8 +247,18 @@ void etna_cmd_stream_flush(struct etna_cmd_stream *stream, int in_fence_fd,
 	if (likely(!is_noop)) {
 		int ret;
 
+		/* Local experiment: ETNA_SUBMIT_TIMING=1 prints the submit ioctl time */
+		struct timespec st0, st1;
+		clock_gettime(CLOCK_MONOTONIC, &st0);
 		ret = drmCommandWriteRead(gpu->dev->fd, DRM_ETNAVIV_GEM_SUBMIT,
 				&req, sizeof(req));
+		clock_gettime(CLOCK_MONOTONIC, &st1);
+		static int st_env = -1;
+		if (st_env < 0)
+			st_env = getenv("ETNA_SUBMIT_TIMING") != NULL;
+		if (st_env)
+			fprintf(stderr, "SUBMIT bos %u bytes %u ioctl_us %ld\n", req.nr_bos, req.stream_size,
+				(st1.tv_sec - st0.tv_sec) * 1000000L + (st1.tv_nsec - st0.tv_nsec) / 1000L);
 
 		if (ret) {
 			ERROR_MSG("submit failed: %d (%s)", ret, strerror(errno));

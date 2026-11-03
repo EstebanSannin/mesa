@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include "pipe-loader/pipe_loader.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
@@ -55,6 +56,7 @@ struct teflon_delegate {
    struct pipe_ml_device *ml_dev;
    struct pipe_tensor *tensors;
    unsigned tensor_count;
+   struct pipe_context *context; /* local experiment TEFLON_REUSE_CONTEXT */
 };
 
 struct teflon_node {
@@ -1216,7 +1218,14 @@ partition_invoke(TfLiteContext *tf_context, TfLiteNode *node)
    struct teflon_delegate *delegate = (struct teflon_delegate *)node->delegate;
    struct teflon_subgraph *tsubgraph = (struct teflon_subgraph *)node->user_data;
    struct pipe_ml_subgraph *subgraph = tsubgraph->base;
-   struct pipe_context *context = delegate->screen->context_create(delegate->screen, NULL, PIPE_CONTEXT_COMPUTE_ONLY);
+   static int reuse = -1;
+   if (reuse < 0)
+      reuse = getenv("TEFLON_REUSE_CONTEXT") != NULL;
+   struct pipe_context *context = reuse ? delegate->context : NULL;
+   if (!context)
+      context = delegate->screen->context_create(delegate->screen, NULL, PIPE_CONTEXT_COMPUTE_ONLY);
+   if (reuse)
+      delegate->context = context;
    long start = 0, end = 0;
 
    if (update_partition_shapes(delegate, tf_context, tsubgraph)) {
@@ -1278,7 +1287,8 @@ partition_invoke(TfLiteContext *tf_context, TfLiteNode *node)
       teflon_debug("teflon: invoked graph, took %ld ms\n", (end - start));
    }
 
-   context->destroy(context);
+   if (!reuse)
+      context->destroy(context);
    context = NULL;
 
    return kTfLiteOk;
@@ -1540,6 +1550,9 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
    TfLiteIntArray *supported_nodes = malloc(plan->size * sizeof(int) + sizeof(*supported_nodes));
    supported_nodes->size = plan->size;
    unsigned node_count = 0;
+   /* Local experiment TEFLON_NO_EDGE_RESHAPE: tensors produced by a node that runs on the NPU */
+   bool no_edge_reshape = getenv("TEFLON_NO_EDGE_RESHAPE") != NULL;
+   bool *npu_tensor = calloc(tf_context->tensors_size, sizeof(*npu_tensor));
    for (int i = 0; i < plan->size; i++) {
       int node_index = plan->data[i];
       bool supported = false;
@@ -1548,6 +1561,15 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
          tf_context, node_index, &node, &registration));
 
       supported = check_op_support(tf_delegate, tf_context, node, registration);
+
+      /* A reshape fed by the CPU would start a partition of its own. The plan is in execution order, so the
+       * producer of its input has been decided already. */
+      if (supported && no_edge_reshape && registration->builtin_code == kTfLiteBuiltinReshape &&
+          !npu_tensor[node->inputs->data[0]])
+         supported = false;
+      if (supported)
+         for (int j = 0; j < node->outputs->size; j++)
+            npu_tensor[node->outputs->data[j]] = true;
 
       teflon_debug("%3d %-15s v%-2d %-11s in:", node_index,
                    tflite_builtin_op_name(registration->builtin_code),
@@ -1588,6 +1610,7 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
          supported_nodes->data[node_count++] = node_index;
    }
    supported_nodes->size = node_count;
+   free(npu_tensor);
 
    TfLiteRegistration registration = {};
 
@@ -1735,6 +1758,8 @@ tflite_plugin_destroy_delegate(TfLiteDelegate *tf_delegate)
    }
    free(delegate->tensors);
 
+   if (delegate->context)
+      delegate->context->destroy(delegate->context);
    delegate->screen->destroy(delegate->screen);
    pipe_loader_release(&delegate->dev, 1);
    free(delegate);
