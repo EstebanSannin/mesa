@@ -464,6 +464,26 @@ lower_operations(struct etna_ml_subgraph *subgraph,
             break;
          }
          case PIPE_ML_OPERATION_TYPE_RESHAPE: {
+            /* A reshape is an alias of its input buffer. When its output is returned to TFLite, the data must be
+             * in NHWC order already: the output shape (e.g. SSD box/class heads, [1, H*W*A, K]) is not 3D, so
+             * the detranspose below for graph outputs would not catch it. NHWC [1, H, W, C] and the reshaped
+             * tensor have the same byte order, so detranspose the 4D input and keep the alias. */
+            struct etna_ml_tensor *reshape_in = etna_ml_get_tensor(subgraph, input_tensors[0]);
+            if (poperation->output_tensors[0]->is_external_output &&
+                reshape_in->act_layout == ETNA_ML_LAYOUT_NCHW &&
+                is_3d(poperation->input_tensors[0])) {
+               ML_DBG("Adding detranspose before reshape of graph output %d.\n", poperation->output_tensors[0]->index);
+               struct etna_operation *detranspose = calloc(1, sizeof(*detranspose));
+               etna_ml_lower_detranspose(subgraph, poperation->input_tensors[0], detranspose);
+               detranspose->input_tensors[0] = input_tensors[0];
+               detranspose->output_tensors[0] = etna_ml_allocate_tensor(subgraph);
+               list_addtail(&detranspose->link, etna_operations);
+
+               struct etna_ml_tensor *nhwc = etna_ml_get_tensor(subgraph, detranspose->output_tensors[0]);
+               nhwc->exp_layout = ETNA_ML_LAYOUT_NHWC;
+               nhwc->act_layout = ETNA_ML_LAYOUT_NHWC;
+               input_tensors[0] = detranspose->output_tensors[0];
+            }
             add_bypass(poperation, input_tensors[0], operation, etna_operations);
             break;
          }
