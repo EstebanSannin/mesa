@@ -103,6 +103,8 @@ struct etna_shader_variant {
    uint32_t code_size; /* code size in uint32 words */
    uint32_t constant_data_size; /* in bytes */
    unsigned num_temps;
+   /* local experiment: fragment shader runs two pixels per thread at fp16 */
+   bool dual16;
 
    /* ETNA_DIRTY_* flags that, when set in context dirty, mean that the
     * uniforms have to get (partial) reloaded. */

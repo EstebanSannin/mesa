@@ -284,7 +284,7 @@ static hw_src
 const_src(struct etna_compile *c, nir_const_value *value, unsigned num_components)
 {
    /* use inline immediates if possible */
-   if (c->info->halti >= 2 && num_components == 1 &&
+   if (c->info->halti >= 2 && num_components == 1 && !c->variant->dual16 &&
        value[0].u64 >> 32 == ETNA_UNIFORM_CONSTANT) {
       unsigned type;
       uint32_t imm;
@@ -984,6 +984,191 @@ static nir_const_value *get_alu_cv(nir_alu_src *src)
  * -try to merge constants as single constant
  * -insert movs for multiple constants if required
  */
+/* Local experiment ETNA_DUAL16: shaders the dual16 prototype can run */
+static bool
+dual16_reject(const char *why, const char *what)
+{
+   if (getenv("ETNA_DUAL16_DEBUG"))
+      fprintf(stderr, "etnaviv dual16: not taken: %s %s\n", why, what ? what : "");
+   return false;
+}
+
+static bool
+dual16_requested(void)
+{
+   return getenv("ETNA_DUAL16") && atoi(getenv("ETNA_DUAL16"));
+}
+
+/* booleans and integers in uniforms are uploaded as integers on cores with native integers */
+static bool
+dual16_int_type(const struct glsl_type *t)
+{
+   t = glsl_without_array(t);
+   if (glsl_type_is_struct_or_ifc(t)) {
+      for (unsigned i = 0; i < glsl_get_length(t); i++) {
+         if (dual16_int_type(glsl_get_struct_field(t, i)))
+            return true;
+      }
+      return false;
+   }
+   if (glsl_type_is_sampler(t) || glsl_type_is_texture(t) || glsl_type_is_image(t))
+      return false;
+   return glsl_type_is_boolean(t) || glsl_type_is_integer(t);
+}
+
+/* before boolean lowering: float and boolean ALU only, so ints can be lowered to float */
+static bool
+dual16_float_only(nir_shader *s)
+{
+   nir_foreach_variable_with_modes(var, s, nir_var_uniform | nir_var_mem_ubo) {
+      if (dual16_int_type(var->type))
+         return dual16_reject("int uniform", var->name);
+      if (var->data.precision == GLSL_PRECISION_HIGH && !glsl_contains_sampler(var->type))
+         return dual16_reject("highp uniform", var->name);
+   }
+   /* fp16 only where GLSL asked for medium or low precision */
+   nir_foreach_variable_with_modes(var, s, nir_var_shader_out) {
+      if (var->data.precision == GLSL_PRECISION_HIGH)
+         return dual16_reject("highp output", var->name);
+      if (dual16_int_type(var->type))
+         return dual16_reject("int output", var->name);
+   }
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_input && !nir_intrinsic_io_semantics(intr).medium_precision)
+            return dual16_reject("highp input", NULL);
+         if (intr->intrinsic == nir_intrinsic_load_input &&
+             nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) != nir_type_float)
+            return dual16_reject("int input", NULL);
+      }
+   }
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         const nir_op_info *info = &nir_op_infos[alu->op];
+         if (alu->op == nir_op_fround_even)
+            return dual16_reject("round", NULL);
+         if (alu->op == nir_op_mov || alu->op == nir_op_bcsel || nir_op_is_vec(alu->op))
+            continue;
+         /* boolean logic, which bool_to_float turns into float math */
+         if ((alu->op == nir_op_iand || alu->op == nir_op_ior || alu->op == nir_op_ixor ||
+              alu->op == nir_op_inot) && alu->def.bit_size == 1)
+            continue;
+         nir_alu_type t = nir_alu_type_get_base_type(info->output_type);
+         if (t != nir_type_float && t != nir_type_bool)
+            return dual16_reject("int alu", info->name);
+         for (unsigned i = 0; i < info->num_inputs; i++) {
+            t = nir_alu_type_get_base_type(info->input_types[i]);
+            if (t != nir_type_float && t != nir_type_bool)
+               return dual16_reject("int alu source", info->name);
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+dual16_eligible(nir_shader *s, bool check_alu)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+
+   foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+      if (node->type != nir_cf_node_block)
+         return dual16_reject("control flow", NULL);
+   }
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_tex: {
+            /* fp16 coordinates only straight from a varying: computed ones (projection) lose
+             * too much, NXP computes those per pixel at high precision */
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (!getenv("ETNA_DUAL16_TEX") || !atoi(getenv("ETNA_DUAL16_TEX")))
+               return dual16_reject("texture", NULL);
+            int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+            nir_instr *parent = c >= 0 ? nir_def_instr_nonconst(tex->src[c].src.ssa) : NULL;
+            if (check_alu && parent && !(parent->type == nir_instr_type_intrinsic &&
+                                         nir_instr_as_intrinsic(parent)->intrinsic == nir_intrinsic_load_input))
+               return dual16_reject("computed texcoord", NULL);
+            break;
+         }
+         case nir_instr_type_load_const:
+         case nir_instr_type_undef:
+         case nir_instr_type_deref:
+            break;
+         case nir_instr_type_alu: {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (!check_alu)
+               break;
+            switch (alu->op) {
+            case nir_op_mov: case nir_op_vec2: case nir_op_vec3: case nir_op_vec4:
+            case nir_op_fadd: case nir_op_fmul: case nir_op_ffma: case nir_op_fmad: case nir_op_fneg: case nir_op_fabs:
+            case nir_op_fsat: case nir_op_fmax: case nir_op_fmin:
+            case nir_op_fdot2: case nir_op_fdot3: case nir_op_fdot4:
+            case nir_op_frsq: case nir_op_frcp: case nir_op_fsqrt: case nir_op_flog2: case nir_op_fexp2:
+            case nir_op_ffloor: case nir_op_fceil: case nir_op_ffract: case nir_op_fsign:
+            case nir_op_fsin: case nir_op_fcos:
+            case nir_op_flt32: case nir_op_fge32: case nir_op_feq32: case nir_op_fneu32:
+            case nir_op_b32csel: case nir_op_b2f32: case nir_op_fcsel:
+            case nir_op_slt: case nir_op_sge: case nir_op_seq: case nir_op_sne: case nir_op_ftrunc:
+            case nir_op_iand: case nir_op_ior: case nir_op_ixor: case nir_op_inot:
+               break;
+            default:
+               return dual16_reject("alu", nir_op_infos[alu->op].name);
+            }
+            break;
+         }
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_input: {
+               unsigned loc = nir_intrinsic_io_semantics(intr).location;
+               if (loc == VARYING_SLOT_POS || loc == VARYING_SLOT_PNTC || loc == VARYING_SLOT_FACE)
+                  return dual16_reject("input", gl_varying_slot_name_for_stage(loc, MESA_SHADER_FRAGMENT));
+               break;
+            }
+            case nir_intrinsic_store_output:
+               if (nir_intrinsic_io_semantics(intr).location == FRAG_RESULT_DEPTH)
+                  return dual16_reject("depth output", NULL);
+               break;
+            case nir_intrinsic_store_deref: {
+               nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+               if (!var || var->data.mode != nir_var_shader_out || var->data.location == FRAG_RESULT_DEPTH)
+                  return dual16_reject("store_deref", var ? var->name : NULL);
+               break;
+            }
+            case nir_intrinsic_load_uniform:
+            case nir_intrinsic_decl_reg:
+            case nir_intrinsic_load_reg:
+            case nir_intrinsic_store_reg:
+               break;
+
+            default:
+               return dual16_reject("intrinsic", nir_intrinsic_infos[intr->intrinsic].name);
+            }
+            break;
+         }
+         default: {
+            char t[16];
+            snprintf(t, sizeof(t), "%d", instr->type);
+            return dual16_reject("instruction type", t);
+         }
+         }
+      }
+   }
+
+   if (getenv("ETNA_DUAL16_DEBUG"))
+      fprintf(stderr, "etnaviv dual16: taken\n");
+   return true;
+}
+
 static void
 lower_alu(struct etna_compile *c, nir_alu_instr *alu)
 {
@@ -1215,7 +1400,7 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
 
                unsigned base = nir_intrinsic_base(intr);
                /* pre halti2 uniform offset will be float */
-               if (c->info->halti < 2)
+               if (c->info->halti < 2 || c->float_ints)
                   base += (unsigned) off[0].f32;
                else
                   base += off[0].u32;
@@ -1541,8 +1726,12 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    if (v->shader->specs->vs_need_z_div)
       NIR_PASS(_, s, nir_lower_clip_halfz);
 
+   /* local experiment ETNA_DUAL16: float booleans for shaders that may run dual16 */
+   c->float_ints = s->info.stage == MESA_SHADER_FRAGMENT && dual16_requested() &&
+                   dual16_eligible(s, false) && dual16_float_only(s);
+
    /* lower pre-halti2 to float (halti0 has integers, but only scalar..) */
-   if (c->info->halti < 2) {
+   if (c->info->halti < 2 || c->float_ints) {
       /* use opt_algebraic between int_to_float and boot_to_float because
        * int_to_float emits ftrunc, and ftrunc lowering generates bool ops
        */
@@ -1578,6 +1767,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    /* needs to be the last pass that touches pass_flags! */
    NIR_PASS(_, s, etna_nir_lower_to_source_mods);
 
+   v->dual16 = c->float_ints && dual16_eligible(s, true);
+
    if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS))
       nir_print_shader(s, stdout);
 
@@ -1595,6 +1786,19 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    /* empty shader, emit NOP */
    if (!c->inst_ptr)
       emit_inst(c, &(struct etna_inst) { .opcode = ISA_OPC_NOP });
+
+   if (v->dual16 && (!getenv("ETNA_DUAL16_RTZ") || atoi(getenv("ETNA_DUAL16_RTZ")))) {
+      for (unsigned i = 0; i < c->inst_ptr; i++) {
+         switch (c->code[i].opcode) {
+         case ISA_OPC_TEXKILL: case ISA_OPC_TEXKILL_UNARY: case ISA_OPC_TEXKILL_BINARY:
+         case ISA_OPC_TEXLD: case ISA_OPC_TEXLDB: case ISA_OPC_TEXLDD: case ISA_OPC_TEXLDL:
+         case ISA_OPC_TXF: case ISA_OPC_NOP:
+            break;
+         default:
+            c->code[i].rounding = ISA_ROUNDING_RTZ;
+         }
+      }
+   }
 
    /* assemble instructions, fixing up labels */
    const bool has_no_oneconst_limit = etna_core_has_feature(c->info, ETNA_FEATURE_SH_NO_ONECONST_LIMIT);

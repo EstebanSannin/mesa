@@ -245,6 +245,7 @@ struct compiled_shader_state {
    uint32_t PS_INPUT_COUNT_MSAA; /* Adds an input */
    uint32_t PS_TEMP_REGISTER_CONTROL;
    uint32_t PS_TEMP_REGISTER_CONTROL_MSAA; /* Adds a temporary if needed to make space for extra input */
+   bool dual16;
    uint32_t PS_START_PC;
    uint32_t GL_VARYING_TOTAL_COMPONENTS;
    uint32_t GL_VARYING_NUM_COMPONENTS[2];

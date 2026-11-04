@@ -300,6 +300,10 @@ etna_link_shaders(struct etna_context *ctx, struct compiled_shader_state *cs,
    cs->PS_INPUT_COUNT =
       VIVS_PS_INPUT_COUNT_COUNT(link.num_varyings + 1) | /* Number of inputs plus position */
       VIVS_PS_INPUT_COUNT_UNK8(fs->input_count_unk8);
+   /* local experiment ETNA_DUAL16 */
+   cs->dual16 = fs->dual16;
+   if (fs->dual16 && getenv("ETNA_DUAL16_IN") && atoi(getenv("ETNA_DUAL16_IN")))
+      cs->PS_INPUT_COUNT |= VIVS_PS_INPUT_COUNT_DUAL16;
    cs->PS_TEMP_REGISTER_CONTROL =
       VIVS_PS_TEMP_REGISTER_CONTROL_NUM_TEMPS(MAX2(fs->num_temps, link.num_varyings + 1));
    cs->PS_START_PC = 0;

@@ -582,6 +582,9 @@ etna_set_framebuffer_state(struct pipe_context *pctx,
    cs->PE_LOGIC_OP = pe_logic_op;
 
    ctx->dirty |= ETNA_DIRTY_FRAMEBUFFER | ETNA_DIRTY_DERIVE_TS;
+   /* local experiment ETNA_DUAL16: the dual16 bit depends on msaa_mode */
+   if (ctx->shader_state.dual16)
+      ctx->dirty |= ETNA_DIRTY_SHADER;
 }
 
 static void

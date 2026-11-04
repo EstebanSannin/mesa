@@ -54,6 +54,9 @@ struct etna_compile {
    uint64_t consts[ETNA_MAX_IMM];
    unsigned const_count;
 
+   /* local experiment ETNA_DUAL16: integers and booleans lowered to float, as on pre-HALTI2 */
+   bool float_ints;
+
    /* movs of constant sources inserted by lower_alu in the current block */
    struct {
       nir_def *src, *mov;

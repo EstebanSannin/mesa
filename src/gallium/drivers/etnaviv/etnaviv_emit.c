@@ -768,7 +768,9 @@ etna_emit_state(struct etna_context *ctx)
          etna_set_state(stream, VIVS_PS_HALTI5_RANGE_HIGH, ctx->shader_state.ps_inst_mem_size / 4);
          assert(ctx->shader_state.PS_INST_ADDR.bo);
          etna_set_state_reloc(stream, VIVS_PS_INST_ADDR, &ctx->shader_state.PS_INST_ADDR);
-         etna_set_state(stream, VIVS_SH_CONFIG, 0x00000002);
+         etna_set_state(stream, VIVS_SH_CONFIG,
+                        0x00000002 | COND(ctx->shader_state.dual16 && !ctx->framebuffer.msaa_mode,
+                                          VIVS_SH_CONFIG_DUAL16));
          etna_set_state(stream, VIVS_SH_ICACHE_CONTROL, VIVS_SH_ICACHE_CONTROL_ENABLE);
          etna_set_state(stream, VIVS_PS_ICACHE_COUNT, ctx->shader_state.ps_inst_mem_size / 4 - 1);
 
