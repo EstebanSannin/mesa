@@ -639,6 +639,20 @@ emit_alu(struct etna_compile *c, nir_alu_instr * alu)
    if (alu->op == nir_op_bitfield_insert_etna)
       srcs[2] = src_swizzle(get_src(c, &alu->src[2].src), SWIZZLE(X, Y, Y, Y));
 
+   /* a copy of register components onto themselves, left by vecN lowering when a value already
+    * sits where the vector wants it
+    */
+   if (alu->op == nir_op_mov && srcs[0].rgroup == ISA_REG_GROUP_TEMP && srcs[0].reg == dst.reg &&
+       !srcs[0].neg && !srcs[0].abs && srcs[0].amode == dst.amode) {
+      bool same = true;
+      for (unsigned i = 0; i < 4; i++) {
+         if ((dst.write_mask & (1 << i)) && ((srcs[0].swiz >> (2 * i)) & 3) != i)
+            same = false;
+      }
+      if (same)
+         return;
+   }
+
    etna_emit_alu(c, alu, dst, srcs);
 }
 
@@ -1122,6 +1136,33 @@ lower_alu(struct etna_compile *c, nir_alu_instr *alu)
    }
 }
 
+/* a vecN of components of one value, used only by texture fetches, becomes a swizzled mov, which
+ * the fetch reads in place (BYPASS_SRC) instead of copying the components into a temporary
+ */
+static void
+vec_to_swizzle(nir_builder *b, nir_alu_instr *alu)
+{
+   unsigned swiz[NIR_MAX_VEC_COMPONENTS];
+   nir_def *src = alu->src[0].src.ssa;
+
+   if (!nir_op_is_vec(alu->op) || nir_def_instr_type(src) == nir_instr_type_load_const)
+      return;
+
+   for (unsigned i = 0; i < alu->def.num_components; i++) {
+      if (alu->src[i].src.ssa != src)
+         return;
+      swiz[i] = alu->src[i].swizzle[0];
+   }
+
+   nir_foreach_use_including_if(use, &alu->def) {
+      if (nir_src_is_if(use) || nir_src_use_instr(use)->type != nir_instr_type_tex)
+         return;
+   }
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def_replace(&alu->def, nir_swizzle(b, src, swiz, alu->def.num_components));
+}
+
 static bool
 emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
 {
@@ -1132,6 +1173,13 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
    unsigned indirect_max = 0;
 
    nir_builder b = nir_builder_create(c->impl);
+
+   nir_foreach_block(block, c->impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type == nir_instr_type_alu)
+            vec_to_swizzle(&b, nir_instr_as_alu(instr));
+      }
+   }
 
    /* convert non-dynamic uniform loads to constants, etc */
    nir_foreach_block(block, c->impl) {
