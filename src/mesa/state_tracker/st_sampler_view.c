@@ -521,6 +521,23 @@ st_create_texture_sampler_view_from_stobj(struct st_context *st,
    templ.astc_decode_format =
       gl_astc_decode_precision_to_pipe(texObj->AstcDecodePrecision);
 
+   /* for YUV formats that the driver samples natively */
+   templ.yuv_color_space = PIPE_YUV_COLOR_SPACE_BT601;
+   templ.yuv_full_range = false;
+   if (util_format_is_yuv(format)) {
+      switch (texObj->yuv_color_space) {
+      case GL_TEXTURE_YUV_COLOR_SPACE_REC709:
+         templ.yuv_color_space = PIPE_YUV_COLOR_SPACE_BT709;
+         break;
+      case GL_TEXTURE_YUV_COLOR_SPACE_REC2020:
+         templ.yuv_color_space = PIPE_YUV_COLOR_SPACE_BT2020;
+         break;
+      default:
+         break;
+      }
+      templ.yuv_full_range = texObj->yuv_full_range;
+   }
+
    return st->pipe->create_sampler_view(st->pipe, texObj->pt, &templ);
 }
 

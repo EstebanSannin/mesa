@@ -190,9 +190,18 @@ etna_texture_desc_fill(struct etna_context *ctx,
                    | VIVS_TE_SAMPLER_CONFIG0_TYPE(target_hw) |
                    COND(res->layout == ETNA_LAYOUT_LINEAR && !util_format_is_compressed(sv->base.format),
                         VIVS_TE_SAMPLER_CONFIG0_ADDRESSING_MODE(TEXTURE_ADDRESSING_MODE_LINEAR)));
+
+   /* The texture unit converts YUV formats to RGB with narrow-range BT.601
+    * coefficients, or BT.709 ones. There is no BT.2020 or full range, and
+    * BT.709 is the closer match for BT.2020.
+    */
+   const bool yuv_bt709 = util_format_is_yuv(sv->base.format) &&
+                          sv->base.yuv_color_space != PIPE_YUV_COLOR_SPACE_BT601;
+
    DESC_SET(CONFIG1, COND(ext, VIVS_TE_SAMPLER_CONFIG1_FORMAT_EXT(format)) |
                      COND(astc, VIVS_TE_SAMPLER_CONFIG1_FORMAT_EXT(TEXTURE_FORMAT_EXT_ASTC)) |
                      COND(is_array, VIVS_TE_SAMPLER_CONFIG1_TEXTURE_ARRAY) |
+                     COND(yuv_bt709, TEXDESC_CONFIG1_YUV_BT709) |
                      VIVS_TE_SAMPLER_CONFIG1_HALIGN(res->halign) | swiz);
    DESC_SET(CONFIG2, 0x00030000 |
          COND(sint && desc->channel[0].size == 8, TE_SAMPLER_CONFIG2_SIGNED_INT8) |
