@@ -302,8 +302,10 @@ etna_link_shaders(struct etna_context *ctx, struct compiled_shader_state *cs,
       VIVS_PS_INPUT_COUNT_UNK8(fs->input_count_unk8);
    /* local experiment ETNA_DUAL16 */
    cs->dual16 = fs->dual16;
-   if (fs->dual16 && getenv("ETNA_DUAL16_IN") && atoi(getenv("ETNA_DUAL16_IN")))
+   cs->dual16_hp_in = fs->dual16_hp_in;
+   if (fs->dual16 && (fs->dual16_hp_in || (getenv("ETNA_DUAL16_IN") && atoi(getenv("ETNA_DUAL16_IN"))))) {
       cs->PS_INPUT_COUNT |= VIVS_PS_INPUT_COUNT_DUAL16;
+   }
    cs->PS_TEMP_REGISTER_CONTROL =
       VIVS_PS_TEMP_REGISTER_CONTROL_NUM_TEMPS(MAX2(fs->num_temps, link.num_varyings + 1));
    cs->PS_START_PC = 0;
@@ -313,7 +315,8 @@ etna_link_shaders(struct etna_context *ctx, struct compiled_shader_state *cs,
    /* MSAA adds another input */
    cs->PS_INPUT_COUNT_MSAA =
       VIVS_PS_INPUT_COUNT_COUNT(link.num_varyings + 2) |
-      VIVS_PS_INPUT_COUNT_UNK8(fs->input_count_unk8);
+      VIVS_PS_INPUT_COUNT_UNK8(fs->input_count_unk8) |
+      COND(fs->dual16_hp_in, VIVS_PS_INPUT_COUNT_DUAL16);
    /* MSAA adds another temp */
    cs->PS_TEMP_REGISTER_CONTROL_MSAA =
       VIVS_PS_TEMP_REGISTER_CONTROL_NUM_TEMPS(MAX2(fs->num_temps + 1, link.num_varyings + 2));

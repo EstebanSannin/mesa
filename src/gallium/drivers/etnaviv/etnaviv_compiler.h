@@ -105,6 +105,8 @@ struct etna_shader_variant {
    unsigned num_temps;
    /* local experiment: fragment shader runs two pixels per thread at fp16 */
    bool dual16;
+   /* ... with its varyings, all texture coordinates, delivered at highp per pixel */
+   bool dual16_hp_in;
 
    /* ETNA_DIRTY_* flags that, when set in context dirty, mean that the
     * uniforms have to get (partial) reloaded. */

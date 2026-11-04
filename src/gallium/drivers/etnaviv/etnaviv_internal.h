@@ -246,6 +246,7 @@ struct compiled_shader_state {
    uint32_t PS_TEMP_REGISTER_CONTROL;
    uint32_t PS_TEMP_REGISTER_CONTROL_MSAA; /* Adds a temporary if needed to make space for extra input */
    bool dual16;
+   bool dual16_hp_in; /* per-thread code: must stay in dual16 mode, MSAA or not */
    uint32_t PS_START_PC;
    uint32_t GL_VARYING_TOTAL_COMPONENTS;
    uint32_t GL_VARYING_NUM_COMPONENTS[2];

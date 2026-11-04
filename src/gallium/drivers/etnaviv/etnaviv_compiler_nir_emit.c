@@ -289,6 +289,22 @@ etna_emit_tex(struct etna_compile *c, nir_tex_instr * tex, unsigned dst_swiz,
       compile_error(c, "Unhandled NIR tex type: %d\n", tex->op);
    }
 
+   /* local experiment ETNA_DUAL16: coordinates arrive at highp, xy for the first pixel of the
+    * thread and zw for the second, so fetch once per pixel */
+   unsigned sx = inst.src[0].swiz & 3, sy = (inst.src[0].swiz >> 2) & 3;
+   if (c->variant->dual16_hp_in && inst.src[0].rgroup == ISA_REG_GROUP_TEMP && sx < 2 && sy < 2) {
+      struct etna_inst t1 = inst;
+      inst.thread = ISA_THREAD_T0;
+      inst.src[0].rgroup = ISA_REG_GROUP_TH;
+      inst.src[0].swiz = INST_SWIZ(sx, sy, sy, sy);
+      t1.thread = ISA_THREAD_T1;
+      t1.src[0].rgroup = ISA_REG_GROUP_TH;
+      t1.src[0].swiz = INST_SWIZ(sx + 2, sy + 2, sy + 2, sy + 2);
+      emit_inst(c, &inst);
+      emit_inst(c, &t1);
+      return;
+   }
+
    emit_inst(c, &inst);
 }
 

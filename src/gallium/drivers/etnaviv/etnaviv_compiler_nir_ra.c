@@ -43,6 +43,17 @@ static unsigned int *q_values[] = {
    (unsigned int[]) {2, 2, 2, 2, 2, 2, 2, },
 };
 
+/* local experiment ETNA_DUAL16: a value only used as texture coordinates */
+static bool
+texcoord_only(nir_def *def)
+{
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_tex)
+         return false;
+   }
+   return true;
+}
+
 static inline int reg_get_class(int virt_reg)
 {
    switch (reg_get_type(virt_reg)) {
@@ -212,6 +223,12 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
                REG_TYPE_VIRT_VEC3_XYZ,
                REG_TYPE_VEC4,
             }[def->num_components - 1];
+            /* local experiment ETNA_DUAL16: a per-pixel coordinate fills its whole register */
+            if (c->variant->dual16_hp_in && texcoord_only(def)) {
+               reg = nir_intrinsic_base(intr) * NUM_REG_TYPES + REG_TYPE_VEC4;
+               ra_set_node_class(g, live_map[def_index(impl, def)],
+                                 ra_get_class_from_index(regs, REG_CLASS_VEC4));
+            }
             break;
          case nir_intrinsic_load_instance_id:
             reg = c->variant->infile.num_reg * NUM_REG_TYPES + REG_TYPE_VIRT_SCALAR_Y;
@@ -234,6 +251,25 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
          if (defs[i].live_start >= defs[j].live_end || defs[j].live_start >= defs[i].live_end)
             continue;
          ra_add_node_interference(g, i, j);
+      }
+   }
+
+   /* local experiment ETNA_DUAL16: texld.t0 writes its result before texld.t1 reads the second
+    * pixel's coordinate, so the result must not share the coordinate's register */
+   if (c->variant->dual16_hp_in) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+            if (ci < 0)
+               continue;
+            unsigned d = live_map[def_index(impl, &tex->def)];
+            unsigned sc = live_map[src_index(impl, &tex->src[ci].src)];
+            if (d < num_nodes && sc < num_nodes)
+               ra_add_node_interference(g, d, sc);
+         }
       }
    }
 

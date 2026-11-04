@@ -999,6 +999,112 @@ dual16_requested(void)
    return getenv("ETNA_DUAL16") && atoi(getenv("ETNA_DUAL16"));
 }
 
+/* a varying of at most two components (as declared) whose loads are only texture coordinates */
+static bool
+dual16_is_texcoord_input(nir_shader *s, nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_load_input || intr->def.num_components > 2 ||
+       nir_intrinsic_component(intr))
+      return false;
+
+   /* the per-pixel layout depends on the declared size: a vec4 takes a register per pixel */
+   nir_foreach_shader_in_variable(var, s) {
+      if (var->data.driver_location == nir_intrinsic_base(intr) && glsl_get_components(var->type) > 2)
+         return false;
+   }
+
+   nir_foreach_use_including_if(src, &intr->def) {
+      if (nir_src_is_if(src))
+         return false;
+      nir_instr *use = nir_src_use_instr(src);
+      if (use->type != nir_instr_type_tex)
+         return false;
+      nir_tex_instr *tex = nir_instr_as_tex(use);
+      int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+      if (c < 0 || &tex->src[c].src != src)
+         return false;
+   }
+   return true;
+}
+
+/* an input variable of at most two components that is only read as texture coordinates */
+static bool
+dual16_texcoord_var(nir_shader *s, nir_variable *var)
+{
+   bool used = false;
+
+   if (!glsl_type_is_vector_or_scalar(var->type) || glsl_get_components(var->type) > 2)
+      return false;
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_deref || nir_intrinsic_get_var(intr, 0) != var)
+            continue;
+         nir_foreach_use_including_if(src, &intr->def) {
+            if (nir_src_is_if(src))
+               return false;
+            nir_instr *use = nir_src_use_instr(src);
+            if (use->type != nir_instr_type_tex)
+               return false;
+            nir_tex_instr *tex = nir_instr_as_tex(use);
+            int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+            if (c < 0 || &tex->src[c].src != src)
+               return false;
+         }
+         used = true;
+      }
+   }
+   return used;
+}
+
+/* renumber the fragment inputs so the texture coordinate varyings come first */
+static void
+dual16_texcoords_first(nir_shader *s)
+{
+   nir_variable *vars[ETNA_NUM_INPUTS] = { NULL };
+   unsigned nv = 0, ntc = 0;
+
+   nir_foreach_shader_in_variable(var, s) {
+      unsigned loc = var->data.driver_location;
+      if (loc >= ETNA_NUM_INPUTS || vars[loc] || !glsl_type_is_vector_or_scalar(var->type))
+         return;
+      vars[loc] = var;
+      nv = MAX2(nv, loc + 1);
+      ntc += dual16_texcoord_var(s, var);
+   }
+   for (unsigned i = 0, a = 0, b = ntc; i < nv; i++) {
+      if (vars[i])
+         vars[i]->data.driver_location = dual16_texcoord_var(s, vars[i]) ? a++ : b++;
+   }
+}
+
+/* every texture fetch reads its coordinate straight from such a varying */
+static bool
+dual16_texcoord_inputs(nir_shader *s)
+{
+   unsigned texs = 0, bases = 0;
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+         nir_instr *parent = c >= 0 ? nir_def_instr_nonconst(tex->src[c].src.ssa) : NULL;
+         if (!parent || parent->type != nir_instr_type_intrinsic ||
+             !dual16_is_texcoord_input(s, nir_instr_as_intrinsic(parent)))
+            return false;
+         bases |= 1u << nir_intrinsic_base(nir_instr_as_intrinsic(parent));
+         texs++;
+      }
+   }
+   /* only the leading varyings arrive per pixel */
+   return texs > 0 && (bases & (bases + 1)) == 0;
+}
+
 /* booleans and integers in uniforms are uploaded as integers on cores with native integers */
 static bool
 dual16_int_type(const struct glsl_type *t)
@@ -1038,7 +1144,8 @@ dual16_float_only(nir_shader *s)
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         if (intr->intrinsic == nir_intrinsic_load_input && !nir_intrinsic_io_semantics(intr).medium_precision)
+         if (intr->intrinsic == nir_intrinsic_load_input && !nir_intrinsic_io_semantics(intr).medium_precision &&
+             !(dual16_is_texcoord_input(s, intr) && dual16_texcoord_inputs(s)))
             return dual16_reject("highp input", NULL);
          if (intr->intrinsic == nir_intrinsic_load_input &&
              nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) != nir_type_float)
@@ -1090,7 +1197,8 @@ dual16_eligible(nir_shader *s, bool check_alu)
             /* fp16 coordinates only straight from a varying: computed ones (projection) lose
              * too much, NXP computes those per pixel at high precision */
             nir_tex_instr *tex = nir_instr_as_tex(instr);
-            if (!getenv("ETNA_DUAL16_TEX") || !atoi(getenv("ETNA_DUAL16_TEX")))
+            if (check_alu && !dual16_texcoord_inputs(s) &&
+                (!getenv("ETNA_DUAL16_TEX") || !atoi(getenv("ETNA_DUAL16_TEX"))))
                return dual16_reject("texture", NULL);
             int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
             nir_instr *parent = c >= 0 ? nir_def_instr_nonconst(tex->src[c].src.ssa) : NULL;
@@ -1671,6 +1779,9 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
          sf->num_reg = MAX2(sf->num_reg, idx+1);
       }
    } else {
+      /* local experiment ETNA_DUAL16: per-pixel texture coordinates are the leading varyings */
+      if (dual16_requested())
+         dual16_texcoords_first(s);
       unsigned count = 0;
       nir_foreach_shader_in_variable(var, s) {
          unsigned idx = var->data.driver_location;
@@ -1768,6 +1879,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    NIR_PASS(_, s, etna_nir_lower_to_source_mods);
 
    v->dual16 = c->float_ints && dual16_eligible(s, true);
+   v->dual16_hp_in = v->dual16 && dual16_texcoord_inputs(s);
 
    if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS))
       nir_print_shader(s, stdout);
