@@ -54,6 +54,12 @@ struct etna_compile {
    uint64_t consts[ETNA_MAX_IMM];
    unsigned const_count;
 
+   /* movs of constant sources inserted by lower_alu in the current block */
+   struct {
+      nir_def *src, *mov;
+   } const_movs[16];
+   unsigned num_const_movs;
+
    /* ra state */
    struct ra_graph *g;
    unsigned *live_map;
