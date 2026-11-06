@@ -63,6 +63,8 @@
 #include "util/u_debug_cb.h"
 #include "util/u_surface.h"
 #include "util/u_transfer.h"
+#include "util/os_time.h"
+#include <inttypes.h>
 
 static inline void
 etna_emit_nop_with_data(struct etna_cmd_stream *stream, uint32_t value)
@@ -363,6 +365,18 @@ etna_reset_gpu_state(struct etna_context *ctx)
    ctx->prev_vs_sampler_base = ~0;
    ctx->needs_gpu_state_reset = false;
    ctx->alpha_coverage_dither_emitted = false;
+}
+
+static int
+etna_draw_time_ms(void)
+{
+   static int ms = -2;
+
+   if (ms == -2) {
+      const char *e = getenv("ETNA_DRAW_TIME");
+      ms = e ? atoi(e) : -1;
+   }
+   return ms;
 }
 
 static void
@@ -683,6 +697,25 @@ etna_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    if (DBG_ENABLED(ETNA_DBG_FLUSH_ALL))
       pctx->flush(pctx, NULL, 0);
+
+   if (unlikely(etna_draw_time_ms() >= 0)) {
+      struct pipe_fence_handle *fence = NULL;
+      int64_t t0 = os_time_get_nano();
+
+      pctx->flush(pctx, &fence, 0);
+      pctx->screen->fence_finish(pctx->screen, NULL, fence, OS_TIMEOUT_INFINITE);
+      pctx->screen->fence_reference(pctx->screen, &fence, NULL);
+      int64_t ms = (os_time_get_nano() - t0) / 1000000;
+      if (ms >= etna_draw_time_ms()) {
+         const struct etna_shader_variant *vs = ctx->shader.vs, *fs = ctx->shader.fs;
+         fprintf(stderr, "ETNA_DRAW_TIME %" PRId64 " ms: vs %s (%u instr) fs %s (%u instr, %u temps) "
+                 "mode %u count %u inst %u fb %ux%u samples %u xfb %u\n", ms,
+                 vs->shader->nir->info.name ? vs->shader->nir->info.name : "?", vs->code_size / 4,
+                 fs->shader->nir->info.name ? fs->shader->nir->info.name : "?", fs->code_size / 4,
+                 fs->num_temps, info->mode, indirect ? 0 : draws[0].count, info->instance_count,
+                 pfb->width, pfb->height, pfb->samples, ctx->streamout.num_targets);
+      }
+   }
 
    for (i = 0; i < pfb->nr_cbufs; i++) {
       if (pfb->cbufs[i].texture) {
