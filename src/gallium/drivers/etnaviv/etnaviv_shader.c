@@ -407,6 +407,18 @@ etna_upload_constant_data(struct etna_context *ctx, struct etna_shader_variant *
 }
 
 bool
+etna_shader_upload_code(struct etna_context *ctx, struct etna_shader_variant *v)
+{
+   return etna_icache_upload_shader(ctx, v);
+}
+
+bool
+etna_shader_upload_constant_data(struct etna_context *ctx, struct etna_shader_variant *v)
+{
+   return etna_upload_constant_data(ctx, v);
+}
+
+bool
 etna_shader_link(struct etna_context *ctx)
 {
    MESA_TRACE_FUNC();

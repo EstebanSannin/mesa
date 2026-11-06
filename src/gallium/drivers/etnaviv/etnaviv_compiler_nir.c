@@ -498,6 +498,7 @@ get_src(struct etna_compile *c, nir_src *src)
       case nir_intrinsic_load_vertex_id:
       case nir_intrinsic_load_uniform:
       case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_ssbo:
       case nir_intrinsic_load_constant:
       case nir_intrinsic_load_reg:
       case nir_intrinsic_ddx:
@@ -787,6 +788,43 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
          .src[1] = get_src(c, &intr->src[2]),
          .src[2] = get_src(c, &intr->src[0]),
       });
+      break;
+   case nir_intrinsic_load_ssbo: {
+      if (!nir_src_is_const(intr->src[0])) {
+         compile_error(c, "dynamically indexed SSBO\n");
+         break;
+      }
+      unsigned idx = nir_src_as_const_value(intr->src[0])[0].u32;
+      unsigned dst_swiz;
+      emit_inst(c, &(struct etna_inst) {
+         .opcode = ISA_OPC_LOAD,
+         .type = ISA_TYPE_U32,
+         .dst = ra_def(c, &intr->def, &dst_swiz),
+         .src[0] = get_src(c, &intr->src[1]),
+         .src[1] = const_src(c, &CONST_VAL(ETNA_UNIFORM_SSBO_ADDR, idx), 1),
+      });
+   } break;
+   case nir_intrinsic_store_ssbo: {
+      if (!nir_src_is_const(intr->src[1])) {
+         compile_error(c, "dynamically indexed SSBO\n");
+         break;
+      }
+      unsigned idx = nir_src_as_const_value(intr->src[1])[0].u32;
+      emit_inst(c, &(struct etna_inst) {
+         .opcode = ISA_OPC_STORE,
+         .type = ISA_TYPE_U32,
+         .denorm = 1,
+         .dst = {
+            .write_mask = nir_intrinsic_write_mask(intr),
+         },
+         .src[0] = const_src(c, &CONST_VAL(ETNA_UNIFORM_SSBO_ADDR, idx), 1),
+         .src[1] = get_src(c, &intr->src[2]),
+         .src[2] = get_src(c, &intr->src[0]),
+      });
+   } break;
+   case nir_intrinsic_barrier:
+      if (nir_intrinsic_execution_scope(intr) >= SCOPE_WORKGROUP)
+         emit_inst(c, &(struct etna_inst) { .opcode = ISA_OPC_BARRIER });
       break;
    case nir_intrinsic_load_front_face:
    case nir_intrinsic_load_frag_coord:
@@ -1189,6 +1227,13 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             case nir_intrinsic_load_first_vertex:
                value[0] = CONST_VAL(ETNA_UNIFORM_XFB_FIRST_VERTEX, 0);
                break;
+            case nir_intrinsic_load_num_workgroups:
+               for (unsigned i = 0; i < intr->def.num_components; i++)
+                  value[i] = CONST_VAL(ETNA_UNIFORM_NUM_WORKGROUPS, i);
+               break;
+            case nir_intrinsic_get_ssbo_size:
+               value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_SIZE, nir_src_as_uint(intr->src[0]));
+               break;
             default:
                continue;
             }
@@ -1230,6 +1275,18 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
                  !nir_def_is_alu(src->ssa))) {
                b.cursor = nir_before_instr(instr);
                nir_src_rewrite(src, nir_mov(&b, src->ssa));
+            }
+         } break;
+         case nir_intrinsic_load_ssbo:
+         case nir_intrinsic_store_ssbo: {
+            const bool store = intr->intrinsic == nir_intrinsic_store_ssbo;
+            nir_src *srcs[] = { &intr->src[store ? 2 : 1], store ? &intr->src[0] : NULL };
+
+            for (unsigned i = 0; i < ARRAY_SIZE(srcs); i++) {
+               if (srcs[i] && nir_src_is_const(*srcs[i])) {
+                  b.cursor = nir_before_instr(instr);
+                  nir_src_rewrite(srcs[i], nir_mov(&b, srcs[i]->ssa));
+               }
             }
          } break;
          default:
@@ -1339,6 +1396,50 @@ fill_vs_mystery(struct etna_shader_variant *v)
                              VIVS_VS_LOAD_BALANCING_D(0x0f);
 }
 
+/* CL_CONFIG value order 3: t0 = global ID, t1 = local ID, t2 = workgroup ID */
+static nir_def *
+load_cs_input(nir_builder *b, unsigned reg, unsigned *input_count)
+{
+   *input_count = MAX2(*input_count, reg + 1);
+   return nir_load_input(b, 3, 32, nir_imm_int(b, 0), .base = reg);
+}
+
+static bool
+lower_cs_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   unsigned *input_count = data;
+   nir_def *val;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global_invocation_id:
+      val = load_cs_input(b, 0, input_count);
+      break;
+   case nir_intrinsic_load_local_invocation_id:
+      val = load_cs_input(b, 1, input_count);
+      break;
+   case nir_intrinsic_load_workgroup_id:
+      val = load_cs_input(b, 2, input_count);
+      break;
+   case nir_intrinsic_load_local_invocation_index: {
+      const uint16_t *size = b->shader->info.workgroup_size;
+      nir_def *id = load_cs_input(b, 1, input_count);
+
+      val = nir_iadd(b, nir_channel(b, id, 0),
+                     nir_imul_imm(b, nir_iadd(b, nir_channel(b, id, 1),
+                                              nir_imul_imm(b, nir_channel(b, id, 2), size[1])),
+                                  size[0]));
+      break;
+   }
+   default:
+      return false;
+   }
+
+   nir_def_replace(&intr->def, nir_u2uN(b, val, intr->def.bit_size));
+   return true;
+}
+
 static uint8_t
 alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
 {
@@ -1412,6 +1513,12 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
     * Remove any dead in variables before we iterate over them
     */
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_shader_in, NULL);
+
+   if (s->info.stage == MESA_SHADER_COMPUTE) {
+      v->uses_discard = false;
+      NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_cs_intrinsic,
+               nir_metadata_control_flow, &v->cs_input_count);
+   }
 
    /* setup input linking */
    struct etna_shader_io_file *sf = &v->infile;
@@ -1555,7 +1662,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
       v->input_count_unk8 = 31; /* XXX what is this */
       assert(v->ps_depth_out_reg <= 0);
-   } else {
+   } else if (s->info.stage == MESA_SHADER_VERTEX) {
       fill_vs_mystery(v);
    }
 

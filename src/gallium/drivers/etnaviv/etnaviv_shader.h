@@ -119,6 +119,12 @@ bool
 etna_shader_link(struct etna_context *ctx);
 
 bool
+etna_shader_upload_code(struct etna_context *ctx, struct etna_shader_variant *v);
+
+bool
+etna_shader_upload_constant_data(struct etna_context *ctx, struct etna_shader_variant *v);
+
+bool
 etna_shader_update_vertex(struct etna_context *ctx);
 
 struct etna_shader_variant *

@@ -113,6 +113,8 @@ etna_context_destroy(struct pipe_context *pctx)
 
    util_dynarray_fini(&ctx->pending_status);
 
+   etna_compute_fini(pctx);
+
    if (ctx->updated_resources)
       _mesa_set_destroy(ctx->updated_resources, NULL);
 
@@ -885,6 +887,7 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    etna_shader_init(pctx);
    etna_texture_init(pctx);
    etna_transfer_init(pctx);
+   etna_compute_init(pctx);
 
    if (!ctx->compute_only) {
       ctx->blitter = util_blitter_create(pctx);

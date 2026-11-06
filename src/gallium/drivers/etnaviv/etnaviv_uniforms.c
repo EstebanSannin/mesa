@@ -137,10 +137,11 @@ etna_uniforms_write(const struct etna_context *ctx,
    struct etna_screen *screen = ctx->screen;
    struct etna_cmd_stream *stream = ctx->stream;
    const struct etna_shader_uniform_info *uinfo = &sobj->uniforms;
-   bool frag = (sobj == ctx->shader.fs);
+   /* compute shaders run on the pixel shader unit, with PS_UNIFORM_BASE 0 */
+   bool frag = (sobj == ctx->shader.fs) || sobj->stage == MESA_SHADER_COMPUTE;
    uint32_t base = frag ? screen->specs.ps_uniforms_offset : screen->specs.vs_uniforms_offset;
 
-   if (screen->specs.has_unified_uniforms && frag)
+   if (screen->specs.has_unified_uniforms && sobj == ctx->shader.fs)
       base += ctx->shader.vs->uniforms.count * 4;
 
    if (!uinfo->count)
@@ -213,6 +214,28 @@ etna_uniforms_write(const struct etna_context *ctx,
 
       case ETNA_UNIFORM_XFB_FIRST_VERTEX:
          etna_cmd_stream_emit(stream, ctx->streamout.first_vertex);
+         break;
+
+      case ETNA_UNIFORM_SSBO_ADDR: {
+         const struct pipe_shader_buffer *sb = &ctx->shader_buffers[sobj->stage].sb[val];
+
+         if (sb->buffer) {
+            etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+               .bo = etna_buffer_resource(sb->buffer)->bo,
+               .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+               .offset = sb->buffer_offset,
+            });
+         } else {
+            etna_cmd_stream_emit(stream, 0);
+         }
+      } break;
+
+      case ETNA_UNIFORM_SSBO_SIZE:
+         etna_cmd_stream_emit(stream, ctx->shader_buffers[sobj->stage].sb[val].buffer_size);
+         break;
+
+      case ETNA_UNIFORM_NUM_WORKGROUPS:
+         etna_cmd_stream_emit(stream, ctx->compute_grid[val]);
          break;
 
       case ETNA_UNIFORM_UNUSED:

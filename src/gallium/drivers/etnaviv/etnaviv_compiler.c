@@ -79,6 +79,7 @@ etna_compiler_create(const struct etna_core_info *info)
       .lower_ifind_msb = true,
       .lower_ufind_msb = true,
       .has_uclz = true,
+      .has_cs_global_id = true,
       .no_integers = info->halti < 2,
    };
 

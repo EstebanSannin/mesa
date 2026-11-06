@@ -130,6 +130,9 @@ struct etna_shader_variant {
    /* unknown input property (XX_INPUT_COUNT, field UNK8) */
    uint32_t input_count_unk8;
 
+   /* compute: number of work-item ID registers the thread walker fills */
+   uint32_t cs_input_count;
+
    /* shader is larger than GPU instruction limit, thus needs icache */
    bool needs_icache;
 

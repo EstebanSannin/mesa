@@ -1,0 +1,280 @@
+/*
+ * Copyright (c) 2026 Etnaviv Project
+ * SPDX-License-Identifier: MIT
+ *
+ * Experimental compute support (ETNA_EXPERIMENTAL_COMPUTE=1).
+ *
+ * Compute shaders run on the pixel shader unit. The work-item IDs are written
+ * by the thread walker into the first temporaries: t0 = global invocation ID,
+ * t1 = local invocation ID, t2 = workgroup ID (CL_CONFIG value order 3).
+ *
+ * Based on the dispatch sequence from the experimental compute support by
+ * Italo Nicola and Tomeu Vizoso (Mesa MR !18986) and the kernel PPU flop reset
+ * (drivers/gpu/drm/etnaviv/etnaviv_flop_reset.c).
+ */
+
+#include "etnaviv_compiler.h"
+#include "etnaviv_context.h"
+#include "etnaviv_debug.h"
+#include "etnaviv_emit.h"
+#include "etnaviv_resource.h"
+#include "etnaviv_screen.h"
+#include "etnaviv_shader.h"
+#include "etnaviv_uniforms.h"
+
+#include "hw/common.xml.h"
+#include "hw/state.xml.h"
+#include "hw/state_3d.xml.h"
+
+#include "util/u_debug.h"
+#include "util/u_inlines.h"
+#include "util/u_math.h"
+#include "util/u_memory.h"
+
+static void
+etna_set_shader_buffers(struct pipe_context *pctx, mesa_shader_stage shader,
+                        unsigned start, unsigned count,
+                        const struct pipe_shader_buffer *buffers,
+                        unsigned writable_bitmask)
+{
+   struct etna_context *ctx = etna_context(pctx);
+   struct etna_shader_buffer_state *so = &ctx->shader_buffers[shader];
+
+   assert(start + count <= ETNA_MAX_SHADER_BUFFERS);
+
+   for (unsigned i = 0; i < count; i++) {
+      struct pipe_shader_buffer *dst = &so->sb[start + i];
+
+      if (buffers && buffers[i].buffer) {
+         pipe_resource_reference(&dst->buffer, buffers[i].buffer);
+         dst->buffer_offset = buffers[i].buffer_offset;
+         dst->buffer_size = buffers[i].buffer_size;
+         so->enabled_mask |= BITFIELD_BIT(start + i);
+      } else {
+         pipe_resource_reference(&dst->buffer, NULL);
+         so->enabled_mask &= ~BITFIELD_BIT(start + i);
+      }
+   }
+}
+
+static void *
+etna_create_compute_state(struct pipe_context *pctx,
+                          const struct pipe_compute_state *pcs)
+{
+   if (pcs->ir_type != PIPE_SHADER_IR_NIR)
+      return NULL;
+
+   struct pipe_shader_state pss = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = (struct nir_shader *)pcs->prog,
+   };
+
+   return pctx->create_fs_state(pctx, &pss);
+}
+
+static void
+etna_bind_compute_state(struct pipe_context *pctx, void *cso)
+{
+   struct etna_context *ctx = etna_context(pctx);
+
+   ctx->shader.bind_cs = cso;
+   ctx->shader.cs = NULL;
+}
+
+static void
+etna_delete_compute_state(struct pipe_context *pctx, void *cso)
+{
+   pctx->delete_fs_state(pctx, cso);
+}
+
+static void
+etna_get_compute_state_info(struct pipe_context *pctx, void *cso,
+                            struct pipe_compute_state_object_info *info)
+{
+   struct etna_screen *screen = etna_screen(pctx->screen);
+
+   info->max_threads = screen->base.compute_caps.max_threads_per_block;
+   info->private_memory = 0;
+   info->preferred_simd_size = 4;
+   info->simd_sizes = 4;
+}
+
+static void
+etna_memory_barrier(struct pipe_context *pctx, unsigned flags)
+{
+   struct etna_context *ctx = etna_context(pctx);
+
+   etna_set_state(ctx->stream, VIVS_GL_FLUSH_CACHE,
+                  VIVS_GL_FLUSH_CACHE_TEXTURE | VIVS_GL_FLUSH_CACHE_SHADER_L1 |
+                  VIVS_GL_FLUSH_CACHE_UNK10 | VIVS_GL_FLUSH_CACHE_UNK11);
+   etna_stall(ctx->stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
+}
+
+static bool
+etna_get_grid(struct etna_context *ctx, const struct pipe_grid_info *info,
+              uint32_t grid[3])
+{
+   if (info->indirect) {
+      /* No indirect dispatch command is known: read the group counts back. */
+      pipe_buffer_read(&ctx->base, info->indirect, info->indirect_offset,
+                       3 * sizeof(uint32_t), grid);
+   } else {
+      memcpy(grid, info->grid, 3 * sizeof(uint32_t));
+   }
+
+   return grid[0] && grid[1] && grid[2];
+}
+
+static void
+etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
+{
+   struct etna_context *ctx = etna_context(pctx);
+   struct etna_cmd_stream *stream = ctx->stream;
+   struct etna_shader *shader = ctx->shader.bind_cs;
+   uint32_t grid[3];
+
+   if (!shader || !etna_get_grid(ctx, info, grid))
+      return;
+
+   struct etna_shader_key key = {};
+   struct etna_shader_variant *v =
+      etna_shader_variant(shader, &key, &ctx->base.debug, true);
+   if (!v)
+      return;
+
+   ctx->shader.cs = v;
+
+   if (!etna_shader_upload_code(ctx, v) ||
+       !etna_shader_upload_constant_data(ctx, v)) {
+      BUG("failed to upload compute shader");
+      return;
+   }
+
+   memcpy(ctx->compute_grid, grid, sizeof(ctx->compute_grid));
+
+   /* Make sure the frontend-visible state of the buffers is tracked. */
+   struct etna_shader_buffer_state *sb = &ctx->shader_buffers[MESA_SHADER_COMPUTE];
+   u_foreach_bit(i, sb->enabled_mask)
+      resource_written(ctx, sb->sb[i].buffer);
+
+   struct etna_constbuf_state *cb = &ctx->constant_buffer[MESA_SHADER_COMPUTE];
+   u_foreach_bit(i, cb->enabled_mask) {
+      if (cb->cb[i].buffer)
+         resource_read(ctx, cb->cb[i].buffer);
+   }
+
+   const unsigned input_count = MAX2(v->cs_input_count, 1);
+   const unsigned block_size = info->block[0] * info->block[1] * info->block[2];
+   /* Threads of a workgroup that are resident at the same time, in units of
+    * 4-wide threads per shader core. Too few and barrier() does not wait for the
+    * whole workgroup; found by experiment on GC7000 r6204. */
+   const unsigned thread_alloc = ctx->compute_thread_alloc ? ctx->compute_thread_alloc :
+      DIV_ROUND_UP(block_size, 4 * ctx->screen->info->gpu.shader_core_count);
+   const unsigned num_temps = MAX3(v->num_temps, input_count, ctx->compute_min_temps);
+   const unsigned num_inst = v->code_size / 4;
+
+   etna_set_state(stream, VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENCL);
+   etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
+
+   etna_uniforms_write(ctx, v, ctx->constant_buffer[MESA_SHADER_COMPUTE].cb);
+
+   etna_set_state(stream, VIVS_PS_VARYING_NUM_COMPONENTS(0), 0);
+   etna_set_state(stream, VIVS_PA_VARYING_NUM_COMPONENTS(0), 0);
+   etna_set_state(stream, VIVS_PS_SAMPLER_BASE, 0);
+   etna_set_state(stream, VIVS_PS_UNIFORM_BASE, 0);
+   /* HALTI5 takes the end of the PS range from PS_HALTI5_RANGE_HIGH, as for draws */
+   etna_set_state(stream, VIVS_PS_NEWRANGE_LOW, 0);
+   etna_set_state(stream, VIVS_PS_HALTI5_RANGE_HIGH, num_inst);
+   etna_set_state_reloc(stream, VIVS_PS_INST_ADDR, &(struct etna_reloc) {
+      .bo = v->bo,
+      .flags = ETNA_RELOC_READ,
+   });
+   etna_set_state(stream, VIVS_SH_CONFIG, VIVS_SH_CONFIG_RTNE_ROUNDING);
+   etna_set_state(stream, VIVS_SH_ICACHE_CONTROL, VIVS_SH_ICACHE_CONTROL_ENABLE);
+   etna_set_state(stream, VIVS_PS_ICACHE_COUNT, num_inst - 1);
+   etna_set_state(stream, VIVS_VS_ICACHE_INVALIDATE, 0x1f);
+   etna_set_state(stream, VIVS_PS_INPUT_COUNT,
+                  VIVS_PS_INPUT_COUNT_COUNT(input_count) |
+                  VIVS_PS_INPUT_COUNT_UNK8(31));
+   etna_set_state(stream, VIVS_PS_TEMP_REGISTER_CONTROL,
+                  VIVS_PS_TEMP_REGISTER_CONTROL_NUM_TEMPS(num_temps));
+   etna_set_state(stream, VIVS_PS_CONTROL, VIVS_PS_CONTROL_RT_COUNT(7) | 0x800);
+   etna_set_state(stream, VIVS_VS_VERTEX_CACHE_CONFIG, 0);
+   etna_set_state(stream, VIVS_PS_PSCS_THROTTLE, 0);
+   etna_set_state(stream, VIVS_PA_ATTRIBUTE_ELEMENT_COUNT,
+                  VIVS_PA_ATTRIBUTE_ELEMENT_COUNT_COUNT(1));
+   etna_set_state(stream, VIVS_GL_VARYING_TOTAL_COMPONENTS, 0);
+   etna_set_state(stream, VIVS_PS_CONTROL_EXT, 0);
+   etna_set_state(stream, VIVS_VS_LOAD_BALANCING, 0x0f3f0000);
+   etna_set_state(stream, VIVS_VS_OUTPUT_COUNT, 1);
+   etna_set_state(stream, VIVS_PA_VS_OUTPUT_COUNT, 0);
+   etna_set_state(stream, VIVS_GL_HALTI5_SH_SPECIALS,
+                  VIVS_GL_HALTI5_SH_SPECIALS_UNK16(0x7f));
+   etna_set_state(stream, VIVS_PS_ICACHE_PREFETCH, 0);
+   etna_set_state(stream, VIVS_GL_SHADER_INDEX, 0);
+
+   etna_set_state(stream, VIVS_CL_CONFIG,
+                  VIVS_CL_CONFIG_DIMENSIONS(3) | VIVS_CL_CONFIG_VALUE_ORDER(3));
+   etna_set_state(stream, VIVS_CL_UNK00924, ctx->compute_unk924);
+   etna_set_state(stream, VIVS_CL_THREAD_ALLOCATION, thread_alloc);
+   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_X, 0);
+   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_Y, 0);
+   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_Z, 0);
+   etna_set_state(stream, VIVS_CL_GLOBAL_SCALE_X, 1);
+   etna_set_state(stream, VIVS_CL_GLOBAL_SCALE_Y, 1);
+   etna_set_state(stream, VIVS_CL_GLOBAL_SCALE_Z, 1);
+
+   /* CL_WORKGROUP_COUNT_{X,Y,Z} and CL_WORKGROUP_SIZE_{X,Y,Z}, minus one */
+   const uint32_t groups[6] = {
+      grid[0] - 1, grid[1] - 1, grid[2] - 1,
+      (info->block[0] - 1) & 0x3ff,
+      (info->block[1] - 1) & 0x3ff,
+      (info->block[2] - 1) & 0x3ff,
+   };
+   etna_set_state_multi(stream, VIVS_CL_WORKGROUP_COUNT_X, 6, groups);
+
+   etna_set_state(stream, VIVS_CL_KICKER, 0xbadabeeb);
+
+   etna_set_state(stream, VIVS_GL_FLUSH_CACHE,
+                  VIVS_GL_FLUSH_CACHE_TEXTURE | VIVS_GL_FLUSH_CACHE_SHADER_L1 |
+                  VIVS_GL_FLUSH_CACHE_UNK10 | VIVS_GL_FLUSH_CACHE_UNK11);
+   etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
+
+   /* The dispatch clobbered the 3D shader state: start over at the next draw. */
+   ctx->needs_gpu_state_reset = true;
+   ctx->dirty = ~0L;
+
+   if (DBG_ENABLED(ETNA_DBG_FLUSH_ALL))
+      pctx->flush(pctx, NULL, 0);
+}
+
+void
+etna_compute_init(struct pipe_context *pctx)
+{
+   struct etna_context *ctx = etna_context(pctx);
+
+   if (!pctx->screen->caps.compute)
+      return;
+
+   ctx->compute_unk924 = debug_get_num_option("ETNA_CL_UNK924", 0x00100000);
+   ctx->compute_thread_alloc = debug_get_num_option("ETNA_CL_THREAD_ALLOC", 0);
+   ctx->compute_min_temps = debug_get_num_option("ETNA_CL_MIN_TEMPS", 1);
+
+   pctx->create_compute_state = etna_create_compute_state;
+   pctx->bind_compute_state = etna_bind_compute_state;
+   pctx->delete_compute_state = etna_delete_compute_state;
+   pctx->get_compute_state_info = etna_get_compute_state_info;
+   pctx->launch_grid = etna_launch_grid;
+   pctx->set_shader_buffers = etna_set_shader_buffers;
+   pctx->memory_barrier = etna_memory_barrier;
+}
+
+void
+etna_compute_fini(struct pipe_context *pctx)
+{
+   struct etna_context *ctx = etna_context(pctx);
+
+   for (unsigned s = 0; s < MESA_SHADER_STAGES; s++)
+      for (unsigned i = 0; i < ETNA_MAX_SHADER_BUFFERS; i++)
+         pipe_resource_reference(&ctx->shader_buffers[s].sb[i].buffer, NULL);
+}

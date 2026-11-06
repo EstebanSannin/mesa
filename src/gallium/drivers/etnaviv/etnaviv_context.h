@@ -82,6 +82,13 @@ struct etna_constbuf_state {
    uint32_t enabled_mask;
 };
 
+#define ETNA_MAX_SHADER_BUFFERS 8
+
+struct etna_shader_buffer_state {
+   struct pipe_shader_buffer sb[ETNA_MAX_SHADER_BUFFERS];
+   uint32_t enabled_mask;
+};
+
 struct etna_vertexbuf_state {
    struct pipe_vertex_buffer vb[PIPE_MAX_ATTRIBS];
    struct compiled_set_vertex_buffer cvb[PIPE_MAX_ATTRIBS];
@@ -90,8 +97,8 @@ struct etna_vertexbuf_state {
 };
 
 struct etna_shader_state {
-   void *bind_vs, *bind_fs;
-   struct etna_shader_variant *vs, *fs;
+   void *bind_vs, *bind_fs, *bind_cs;
+   struct etna_shader_variant *vs, *fs, *cs;
    struct etna_shader_key key;
 };
 
@@ -141,6 +148,9 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_XFB_ADDR,
    ETNA_UNIFORM_XFB_NUM_VERTICES,
    ETNA_UNIFORM_XFB_FIRST_VERTEX,
+   ETNA_UNIFORM_SSBO_ADDR,
+   ETNA_UNIFORM_SSBO_SIZE,
+   ETNA_UNIFORM_NUM_WORKGROUPS,
 };
 
 struct etna_shader_uniform_info {
@@ -236,6 +246,7 @@ struct etna_context {
    uint32_t dirty_samplers;
    struct pipe_sampler_view *sampler_view[PIPE_MAX_SAMPLERS];
    struct etna_constbuf_state constant_buffer[MESA_SHADER_STAGES];
+   struct etna_shader_buffer_state shader_buffers[MESA_SHADER_STAGES];
    struct etna_vertexbuf_state vertex_buffer;
    struct etna_index_buffer index_buffer;
    struct etna_shader_state shader;
@@ -279,6 +290,12 @@ struct etna_context {
     * pipe_blit_info has no driver-private field to carry this through. */
    bool blit_rb_swap;
    bool needs_gpu_state_reset;
+
+   /* experimental compute */
+   uint32_t compute_grid[3];
+   uint32_t compute_unk924;
+   uint32_t compute_thread_alloc;
+   uint32_t compute_min_temps;
    bool mag_switchover_half;
    bool alpha_coverage_dither_emitted;
 
@@ -337,6 +354,12 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
 
 bool
 etna_render_condition_check(struct pipe_context *pctx);
+
+void
+etna_compute_init(struct pipe_context *pctx);
+
+void
+etna_compute_fini(struct pipe_context *pctx);
 
 #ifndef NDEBUG
 static inline void clear_atomic_emit_flag(struct etna_context **ctx_ptr) {

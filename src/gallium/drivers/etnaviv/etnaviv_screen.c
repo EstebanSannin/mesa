@@ -43,6 +43,7 @@
 
 #include "util/hash_table.h"
 #include "util/os_time.h"
+#include "util/u_debug.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
@@ -204,11 +205,65 @@ etna_init_single_shader_caps(struct etna_screen *screen, mesa_shader_stage shade
       (1 << PIPE_SHADER_IR_NIR);
 }
 
+/* Experimental: compute shaders with SSBOs, no shared memory, images or atomics yet. */
+static bool
+etna_compute_supported(struct etna_screen *screen)
+{
+   return screen->info->halti >= 5 &&
+          debug_get_bool_option("ETNA_EXPERIMENTAL_COMPUTE", false);
+}
+
 static void
 etna_init_shader_caps(struct etna_screen *screen)
 {
    etna_init_single_shader_caps(screen, MESA_SHADER_VERTEX);
    etna_init_single_shader_caps(screen, MESA_SHADER_FRAGMENT);
+
+   if (etna_compute_supported(screen)) {
+      struct pipe_shader_caps *caps =
+         (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_COMPUTE];
+
+      etna_init_single_shader_caps(screen, MESA_SHADER_COMPUTE);
+      caps->max_inputs = 0;
+      caps->max_outputs = 0;
+      caps->max_texture_samplers = 0;
+      caps->max_sampler_views = 0;
+      caps->max_shader_buffers = ETNA_MAX_SHADER_BUFFERS;
+      caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
+   }
+}
+
+static void
+etna_init_compute_caps(struct etna_screen *screen)
+{
+   struct pipe_compute_caps *caps =
+      (struct pipe_compute_caps *)&screen->base.compute_caps;
+   /* With CL_THREAD_ALLOCATION sized for the whole workgroup, barrier() works up to
+    * 256 invocations; 512 hangs (measured on GC7000 r6204 with a 1-temp kernel). */
+   const unsigned max_threads = debug_get_num_option("ETNA_CL_MAX_THREADS", 256);
+
+   if (!etna_compute_supported(screen))
+      return;
+
+   caps->address_bits = 32;
+   caps->grid_dimension = 3;
+   caps->max_grid_size[0] =
+   caps->max_grid_size[1] =
+   caps->max_grid_size[2] = 65535;
+   caps->max_block_size[0] = MIN2(max_threads, 1024);
+   caps->max_block_size[1] = MIN2(max_threads, 1024);
+   caps->max_block_size[2] = MIN2(max_threads, 64);
+   caps->max_threads_per_block = max_threads;
+   caps->max_local_size = 0;
+   caps->max_compute_units = screen->info->gpu.shader_core_count;
+   caps->max_clock_frequency = 1000;
+   caps->subgroup_sizes = 4;
+
+   uint64_t system_memory;
+   if (os_get_total_physical_memory(&system_memory)) {
+      caps->max_global_size = system_memory;
+      caps->max_mem_alloc_size = MIN2(system_memory, 1u << 27);
+   }
 }
 
 static bool
@@ -291,6 +346,12 @@ etna_init_screen_caps(struct etna_screen *screen)
    caps->alpha_test = !VIV_FEATURE(screen, ETNA_FEATURE_PE_NO_ALPHA_TEST);
 
    caps->draw_indirect = VIV_FEATURE(screen, ETNA_FEATURE_HALTI5);
+
+   caps->compute = etna_compute_supported(screen);
+   if (caps->compute) {
+      caps->shader_buffer_offset_alignment = 16;
+      caps->max_shader_buffer_size = 1 << 27;
+   }
 
    caps->glsl_feature_level =
    caps->glsl_feature_level_compatibility = screen->info->halti >= 2 ? 130 : 120;
@@ -1117,6 +1178,7 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    etna_resource_screen_init(pscreen);
 
    etna_init_shader_caps(screen);
+   etna_init_compute_caps(screen);
    etna_init_screen_caps(screen);
 
    screen->compiler->max_render_targets = screen->base.caps.max_render_targets;
