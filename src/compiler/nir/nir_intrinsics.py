@@ -1692,6 +1692,14 @@ load("shared_ir3", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
 # src[] = { address, 32-bit offset }.
 load("global_etna", [1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+# Atomics on the same address + offset form. src[] = { address, 32-bit offset, data }.
+intrinsic("global_atomic_etna", src_comp=[1, 1, 1], dest_comp=1, indices=[ATOMIC_OP])
+# Compare-and-swap takes the new and the compared value as one vec2.
+# src[] = { address, 32-bit offset, vec2(new value, compared value) }.
+intrinsic("global_atomic_swap_etna", src_comp=[1, 1, 2], dest_comp=1, indices=[ATOMIC_OP])
+# GPU address of a bound SSBO. src[] = { buffer index }.
+intrinsic("load_ssbo_address_etna", src_comp=[1], dest_comp=1, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # IR3-specific bindless handle specifier. Similar to vulkan_resource_index, but
 # without the binding because the hardware expects a single flattened index

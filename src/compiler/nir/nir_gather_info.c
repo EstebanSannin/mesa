@@ -374,6 +374,8 @@ nir_intrinsic_writes_external_memory(const nir_intrinsic_instr *instr)
    case nir_intrinsic_store_global:
    case nir_intrinsic_store_global_offset:
    case nir_intrinsic_store_global_etna:
+   case nir_intrinsic_global_atomic_etna:
+   case nir_intrinsic_global_atomic_swap_etna:
    case nir_intrinsic_store_global_amd:
    case nir_intrinsic_store_buffer_amd:
    case nir_intrinsic_store_ssbo:
