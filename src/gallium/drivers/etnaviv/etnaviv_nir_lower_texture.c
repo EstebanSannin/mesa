@@ -554,6 +554,48 @@ lower_offset_filter(const nir_instr *instr, const void *data)
    return false;
 }
 
+/* In compute shaders the texture unit takes the layer of a 2D array texture
+ * as a coordinate normalized to the layer count and rounds it to the nearest
+ * layer, as for no other stage: found by experiment on GC7000 r6204, where
+ * texture() at layer 1.0 of a 6-layer array returned layer 5. Select the GL
+ * layer, clamp(floor(z + 0.5), 0, layers - 1), and pass it scaled down by
+ * the layer count; the quarter keeps it off a rounding boundary. */
+static bool
+lower_cs_array_layer(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+{
+   if (!tex->is_array || tex->sampler_dim != GLSL_SAMPLER_DIM_2D)
+      return false;
+
+   switch (tex->op) {
+   case nir_texop_tex:
+   case nir_texop_txb:
+   case nir_texop_txl:
+   case nir_texop_txd:
+   case nir_texop_tg4:
+      break;
+   default:
+      return false;
+   }
+
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   assert(coord_idx >= 0);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   const unsigned layer_comp = tex->coord_components - 1;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *sizes = nir_load_texture_size_etna(b, 32, nir_imm_int(b, tex->texture_index));
+   nir_def *layers = nir_i2f32(b, nir_channel(b, sizes, 2));
+   nir_def *layer = nir_ffloor(b, nir_fadd_imm(b, nir_channel(b, coord, layer_comp), 0.5));
+
+   layer = nir_fmin(b, nir_fmax(b, layer, nir_imm_float(b, 0.0)), nir_fadd_imm(b, layers, -1.0));
+   layer = nir_fdiv(b, nir_fadd_imm(b, layer, 0.25), layers);
+
+   nir_src_rewrite(&tex->src[coord_idx].src, nir_vector_insert_imm(b, coord, layer, layer_comp));
+
+   return true;
+}
+
 bool
 etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct etna_core_info *info)
 {
@@ -577,6 +619,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
    }
 
    NIR_PASS(progress, s, nir_lower_tex, &lower_tex_options);
+
+   if (s->info.stage == MESA_SHADER_COMPUTE)
+      NIR_PASS(progress, s, nir_shader_tex_pass, lower_cs_array_layer,
+               nir_metadata_control_flow, NULL);
 
    if (key->has_sample_tex_compare)
       NIR_PASS(progress, s, nir_lower_tex_shadow, key->num_texture_states,
