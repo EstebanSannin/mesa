@@ -21,6 +21,7 @@
 #include "etnaviv_resource.h"
 #include "etnaviv_screen.h"
 #include "etnaviv_shader.h"
+#include "etnaviv_state.h"
 #include "etnaviv_texture.h"
 #include "etnaviv_uniforms.h"
 
@@ -276,6 +277,9 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    u_foreach_bit(i, sb->enabled_mask)
       resource_written(ctx, sb->sb[i].buffer);
 
+   /* indirectly indexed uniforms are read from constant buffer 0 as a UBO */
+   etna_upload_constbufs(ctx, MESA_SHADER_COMPUTE, v);
+
    struct etna_constbuf_state *cb = &ctx->constant_buffer[MESA_SHADER_COMPUTE];
    u_foreach_bit(i, cb->enabled_mask) {
       if (cb->cb[i].buffer)
@@ -316,6 +320,8 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    }
 
    etna_set_state(stream, VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENCL);
+   /* memory the CPU wrote (buffers, uploaded constants) may be stale in L1 */
+   etna_set_state(stream, VIVS_GL_FLUSH_CACHE, VIVS_GL_FLUSH_CACHE_SHADER_L1);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
 
    etna_uniforms_write(ctx, v, ctx->constant_buffer[MESA_SHADER_COMPUTE].cb);
