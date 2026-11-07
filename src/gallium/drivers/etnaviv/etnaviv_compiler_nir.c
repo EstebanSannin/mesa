@@ -1581,6 +1581,36 @@ image_param(nir_builder *b, nir_def *index, enum etna_image_param param)
    return nir_load_image_param_etna(b, index, .base = param);
 }
 
+/* f32 to f16 bits with 32-bit integer math (no 16-bit ALU here): round to
+ * nearest, tiny values flush to zero, overflow to infinity, NaN stays NaN */
+static nir_def *
+float_to_half_bits(nir_builder *b, nir_def *f)
+{
+   nir_def *sign = nir_iand_imm(b, nir_ushr_imm(b, f, 16), 0x8000);
+   nir_def *abs = nir_iand_imm(b, f, 0x7fffffff);
+   /* rebias the exponent from 127 to 15 and drop 13 mantissa bits, rounding
+    * to nearest even (add 0xfff plus the lowest kept bit) */
+   nir_def *odd = nir_iand_imm(b, nir_ushr_imm(b, abs, 13), 1);
+   nir_def *normal = nir_ushr_imm(b, nir_iadd(b, nir_iadd_imm(b, abs, 0xc8000fff), odd), 13);
+   nir_def *h = nir_bcsel(b, nir_ult(b, abs, nir_imm_int(b, 113 << 23)), nir_imm_int(b, 0), normal);
+   h = nir_bcsel(b, nir_uge(b, abs, nir_imm_int(b, 0x477ff000)), nir_imm_int(b, 0x7c00), h);
+   h = nir_bcsel(b, nir_ult(b, nir_imm_int(b, 0x7f800000), abs), nir_imm_int(b, 0x7e00), h);
+   return nir_ior(b, sign, h);
+}
+
+static nir_def *
+pack_image_texel(nir_builder *b, enum pipe_format format, nir_def *rgba)
+{
+   if (format != PIPE_FORMAT_R16G16B16A16_FLOAT)
+      return nir_format_pack_rgba(b, format, rgba);
+
+   nir_def *h[4];
+   for (unsigned i = 0; i < 4; i++)
+      h[i] = float_to_half_bits(b, nir_channel(b, rgba, i));
+   return nir_vec2(b, nir_ior(b, h[0], nir_ishl_imm(b, h[1], 16)),
+                   nir_ior(b, h[2], nir_ishl_imm(b, h[3], 16)));
+}
+
 static void
 image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *align)
 {
@@ -1604,7 +1634,9 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    /* image derefs to binding indices, like gl_nir_lower_images() */
    if (intr->intrinsic == nir_intrinsic_image_deref_load ||
        intr->intrinsic == nir_intrinsic_image_deref_store ||
-       intr->intrinsic == nir_intrinsic_image_deref_size) {
+       intr->intrinsic == nir_intrinsic_image_deref_size ||
+       intr->intrinsic == nir_intrinsic_image_deref_atomic ||
+       intr->intrinsic == nir_intrinsic_image_deref_atomic_swap) {
       nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
       nir_variable *var = nir_deref_instr_get_variable(deref);
       nir_def *index = nir_iadd_imm(b, nir_build_deref_offset(b, deref, image_type_size_align_1),
@@ -1615,7 +1647,9 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 
    if (intr->intrinsic != nir_intrinsic_image_load &&
        intr->intrinsic != nir_intrinsic_image_store &&
-       intr->intrinsic != nir_intrinsic_image_size)
+       intr->intrinsic != nir_intrinsic_image_size &&
+       intr->intrinsic != nir_intrinsic_image_atomic &&
+       intr->intrinsic != nir_intrinsic_image_atomic_swap)
       return false;
 
    nir_def *index = intr->src[0].ssa;
@@ -1662,7 +1696,17 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
                              : NULL;
    const unsigned words = DIV_ROUND_UP(texel_bytes, 4);
 
-   if (intr->intrinsic == nir_intrinsic_image_load) {
+   if (intr->intrinsic == nir_intrinsic_image_atomic) {
+      /* r32ui and r32i only */
+      nir_def_replace(&intr->def,
+                      nir_global_atomic_etna(b, 32, addr, offset, intr->src[3].ssa,
+                                             .atomic_op = nir_intrinsic_atomic_op(intr)));
+   } else if (intr->intrinsic == nir_intrinsic_image_atomic_swap) {
+      nir_def_replace(&intr->def,
+                      nir_global_atomic_swap_etna(b, 32, addr, offset,
+                                                  nir_vec2(b, intr->src[4].ssa, intr->src[3].ssa),
+                                                  .atomic_op = nir_intrinsic_atomic_op(intr)));
+   } else if (intr->intrinsic == nir_intrinsic_image_load) {
       nir_def *texel = nir_load_global_etna(b, words, 32, addr, offset);
       if (planes)
          texel = nir_vec4(b, nir_channel(b, texel, 0), nir_channel(b, texel, 1),
@@ -1671,7 +1715,7 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
       nir_def *rgba = nir_format_unpack_rgba(b, texel, format);
       nir_def_replace(&intr->def, nir_trim_vector(b, rgba, intr->def.num_components));
    } else {
-      nir_def *texel = nir_format_pack_rgba(b, format, intr->src[3].ssa);
+      nir_def *texel = pack_image_texel(b, format, intr->src[3].ssa);
       nir_store_global_etna(b, nir_channels(b, texel, BITFIELD_MASK(words)), addr, offset,
                             .write_mask = BITFIELD_MASK(words));
       if (planes)
