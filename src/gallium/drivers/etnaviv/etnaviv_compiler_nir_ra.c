@@ -168,7 +168,7 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
          /* can't have dst swizzle or sparse writemask on UBO and constant loads */
          if (intr->intrinsic == nir_intrinsic_load_ubo ||
-             intr->intrinsic == nir_intrinsic_load_ssbo ||
+             intr->intrinsic == nir_intrinsic_load_global_etna ||
              intr->intrinsic == nir_intrinsic_load_constant) {
             assert(def == &intr->def);
             if (def->num_components == 2)
@@ -226,6 +226,13 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
 
          ra_set_node_reg(g, live_map[def_index(impl, def)], reg);
       }
+   }
+
+   /* a def nobody reads (an atomic's old value) is still written: keep its
+    * register from overlapping values that are live across that instruction */
+   for (unsigned i = 0; i < num_nodes; i++) {
+      if (defs[i].live_end <= defs[i].live_start)
+         defs[i].live_end = defs[i].live_start + 1;
    }
 
    /* add interference for intersecting live ranges */

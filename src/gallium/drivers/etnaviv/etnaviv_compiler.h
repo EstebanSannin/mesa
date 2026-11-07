@@ -133,6 +133,9 @@ struct etna_shader_variant {
    /* compute: number of work-item ID registers the thread walker fills */
    uint32_t cs_input_count;
 
+   /* compute: bytes of shared memory per workgroup (one DDR slice each) */
+   uint32_t cs_shared_size;
+
    /* shader is larger than GPU instruction limit, thus needs icache */
    bool needs_icache;
 

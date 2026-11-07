@@ -151,6 +151,7 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_SSBO_ADDR,
    ETNA_UNIFORM_SSBO_SIZE,
    ETNA_UNIFORM_NUM_WORKGROUPS,
+   ETNA_UNIFORM_SHARED_ADDR,
 };
 
 struct etna_shader_uniform_info {
@@ -293,6 +294,8 @@ struct etna_context {
 
    /* experimental compute */
    uint32_t compute_grid[3];
+   struct etna_bo *compute_shared_bo;
+   uint32_t compute_shared_bo_size;
    uint32_t compute_unk924;
    uint32_t compute_thread_alloc;
    uint32_t compute_min_temps;

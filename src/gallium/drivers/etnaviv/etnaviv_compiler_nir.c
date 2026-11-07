@@ -498,7 +498,9 @@ get_src(struct etna_compile *c, nir_src *src)
       case nir_intrinsic_load_vertex_id:
       case nir_intrinsic_load_uniform:
       case nir_intrinsic_load_ubo:
-      case nir_intrinsic_load_ssbo:
+      case nir_intrinsic_load_global_etna:
+      case nir_intrinsic_global_atomic_etna:
+      case nir_intrinsic_global_atomic_swap_etna:
       case nir_intrinsic_load_constant:
       case nir_intrinsic_load_reg:
       case nir_intrinsic_ddx:
@@ -681,6 +683,27 @@ emit_tex(struct etna_compile *c, nir_tex_instr * tex)
                  src2 ? get_src(c, src2) : SRC_DISABLE);
 }
 
+/* opcode and type of an atomic; NOP if the hardware has none */
+static enum isa_opc
+atomic_opcode(nir_atomic_op op, enum isa_type *type)
+{
+   *type = ISA_TYPE_S32;
+
+   switch (op) {
+   case nir_atomic_op_iadd:    return ISA_OPC_ATOMIC_ADD;
+   case nir_atomic_op_imin:    return ISA_OPC_ATOMIC_MIN;
+   case nir_atomic_op_imax:    return ISA_OPC_ATOMIC_MAX;
+   case nir_atomic_op_iand:    return ISA_OPC_ATOMIC_AND;
+   case nir_atomic_op_ior:     return ISA_OPC_ATOMIC_OR;
+   case nir_atomic_op_ixor:    return ISA_OPC_ATOMIC_XOR;
+   case nir_atomic_op_cmpxchg: return ISA_OPC_ATOMIC_CMP_XCHG;
+   case nir_atomic_op_umin:    *type = ISA_TYPE_U32; return ISA_OPC_ATOMIC_MIN;
+   case nir_atomic_op_umax:    *type = ISA_TYPE_U32; return ISA_OPC_ATOMIC_MAX;
+   case nir_atomic_op_xchg:    *type = ISA_TYPE_U32; return ISA_OPC_ATOMIC_XCHG;
+   default:                    return ISA_OPC_NOP;
+   }
+}
+
 static void
 emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
 {
@@ -789,27 +812,17 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
          .src[2] = get_src(c, &intr->src[0]),
       });
       break;
-   case nir_intrinsic_load_ssbo: {
-      if (!nir_src_is_const(intr->src[0])) {
-         compile_error(c, "dynamically indexed SSBO\n");
-         break;
-      }
-      unsigned idx = nir_src_as_const_value(intr->src[0])[0].u32;
+   case nir_intrinsic_load_global_etna: {
       unsigned dst_swiz;
       emit_inst(c, &(struct etna_inst) {
          .opcode = ISA_OPC_LOAD,
          .type = ISA_TYPE_U32,
          .dst = ra_def(c, &intr->def, &dst_swiz),
          .src[0] = get_src(c, &intr->src[1]),
-         .src[1] = const_src(c, &CONST_VAL(ETNA_UNIFORM_SSBO_ADDR, idx), 1),
+         .src[1] = get_src(c, &intr->src[0]),
       });
    } break;
-   case nir_intrinsic_store_ssbo: {
-      if (!nir_src_is_const(intr->src[1])) {
-         compile_error(c, "dynamically indexed SSBO\n");
-         break;
-      }
-      unsigned idx = nir_src_as_const_value(intr->src[1])[0].u32;
+   case nir_intrinsic_store_global_etna:
       emit_inst(c, &(struct etna_inst) {
          .opcode = ISA_OPC_STORE,
          .type = ISA_TYPE_U32,
@@ -817,9 +830,31 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
          .dst = {
             .write_mask = nir_intrinsic_write_mask(intr),
          },
-         .src[0] = const_src(c, &CONST_VAL(ETNA_UNIFORM_SSBO_ADDR, idx), 1),
+         .src[0] = get_src(c, &intr->src[1]),
          .src[1] = get_src(c, &intr->src[2]),
          .src[2] = get_src(c, &intr->src[0]),
+      });
+      break;
+   case nir_intrinsic_global_atomic_etna:
+   case nir_intrinsic_global_atomic_swap_etna: {
+      enum isa_type type;
+      enum isa_opc opc = atomic_opcode(nir_intrinsic_atomic_op(intr), &type);
+      unsigned dst_swiz;
+
+      if (opc == ISA_OPC_NOP) {
+         compile_error(c, "unsupported atomic op %d\n", nir_intrinsic_atomic_op(intr));
+         break;
+      }
+
+      /* like the blob: address, offset, data (vec2 new/compared for cmpxchg) */
+      emit_inst(c, &(struct etna_inst) {
+         .opcode = opc,
+         .type = type,
+         .skphp = 1,
+         .dst = ra_def(c, &intr->def, &dst_swiz),
+         .src[0] = get_src(c, &intr->src[0]),
+         .src[1] = get_src(c, &intr->src[1]),
+         .src[2] = get_src(c, &intr->src[2]),
       });
    } break;
    case nir_intrinsic_barrier:
@@ -1234,6 +1269,16 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             case nir_intrinsic_get_ssbo_size:
                value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_SIZE, nir_src_as_uint(intr->src[0]));
                break;
+            case nir_intrinsic_load_shared_base_ptr:
+               value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_ADDR, 0);
+               break;
+            case nir_intrinsic_load_ssbo_address_etna:
+               if (!nir_src_is_const(intr->src[0])) {
+                  compile_error(c, "dynamically indexed SSBO\n");
+                  continue;
+               }
+               value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_ADDR, nir_src_as_uint(intr->src[0]));
+               break;
             default:
                continue;
             }
@@ -1277,10 +1322,15 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
                nir_src_rewrite(src, nir_mov(&b, src->ssa));
             }
          } break;
-         case nir_intrinsic_load_ssbo:
-         case nir_intrinsic_store_ssbo: {
-            const bool store = intr->intrinsic == nir_intrinsic_store_ssbo;
-            nir_src *srcs[] = { &intr->src[store ? 2 : 1], store ? &intr->src[0] : NULL };
+         case nir_intrinsic_load_global_etna:
+         case nir_intrinsic_store_global_etna:
+         case nir_intrinsic_global_atomic_etna:
+         case nir_intrinsic_global_atomic_swap_etna: {
+            /* the address is a uniform: offset and data go through registers */
+            const bool store = intr->intrinsic == nir_intrinsic_store_global_etna;
+            const bool load = intr->intrinsic == nir_intrinsic_load_global_etna;
+            nir_src *srcs[] = { store ? &intr->src[2] : &intr->src[1],
+                                store ? &intr->src[0] : load ? NULL : &intr->src[2] };
 
             for (unsigned i = 0; i < ARRAY_SIZE(srcs); i++) {
                if (srcs[i] && nir_src_is_const(*srcs[i])) {
@@ -1440,6 +1490,113 @@ lower_cs_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* Shared memory lives in DDR, one slice per workgroup: address = shared base +
+ * linear workgroup index * slice size + offset. barrier() keeps the threads of
+ * a group in step, and the slices of different groups never overlap. */
+static bool
+lower_shared_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned slice = *(unsigned *)data;
+   unsigned off_src;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_shared:
+   case nir_intrinsic_shared_atomic:
+   case nir_intrinsic_shared_atomic_swap:
+      off_src = 0;
+      break;
+   case nir_intrinsic_store_shared:
+      off_src = 1;
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *wid = nir_load_workgroup_id(b);
+   nir_def *num = nir_load_num_workgroups(b);
+   nir_def *group = nir_iadd(b, nir_channel(b, wid, 0),
+                             nir_imul(b, nir_channel(b, num, 0),
+                                      nir_iadd(b, nir_channel(b, wid, 1),
+                                               nir_imul(b, nir_channel(b, num, 1),
+                                                        nir_channel(b, wid, 2)))));
+   nir_def *offset = nir_iadd(b, nir_imul_imm(b, group, slice),
+                              nir_iadd_imm(b, intr->src[off_src].ssa, nir_intrinsic_base(intr)));
+   nir_def *addr = nir_load_shared_base_ptr(b, 1, 32);
+   nir_def *repl = NULL;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_shared:
+      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size, addr, offset);
+      break;
+   case nir_intrinsic_store_shared:
+      nir_store_global_etna(b, intr->src[0].ssa, addr, offset,
+                            .write_mask = nir_intrinsic_write_mask(intr));
+      break;
+   case nir_intrinsic_shared_atomic:
+      repl = nir_global_atomic_etna(b, intr->def.bit_size, addr, offset, intr->src[1].ssa,
+                                    .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   case nir_intrinsic_shared_atomic_swap:
+      repl = nir_global_atomic_swap_etna(b, intr->def.bit_size, addr, offset,
+                                         nir_vec2(b, intr->src[2].ssa, intr->src[1].ssa),
+                                         .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   default:
+      UNREACHABLE("not a shared memory access");
+   }
+
+   if (repl)
+      nir_def_rewrite_uses(&intr->def, repl);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+/* SSBO access becomes address + offset: the address is a uniform the driver
+ * fills with the GPU address of the bound buffer */
+static bool
+lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   nir_def *repl = NULL;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ssbo:
+      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size,
+                                  nir_load_ssbo_address_etna(b, intr->src[0].ssa),
+                                  intr->src[1].ssa);
+      break;
+   case nir_intrinsic_store_ssbo:
+      nir_store_global_etna(b, intr->src[0].ssa,
+                            nir_load_ssbo_address_etna(b, intr->src[1].ssa),
+                            intr->src[2].ssa,
+                            .write_mask = nir_intrinsic_write_mask(intr));
+      break;
+   case nir_intrinsic_ssbo_atomic:
+      repl = nir_global_atomic_etna(b, intr->def.bit_size,
+                                    nir_load_ssbo_address_etna(b, intr->src[0].ssa),
+                                    intr->src[1].ssa, intr->src[2].ssa,
+                                    .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   case nir_intrinsic_ssbo_atomic_swap:
+      repl = nir_global_atomic_swap_etna(b, intr->def.bit_size,
+                                         nir_load_ssbo_address_etna(b, intr->src[0].ssa),
+                                         intr->src[1].ssa,
+                                         nir_vec2(b, intr->src[3].ssa, intr->src[2].ssa),
+                                         .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   default:
+      return false;
+   }
+
+   if (repl)
+      nir_def_rewrite_uses(&intr->def, repl);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 static uint8_t
 alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
 {
@@ -1516,9 +1673,22 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
 
    if (s->info.stage == MESA_SHADER_COMPUTE) {
       v->uses_discard = false;
+
+      NIR_PASS(_, s, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+               glsl_get_cl_type_size_align);
+      NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_shared,
+               nir_address_format_32bit_offset);
+      v->cs_shared_size = align(s->info.shared_size, 16);
+      if (v->cs_shared_size)
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_shared_access,
+                  nir_metadata_none, &v->cs_shared_size);
+
       NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_cs_intrinsic,
                nir_metadata_control_flow, &v->cs_input_count);
    }
+
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,
+            nir_metadata_control_flow, NULL);
 
    /* setup input linking */
    struct etna_shader_io_file *sf = &v->infile;

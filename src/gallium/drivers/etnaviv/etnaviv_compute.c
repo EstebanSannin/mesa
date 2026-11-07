@@ -152,6 +152,29 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
    memcpy(ctx->compute_grid, grid, sizeof(ctx->compute_grid));
 
+   /* one shared memory slice per workgroup of this dispatch */
+   if (v->cs_shared_size) {
+      const uint64_t need = (uint64_t)v->cs_shared_size * grid[0] * grid[1] * grid[2];
+
+      if (need > UINT32_MAX) {
+         BUG("shared memory for %u workgroups does not fit", grid[0] * grid[1] * grid[2]);
+         return;
+      }
+
+      if (need > ctx->compute_shared_bo_size) {
+         if (ctx->compute_shared_bo)
+            etna_bo_del(ctx->compute_shared_bo);
+         ctx->compute_shared_bo_size = align(need, 64 * 1024);
+         ctx->compute_shared_bo = etna_bo_new(ctx->screen->dev, ctx->compute_shared_bo_size,
+                                              DRM_ETNA_GEM_CACHE_WC);
+         if (!ctx->compute_shared_bo) {
+            ctx->compute_shared_bo_size = 0;
+            BUG("no memory for compute shared memory");
+            return;
+         }
+      }
+   }
+
    /* Make sure the frontend-visible state of the buffers is tracked. */
    struct etna_shader_buffer_state *sb = &ctx->shader_buffers[MESA_SHADER_COMPUTE];
    u_foreach_bit(i, sb->enabled_mask)
@@ -273,6 +296,9 @@ void
 etna_compute_fini(struct pipe_context *pctx)
 {
    struct etna_context *ctx = etna_context(pctx);
+
+   if (ctx->compute_shared_bo)
+      etna_bo_del(ctx->compute_shared_bo);
 
    for (unsigned s = 0; s < MESA_SHADER_STAGES; s++)
       for (unsigned i = 0; i < ETNA_MAX_SHADER_BUFFERS; i++)

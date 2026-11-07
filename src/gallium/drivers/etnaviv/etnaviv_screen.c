@@ -254,7 +254,7 @@ etna_init_compute_caps(struct etna_screen *screen)
    caps->max_block_size[1] = MIN2(max_threads, 1024);
    caps->max_block_size[2] = MIN2(max_threads, 64);
    caps->max_threads_per_block = max_threads;
-   caps->max_local_size = 0;
+   caps->max_local_size = 32768;
    caps->max_compute_units = screen->info->gpu.shader_core_count;
    caps->max_clock_frequency = 1000;
    caps->subgroup_sizes = 4;

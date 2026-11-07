@@ -238,6 +238,13 @@ etna_uniforms_write(const struct etna_context *ctx,
          etna_cmd_stream_emit(stream, ctx->compute_grid[val]);
          break;
 
+      case ETNA_UNIFORM_SHARED_ADDR:
+         etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+            .bo = ctx->compute_shared_bo,
+            .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+         });
+         break;
+
       case ETNA_UNIFORM_UNUSED:
          etna_cmd_stream_emit(stream, 0);
          break;

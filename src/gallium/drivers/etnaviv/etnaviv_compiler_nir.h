@@ -207,6 +207,11 @@ real_def(nir_def *def, unsigned *swiz, unsigned *mask)
    bool can_bypass_src = !nir_def_used_by_if(def);
    nir_instr *p_instr = nir_def_instr(def);
 
+   /* an intrinsic result nobody reads (an atomic's old value) is still
+    * written by the instruction, so it needs its own register */
+   if (nir_def_is_unused(def) && p_instr->type == nir_instr_type_intrinsic)
+      return def;
+
    /* if used by a vecN, the "real" destination becomes the vecN destination
     * lower_alu guarantees that values used by a vecN are only used by that vecN
     * we can apply the same logic to movs in a some cases too
@@ -292,7 +297,9 @@ def_for_instr(nir_instr *instr)
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       if (intr->intrinsic == nir_intrinsic_load_uniform ||
           intr->intrinsic == nir_intrinsic_load_ubo ||
-          intr->intrinsic == nir_intrinsic_load_ssbo ||
+          intr->intrinsic == nir_intrinsic_load_global_etna ||
+          intr->intrinsic == nir_intrinsic_global_atomic_etna ||
+          intr->intrinsic == nir_intrinsic_global_atomic_swap_etna ||
           intr->intrinsic == nir_intrinsic_load_constant ||
           intr->intrinsic == nir_intrinsic_load_input ||
           intr->intrinsic == nir_intrinsic_load_instance_id ||
