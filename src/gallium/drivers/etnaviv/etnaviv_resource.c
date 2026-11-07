@@ -719,6 +719,14 @@ etna_resource_create(struct pipe_screen *pscreen,
    if (eil_format_is_emulated_128bit(templat->format))
       layout = ETNA_LAYOUT_TILED;
 
+   /* Experimental compute addresses images linearly in the shader, and a
+    * texture can be bound as an image at any time: keep the textures in
+    * image formats linear. Rendering goes through the render shadow. */
+   if (pscreen->caps.compute && templat->nr_samples <= 1 &&
+       !(templat->bind & PIPE_BIND_DEPTH_STENCIL) &&
+       etna_format_is_image_format(templat->format))
+      layout = ETNA_LAYOUT_LINEAR;
+
    if (/* linear base or scanout without modifier requested */
        (templat->bind & (PIPE_BIND_LINEAR | PIPE_BIND_SCANOUT)) ||
        /* compressed textures don't use tiling, they have their own "tiles" */

@@ -89,6 +89,13 @@ struct etna_shader_buffer_state {
    uint32_t enabled_mask;
 };
 
+#define ETNA_MAX_SHADER_IMAGES 8
+
+struct etna_shader_image_state {
+   struct pipe_image_view img[ETNA_MAX_SHADER_IMAGES];
+   uint32_t enabled_mask;
+};
+
 struct etna_vertexbuf_state {
    struct pipe_vertex_buffer vb[PIPE_MAX_ATTRIBS];
    struct compiled_set_vertex_buffer cvb[PIPE_MAX_ATTRIBS];
@@ -152,6 +159,13 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_SSBO_SIZE,
    ETNA_UNIFORM_NUM_WORKGROUPS,
    ETNA_UNIFORM_SHARED_ADDR,
+   /* image parameters, in the order of the BASE of load_image_param_etna */
+   ETNA_UNIFORM_IMAGE_ADDR,
+   ETNA_UNIFORM_IMAGE_STRIDE,
+   ETNA_UNIFORM_IMAGE_LAYER_STRIDE,
+   ETNA_UNIFORM_IMAGE_WIDTH,
+   ETNA_UNIFORM_IMAGE_HEIGHT,
+   ETNA_UNIFORM_IMAGE_DEPTH,
 };
 
 struct etna_shader_uniform_info {
@@ -248,6 +262,7 @@ struct etna_context {
    struct pipe_sampler_view *sampler_view[PIPE_MAX_SAMPLERS];
    struct etna_constbuf_state constant_buffer[MESA_SHADER_STAGES];
    struct etna_shader_buffer_state shader_buffers[MESA_SHADER_STAGES];
+   struct etna_shader_image_state shader_images[MESA_SHADER_STAGES];
    struct etna_vertexbuf_state vertex_buffer;
    struct etna_index_buffer index_buffer;
    struct etna_shader_state shader;

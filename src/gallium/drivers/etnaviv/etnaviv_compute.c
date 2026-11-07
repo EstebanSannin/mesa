@@ -13,6 +13,7 @@
  * (drivers/gpu/drm/etnaviv/etnaviv_flop_reset.c).
  */
 
+#include "etnaviv_clear_blit.h"
 #include "etnaviv_compiler.h"
 #include "etnaviv_context.h"
 #include "etnaviv_debug.h"
@@ -56,6 +57,46 @@ etna_set_shader_buffers(struct pipe_context *pctx, mesa_shader_stage shader,
          so->enabled_mask &= ~BITFIELD_BIT(start + i);
       }
    }
+}
+
+static void
+etna_set_shader_images(struct pipe_context *pctx, mesa_shader_stage shader,
+                       unsigned start, unsigned count, unsigned unbind_num_trailing_slots,
+                       const struct pipe_image_view *images)
+{
+   struct etna_context *ctx = etna_context(pctx);
+   struct etna_shader_image_state *so = &ctx->shader_images[shader];
+
+   for (unsigned i = 0; i < count + unbind_num_trailing_slots; i++) {
+      const unsigned n = start + i;
+      struct pipe_image_view *dst = &so->img[n];
+
+      if (n >= ETNA_MAX_SHADER_IMAGES)
+         break;
+
+      if (i < count && images && images[i].resource &&
+          images[i].resource->target != PIPE_BUFFER) {
+         util_copy_image_view(dst, &images[i]);
+         so->enabled_mask |= BITFIELD_BIT(n);
+      } else {
+         util_copy_image_view(dst, NULL);
+         so->enabled_mask &= ~BITFIELD_BIT(n);
+      }
+   }
+}
+
+/* Bring the linear base of an image up to date: newer contents may sit in
+ * the render sibling or behind tile status. */
+static void
+etna_compute_prepare_image(struct etna_context *ctx, const struct pipe_image_view *img)
+{
+   struct etna_resource *base = etna_resource(img->resource);
+   const unsigned lvl = img->u.tex.level;
+
+   if (base->render && etna_resource_newer(etna_resource(base->render), base))
+      etna_copy_resource(&ctx->base, &base->base, base->render, lvl, lvl, false);
+   else if (etna_resource_needs_flush(base))
+      etna_copy_resource(&ctx->base, &base->base, &base->base, lvl, lvl, false);
 }
 
 static void *
@@ -248,6 +289,15 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    struct etna_saved_textures saved;
    const uint32_t textures = shader->textures_used;
 
+   struct etna_shader_image_state *images = &ctx->shader_images[MESA_SHADER_COMPUTE];
+   u_foreach_bit(i, images->enabled_mask) {
+      etna_compute_prepare_image(ctx, &images->img[i]);
+      if (images->img[i].access & PIPE_IMAGE_ACCESS_WRITE)
+         resource_written(ctx, images->img[i].resource);
+      else
+         resource_read(ctx, images->img[i].resource);
+   }
+
    if (textures) {
       etna_compute_swap_textures(ctx, &saved, true);
       u_foreach_bit(i, ctx->active_sampler_views & textures) {
@@ -328,6 +378,13 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    if (textures)
       etna_compute_swap_textures(ctx, &saved, false);
 
+   /* the linear base is now the newest copy of written images */
+   u_foreach_bit(i, images->enabled_mask) {
+      if (images->img[i].access & PIPE_IMAGE_ACCESS_WRITE)
+         etna_resource_level_mark_changed(
+            &etna_resource(images->img[i].resource)->levels[images->img[i].u.tex.level]);
+   }
+
    /* The dispatch clobbered the 3D shader state: start over at the next draw. */
    ctx->needs_gpu_state_reset = true;
    ctx->dirty = ~0L;
@@ -354,6 +411,7 @@ etna_compute_init(struct pipe_context *pctx)
    pctx->get_compute_state_info = etna_get_compute_state_info;
    pctx->launch_grid = etna_launch_grid;
    pctx->set_shader_buffers = etna_set_shader_buffers;
+   pctx->set_shader_images = etna_set_shader_images;
    pctx->memory_barrier = etna_memory_barrier;
 }
 
@@ -368,7 +426,10 @@ etna_compute_fini(struct pipe_context *pctx)
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
       pipe_sampler_view_reference(&ctx->cs_sampler_view[i], NULL);
 
-   for (unsigned s = 0; s < MESA_SHADER_STAGES; s++)
+   for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
       for (unsigned i = 0; i < ETNA_MAX_SHADER_BUFFERS; i++)
          pipe_resource_reference(&ctx->shader_buffers[s].sb[i].buffer, NULL);
+      for (unsigned i = 0; i < ETNA_MAX_SHADER_IMAGES; i++)
+         util_copy_image_view(&ctx->shader_images[s].img[i], NULL);
+   }
 }

@@ -229,6 +229,7 @@ etna_init_shader_caps(struct etna_screen *screen)
       caps->max_texture_samplers = screen->specs.fragment_sampler_count;
       caps->max_sampler_views = screen->specs.fragment_sampler_count;
       caps->max_shader_buffers = ETNA_MAX_SHADER_BUFFERS;
+      caps->max_shader_images = ETNA_MAX_SHADER_IMAGES;
       caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
    }
 }
@@ -641,6 +642,10 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
       if (gpu_supports_vertex_format(screen, format))
          allowed |= PIPE_BIND_VERTEX_BUFFER;
    }
+
+   if ((usage & PIPE_BIND_SHADER_IMAGE) && pscreen->caps.compute &&
+       target != PIPE_BUFFER && sample_count <= 1 && etna_format_is_image_format(format))
+      allowed |= PIPE_BIND_SHADER_IMAGE;
 
    if (usage & PIPE_BIND_INDEX_BUFFER) {
       /* must be supported index format */

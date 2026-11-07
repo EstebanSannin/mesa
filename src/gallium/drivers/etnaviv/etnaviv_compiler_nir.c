@@ -42,6 +42,9 @@
 #include "util/u_memory.h"
 #include "util/register_allocate.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_deref.h"
+#include "compiler/nir/nir_format_convert.h"
+#include "util/format/u_format.h"
 
 #include "util/compiler.h"
 #include "util/half_float.h"
@@ -1272,6 +1275,14 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             case nir_intrinsic_load_shared_base_ptr:
                value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_ADDR, 0);
                break;
+            case nir_intrinsic_load_image_param_etna:
+               if (!nir_src_is_const(intr->src[0])) {
+                  compile_error(c, "dynamically indexed image\n");
+                  continue;
+               }
+               value[0] = CONST_VAL(ETNA_UNIFORM_IMAGE_ADDR + nir_intrinsic_base(intr),
+                                    nir_src_as_uint(intr->src[0]));
+               break;
             case nir_intrinsic_load_ssbo_address_etna:
                if (!nir_src_is_const(intr->src[0])) {
                   compile_error(c, "dynamically indexed SSBO\n");
@@ -1553,6 +1564,101 @@ lower_shared_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+enum etna_image_param {
+   ETNA_IMAGE_ADDR,
+   ETNA_IMAGE_STRIDE,
+   ETNA_IMAGE_LAYER_STRIDE,
+   ETNA_IMAGE_WIDTH,
+   ETNA_IMAGE_HEIGHT,
+   ETNA_IMAGE_DEPTH,
+};
+
+static nir_def *
+image_param(nir_builder *b, nir_def *index, enum etna_image_param param)
+{
+   return nir_load_image_param_etna(b, index, .base = param);
+}
+
+static void
+image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *align)
+{
+   unsigned s = glsl_type_is_array(type) ? glsl_get_aoa_size(type) : 1;
+
+   *size = s;
+   *align = s;
+}
+
+/* Images are linear (see etna_resource_create()): load and store texels with
+ * LOAD/STORE at base + x * bpp + y * row stride + layer * layer stride, and
+ * convert them with the format's pack/unpack. */
+static bool
+lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+
+   /* image derefs to binding indices, like gl_nir_lower_images() */
+   if (intr->intrinsic == nir_intrinsic_image_deref_load ||
+       intr->intrinsic == nir_intrinsic_image_deref_store ||
+       intr->intrinsic == nir_intrinsic_image_deref_size) {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      nir_variable *var = nir_deref_instr_get_variable(deref);
+      nir_def *index = nir_iadd_imm(b, nir_build_deref_offset(b, deref, image_type_size_align_1),
+                                    var->data.driver_location);
+
+      nir_rewrite_image_intrinsic(intr, index, nir_image_intrinsic_type_default);
+   }
+
+   if (intr->intrinsic != nir_intrinsic_image_load &&
+       intr->intrinsic != nir_intrinsic_image_store &&
+       intr->intrinsic != nir_intrinsic_image_size)
+      return false;
+
+   nir_def *index = intr->src[0].ssa;
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool array = nir_intrinsic_image_array(intr);
+   const bool layered = array || dim == GLSL_SAMPLER_DIM_3D || dim == GLSL_SAMPLER_DIM_CUBE;
+
+   if (intr->intrinsic == nir_intrinsic_image_size) {
+      nir_def *size[3] = {
+         image_param(b, index, ETNA_IMAGE_WIDTH),
+         image_param(b, index, ETNA_IMAGE_HEIGHT),
+         image_param(b, index, ETNA_IMAGE_DEPTH),
+      };
+      if (dim == GLSL_SAMPLER_DIM_CUBE && array)
+         size[2] = nir_udiv_imm(b, size[2], 6);
+      nir_def_replace(&intr->def, nir_vec(b, size, intr->def.num_components));
+      return true;
+   }
+
+   const enum pipe_format format = nir_intrinsic_format(intr);
+   const unsigned bpp = util_format_get_blocksize(format);
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *offset = nir_imul_imm(b, nir_channel(b, coord, 0), bpp);
+
+   if (dim != GLSL_SAMPLER_DIM_1D)
+      offset = nir_iadd(b, offset, nir_imul(b, nir_channel(b, coord, 1),
+                                            image_param(b, index, ETNA_IMAGE_STRIDE)));
+   if (layered)
+      offset = nir_iadd(b, offset, nir_imul(b, nir_channel(b, coord, 2),
+                                            image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
+
+   nir_def *addr = image_param(b, index, ETNA_IMAGE_ADDR);
+   const unsigned words = DIV_ROUND_UP(bpp, 4);
+
+   if (intr->intrinsic == nir_intrinsic_image_load) {
+      nir_def *texel = nir_load_global_etna(b, words, 32, addr, offset);
+      nir_def *rgba = nir_format_unpack_rgba(b, texel, format);
+      nir_def_replace(&intr->def, nir_trim_vector(b, rgba, intr->def.num_components));
+   } else {
+      nir_def *texel = nir_format_pack_rgba(b, format, intr->src[3].ssa);
+      nir_store_global_etna(b, nir_trim_vector(b, texel, words), addr, offset,
+                            .write_mask = BITFIELD_MASK(words));
+      nir_instr_remove(&intr->instr);
+   }
+
+   return true;
+}
+
 /* SSBO access becomes address + offset: the address is a uniform the driver
  * fills with the GPU address of the bound buffer */
 static bool
@@ -1687,6 +1793,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
                nir_metadata_control_flow, &v->cs_input_count);
    }
 
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_image_access,
+            nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,
             nir_metadata_control_flow, NULL);
 

@@ -1700,6 +1700,10 @@ intrinsic("global_atomic_swap_etna", src_comp=[1, 1, 2], dest_comp=1, indices=[A
 # GPU address of a bound SSBO. src[] = { buffer index }.
 intrinsic("load_ssbo_address_etna", src_comp=[1], dest_comp=1, bit_sizes=[32],
           flags=[CAN_ELIMINATE, CAN_REORDER])
+# Parameter of a bound image (address, strides, size), selected by BASE.
+# src[] = { image index }.
+intrinsic("load_image_param_etna", src_comp=[1], dest_comp=1, bit_sizes=[32],
+          indices=[BASE], flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # IR3-specific bindless handle specifier. Similar to vulkan_resource_index, but
 # without the binding because the hardware expects a single flattened index

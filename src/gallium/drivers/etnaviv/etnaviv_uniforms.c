@@ -238,6 +238,35 @@ etna_uniforms_write(const struct etna_context *ctx,
          etna_cmd_stream_emit(stream, ctx->compute_grid[val]);
          break;
 
+      case ETNA_UNIFORM_IMAGE_ADDR: {
+         const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
+         const struct etna_resource *rsc = etna_resource(img->resource);
+         const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
+
+         etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+            .bo = rsc->bo,
+            .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+            .offset = lev->offset + img->u.tex.first_layer * lev->layer_stride,
+         });
+      } break;
+
+      case ETNA_UNIFORM_IMAGE_STRIDE:
+      case ETNA_UNIFORM_IMAGE_LAYER_STRIDE:
+      case ETNA_UNIFORM_IMAGE_WIDTH:
+      case ETNA_UNIFORM_IMAGE_HEIGHT:
+      case ETNA_UNIFORM_IMAGE_DEPTH: {
+         const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
+         const struct etna_resource_level *lev =
+            &etna_resource(img->resource)->levels[img->u.tex.level];
+         const uint32_t v[] = {
+            lev->stride, lev->layer_stride, lev->width, lev->height,
+            img->resource->target == PIPE_TEXTURE_3D ? lev->depth
+               : img->u.tex.last_layer - img->u.tex.first_layer + 1,
+         };
+
+         etna_cmd_stream_emit(stream, v[uinfo->contents[i] - ETNA_UNIFORM_IMAGE_STRIDE]);
+      } break;
+
       case ETNA_UNIFORM_SHARED_ADDR:
          etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
             .bo = ctx->compute_shared_bo,
