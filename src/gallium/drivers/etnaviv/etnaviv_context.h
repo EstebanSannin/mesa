@@ -382,6 +382,11 @@ etna_render_condition_check(struct pipe_context *pctx);
 void
 etna_reset_gpu_state(struct etna_context *ctx);
 
+struct etna_shader_key;
+void
+etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key *key,
+                                uint16_t lod_samplers);
+
 void
 etna_compute_init(struct pipe_context *pctx);
 

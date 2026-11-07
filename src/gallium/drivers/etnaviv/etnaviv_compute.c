@@ -221,18 +221,29 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    if (!shader || !etna_get_grid(ctx, info, grid))
       return;
 
+   /* Compute shaders sample through the fragment slots. Bind the compute
+    * textures there first: the shader variant depends on them, as for
+    * fragment shaders (128-bit formats, shadow compare, ...). */
+   struct etna_saved_textures saved;
+   const uint32_t textures = shader->textures_used;
    struct etna_shader_key key = {};
+
+   if (textures) {
+      etna_compute_swap_textures(ctx, &saved, true);
+      etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers);
+   }
+
    struct etna_shader_variant *v =
       etna_shader_variant(shader, &key, &ctx->base.debug, true);
    if (!v)
-      return;
+      goto out;
 
    ctx->shader.cs = v;
 
    if (!etna_shader_upload_code(ctx, v) ||
        !etna_shader_upload_constant_data(ctx, v)) {
       BUG("failed to upload compute shader");
-      return;
+      goto out;
    }
 
    memcpy(ctx->compute_grid, grid, sizeof(ctx->compute_grid));
@@ -243,7 +254,7 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
       if (need > UINT32_MAX) {
          BUG("shared memory for %u workgroups does not fit", grid[0] * grid[1] * grid[2]);
-         return;
+         goto out;
       }
 
       if (need > ctx->compute_shared_bo_size) {
@@ -255,7 +266,7 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          if (!ctx->compute_shared_bo) {
             ctx->compute_shared_bo_size = 0;
             BUG("no memory for compute shared memory");
-            return;
+            goto out;
          }
       }
    }
@@ -286,9 +297,6 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       etna_reset_gpu_state(ctx);
 
    /* textures first: bringing a sampler source up to date may blit */
-   struct etna_saved_textures saved;
-   const uint32_t textures = shader->textures_used;
-
    struct etna_shader_image_state *images = &ctx->shader_images[MESA_SHADER_COMPUTE];
    u_foreach_bit(i, images->enabled_mask) {
       etna_compute_prepare_image(ctx, &images->img[i]);
@@ -299,7 +307,6 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    }
 
    if (textures) {
-      etna_compute_swap_textures(ctx, &saved, true);
       u_foreach_bit(i, ctx->active_sampler_views & textures) {
          etna_update_sampler_source(ctx->sampler_view[i], i);
          resource_read(ctx, ctx->sampler_view[i]->texture);
@@ -375,9 +382,6 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
                   VIVS_GL_FLUSH_CACHE_UNK10 | VIVS_GL_FLUSH_CACHE_UNK11);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
 
-   if (textures)
-      etna_compute_swap_textures(ctx, &saved, false);
-
    /* the linear base is now the newest copy of written images */
    u_foreach_bit(i, images->enabled_mask) {
       if (images->img[i].access & PIPE_IMAGE_ACCESS_WRITE)
@@ -391,6 +395,10 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
    if (DBG_ENABLED(ETNA_DBG_FLUSH_ALL))
       pctx->flush(pctx, NULL, 0);
+
+out:
+   if (textures)
+      etna_compute_swap_textures(ctx, &saved, false);
 }
 
 void

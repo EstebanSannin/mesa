@@ -223,15 +223,13 @@ etna_get_vs(struct etna_context *ctx, struct etna_shader_key* const key)
    return true;
 }
 
-static bool
-etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
+/* Texture part of the key of a shader that samples through the fragment
+ * slots: fragment shaders, and compute shaders, whose textures are bound
+ * there for the dispatch. */
+void
+etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key *key,
+                                uint16_t lod_samplers)
 {
-   const struct etna_shader_variant *old = ctx->shader.fs;
-   struct etna_shader *fs = ctx->shader.bind_fs;
-
-   key->use_xfb_emu = false;
-   key->rt_pack_rgba16 = ctx->framebuffer_s.rt_pack_rgba16;
-
    /* update the key if we need to run nir_lower_sample_tex_compare(..).
     * halti < 2 has no HW shadow compare. halti >= 2 has it, but depth32f is
     * emulated as D24S8 and the float compare ref must not be clamped to the
@@ -269,7 +267,19 @@ etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
          etna_shader_key_set_tex_swizzle(key, i, ctx->sampler_view[i]);
    }
 
-   key->tex_mag_switchover = etna_tex_mag_switchover(ctx, fs->tex_lod_samplers, 0);
+   key->tex_mag_switchover = etna_tex_mag_switchover(ctx, lod_samplers, 0);
+}
+
+static bool
+etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
+{
+   const struct etna_shader_variant *old = ctx->shader.fs;
+   struct etna_shader *fs = ctx->shader.bind_fs;
+
+   key->use_xfb_emu = false;
+   key->rt_pack_rgba16 = ctx->framebuffer_s.rt_pack_rgba16;
+
+   etna_shader_key_set_fs_textures(ctx, key, fs->tex_lod_samplers);
 
    ctx->shader.fs = etna_shader_variant(fs, key, &ctx->base.debug, true);
 

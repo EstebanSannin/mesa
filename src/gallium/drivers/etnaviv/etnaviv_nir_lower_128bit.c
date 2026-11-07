@@ -223,7 +223,8 @@ etna_nir_lower_128bit(nir_shader *s, struct etna_shader_key *key)
    bool progress = false;
    const bool is_fs = s->info.stage == MESA_SHADER_FRAGMENT;
 
-   if (!is_fs && s->info.stage != MESA_SHADER_VERTEX)
+   if (!is_fs && s->info.stage != MESA_SHADER_VERTEX &&
+       s->info.stage != MESA_SHADER_COMPUTE)
       return false;
 
    const bool has_rt = is_fs && key->has_128bit_rt;
