@@ -855,23 +855,23 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
 
       /* atomic_cmp_xchg takes the new and the compared value from .x and .y of
        * its destination register, like the blob emits it (dst t0.x, data
-       * t0.xy): return the old value in the data register (pinned to .xy,
-       * dead after this instruction) and copy it out. */
+       * t0.xy). The result has a full register that no source of this
+       * instruction shares (see RA): copy the operand there and let the old
+       * value replace .x. The operand itself can stay live, in a loop. */
       if (opc == ISA_OPC_ATOMIC_CMP_XCHG) {
-         assert(data.rgroup == ISA_REG_GROUP_TEMP);
+         emit_inst(c, &(struct etna_inst) {
+            .opcode = ISA_OPC_MOV,
+            .dst = { .use = 1, .reg = dst.reg, .write_mask = ISA_WRMASK_XY__ },
+            .src[0] = data,
+         });
          emit_inst(c, &(struct etna_inst) {
             .opcode = opc,
             .type = type,
             .skphp = 1,
-            .dst = { .use = 1, .reg = data.reg, .write_mask = ISA_WRMASK_X___ },
+            .dst = { .use = 1, .reg = dst.reg, .write_mask = ISA_WRMASK_X___ },
             .src[0] = get_src(c, &intr->src[0]),
             .src[1] = get_src(c, &intr->src[1]),
-            .src[2] = data,
-         });
-         emit_inst(c, &(struct etna_inst) {
-            .opcode = ISA_OPC_MOV,
-            .dst = dst,
-            .src[0] = SRC_REG(data.reg, SWIZZLE(X, X, X, X)),
+            .src[2] = SRC_REG(dst.reg, SWIZZLE(X, Y, Y, Y)),
          });
          break;
       }

@@ -208,9 +208,14 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
          } continue;
          case nir_intrinsic_global_atomic_swap_etna: {
             /* atomic_cmp_xchg reads the new and the compared value from .x
-             * and .y of its register whatever the swizzle: keep it at xy */
-            unsigned index = live_map[src_index(impl, &intr->src[2])];
+             * and .y of its destination register, which is written before
+             * the instruction (see emit): give the result a full register,
+             * live from just before the instruction so that it shares no
+             * register with the sources. */
+            unsigned index = live_map[def_index(impl, def)];
             ra_set_node_class(g, index, ra_get_class_from_index(regs, REG_CLASS_VEC4));
+            if (defs[index].live_start)
+               defs[index].live_start--;
          } continue;
          case nir_intrinsic_load_input:
             reg = nir_intrinsic_base(intr) * NUM_REG_TYPES + (unsigned[]) {
