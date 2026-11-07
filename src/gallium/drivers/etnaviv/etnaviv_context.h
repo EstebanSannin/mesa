@@ -166,6 +166,8 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_IMAGE_WIDTH,
    ETNA_UNIFORM_IMAGE_HEIGHT,
    ETNA_UNIFORM_IMAGE_DEPTH,
+   ETNA_UNIFORM_IMAGE_TILED,
+   ETNA_UNIFORM_IMAGE_PLANE_OFFSET,
 };
 
 struct etna_shader_uniform_info {

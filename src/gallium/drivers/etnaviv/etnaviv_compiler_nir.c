@@ -1571,6 +1571,8 @@ enum etna_image_param {
    ETNA_IMAGE_WIDTH,
    ETNA_IMAGE_HEIGHT,
    ETNA_IMAGE_DEPTH,
+   ETNA_IMAGE_TILED,
+   ETNA_IMAGE_PLANE_OFFSET,
 };
 
 static nir_def *
@@ -1588,9 +1590,12 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
    *align = s;
 }
 
-/* Images are linear (see etna_resource_create()): load and store texels with
- * LOAD/STORE at base + x * bpp + y * row stride + layer * layer stride, and
- * convert them with the format's pack/unpack. */
+/* Images are linear or 4x4 tiled (see etna_resource_create()): load and store
+ * texels with LOAD/STORE and convert them with the format's pack/unpack.
+ * Linear: base + layer * layer stride + y * stride + x * bpp. Tiled: tiles of
+ * 4x4 texels in rows of stride * 4 bytes. 128-bit formats are two stacked
+ * planes of 64-bit texels (xy, then zw), see
+ * etna_resource_level_second_plane_offset(). */
 static bool
 lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 {
@@ -1632,27 +1637,45 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 
    const enum pipe_format format = nir_intrinsic_format(intr);
    const unsigned bpp = util_format_get_blocksize(format);
+   const bool planes = bpp == 16;
+   const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
-   nir_def *offset = nir_imul_imm(b, nir_channel(b, coord, 0), bpp);
+   nir_def *x = nir_channel(b, coord, 0);
+   nir_def *y = dim == GLSL_SAMPLER_DIM_1D ? nir_imm_int(b, 0) : nir_channel(b, coord, 1);
+   nir_def *stride = image_param(b, index, ETNA_IMAGE_STRIDE);
 
-   if (dim != GLSL_SAMPLER_DIM_1D)
-      offset = nir_iadd(b, offset, nir_imul(b, nir_channel(b, coord, 1),
-                                            image_param(b, index, ETNA_IMAGE_STRIDE)));
+   nir_def *linear = nir_iadd(b, nir_imul_imm(b, x, texel_bytes), nir_imul(b, y, stride));
+   nir_def *in_tile = nir_iadd(b, nir_ishl_imm(b, nir_iand_imm(b, y, 3), 2), nir_iand_imm(b, x, 3));
+   nir_def *tiled =
+      nir_iadd(b, nir_imul(b, nir_ushr_imm(b, y, 2), nir_ishl_imm(b, stride, 2)),
+               nir_imul_imm(b, nir_iadd(b, nir_ishl_imm(b, nir_ushr_imm(b, x, 2), 4), in_tile),
+                            texel_bytes));
+   nir_def *offset = nir_bcsel(b, nir_ine_imm(b, image_param(b, index, ETNA_IMAGE_TILED), 0),
+                               tiled, linear);
+
    if (layered)
       offset = nir_iadd(b, offset, nir_imul(b, nir_channel(b, coord, 2),
                                             image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
 
    nir_def *addr = image_param(b, index, ETNA_IMAGE_ADDR);
-   const unsigned words = DIV_ROUND_UP(bpp, 4);
+   nir_def *offset2 = planes ? nir_iadd(b, offset, image_param(b, index, ETNA_IMAGE_PLANE_OFFSET))
+                             : NULL;
+   const unsigned words = DIV_ROUND_UP(texel_bytes, 4);
 
    if (intr->intrinsic == nir_intrinsic_image_load) {
       nir_def *texel = nir_load_global_etna(b, words, 32, addr, offset);
+      if (planes)
+         texel = nir_vec4(b, nir_channel(b, texel, 0), nir_channel(b, texel, 1),
+                          nir_channel(b, nir_load_global_etna(b, 2, 32, addr, offset2), 0),
+                          nir_channel(b, nir_load_global_etna(b, 2, 32, addr, offset2), 1));
       nir_def *rgba = nir_format_unpack_rgba(b, texel, format);
       nir_def_replace(&intr->def, nir_trim_vector(b, rgba, intr->def.num_components));
    } else {
       nir_def *texel = nir_format_pack_rgba(b, format, intr->src[3].ssa);
-      nir_store_global_etna(b, nir_trim_vector(b, texel, words), addr, offset,
+      nir_store_global_etna(b, nir_channels(b, texel, BITFIELD_MASK(words)), addr, offset,
                             .write_mask = BITFIELD_MASK(words));
+      if (planes)
+         nir_store_global_etna(b, nir_channels(b, texel, 0xc), addr, offset2, .write_mask = 0x3);
       nir_instr_remove(&intr->instr);
    }
 

@@ -254,14 +254,18 @@ etna_uniforms_write(const struct etna_context *ctx,
       case ETNA_UNIFORM_IMAGE_LAYER_STRIDE:
       case ETNA_UNIFORM_IMAGE_WIDTH:
       case ETNA_UNIFORM_IMAGE_HEIGHT:
-      case ETNA_UNIFORM_IMAGE_DEPTH: {
+      case ETNA_UNIFORM_IMAGE_DEPTH:
+      case ETNA_UNIFORM_IMAGE_TILED:
+      case ETNA_UNIFORM_IMAGE_PLANE_OFFSET: {
          const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
-         const struct etna_resource_level *lev =
-            &etna_resource(img->resource)->levels[img->u.tex.level];
+         const struct etna_resource *rsc = etna_resource(img->resource);
+         const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
          const uint32_t v[] = {
             lev->stride, lev->layer_stride, lev->width, lev->height,
             img->resource->target == PIPE_TEXTURE_3D ? lev->depth
                : img->u.tex.last_layer - img->u.tex.first_layer + 1,
+            rsc->layout == ETNA_LAYOUT_TILED,
+            etna_resource_level_second_plane_offset(lev),
          };
 
          etna_cmd_stream_emit(stream, v[uinfo->contents[i] - ETNA_UNIFORM_IMAGE_STRIDE]);

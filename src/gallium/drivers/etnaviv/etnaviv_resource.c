@@ -719,13 +719,15 @@ etna_resource_create(struct pipe_screen *pscreen,
    if (eil_format_is_emulated_128bit(templat->format))
       layout = ETNA_LAYOUT_TILED;
 
-   /* Experimental compute addresses images linearly in the shader, and a
-    * texture can be bound as an image at any time: keep the textures in
-    * image formats linear. Rendering goes through the render shadow. */
+   /* Experimental compute addresses images in the shader, which knows the
+    * linear and the 4x4 tiled layouts but not super tiling, and a texture
+    * can be bound as an image at any time: keep the textures in image
+    * formats 4x4 tiled. */
    if (pscreen->caps.compute && templat->nr_samples <= 1 &&
        !(templat->bind & PIPE_BIND_DEPTH_STENCIL) &&
-       etna_format_is_image_format(templat->format))
-      layout = ETNA_LAYOUT_LINEAR;
+       etna_format_is_image_format(templat->format) &&
+       layout != ETNA_LAYOUT_LINEAR)
+      layout = ETNA_LAYOUT_TILED;
 
    if (/* linear base or scanout without modifier requested */
        (templat->bind & (PIPE_BIND_LINEAR | PIPE_BIND_SCANOUT)) ||
