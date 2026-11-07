@@ -39,6 +39,7 @@
 
 #include <math.h>
 #include "isa/enums.h"
+#include "util/u_debug.h"
 #include "util/u_memory.h"
 #include "util/register_allocate.h"
 #include "compiler/nir/nir_builder.h"
@@ -849,15 +850,41 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
          break;
       }
 
-      /* like the blob: address, offset, data (vec2 new/compared for cmpxchg) */
+      struct etna_inst_src data = get_src(c, &intr->src[2]);
+      struct etna_inst_dst dst = ra_def(c, &intr->def, &dst_swiz);
+
+      /* atomic_cmp_xchg takes the new and the compared value from .x and .y of
+       * its destination register, like the blob emits it (dst t0.x, data
+       * t0.xy): return the old value in the data register (pinned to .xy,
+       * dead after this instruction) and copy it out. */
+      if (opc == ISA_OPC_ATOMIC_CMP_XCHG) {
+         assert(data.rgroup == ISA_REG_GROUP_TEMP);
+         emit_inst(c, &(struct etna_inst) {
+            .opcode = opc,
+            .type = type,
+            .skphp = 1,
+            .dst = { .use = 1, .reg = data.reg, .write_mask = ISA_WRMASK_X___ },
+            .src[0] = get_src(c, &intr->src[0]),
+            .src[1] = get_src(c, &intr->src[1]),
+            .src[2] = data,
+         });
+         emit_inst(c, &(struct etna_inst) {
+            .opcode = ISA_OPC_MOV,
+            .dst = dst,
+            .src[0] = SRC_REG(data.reg, SWIZZLE(X, X, X, X)),
+         });
+         break;
+      }
+
+      /* like the blob: address, offset, data */
       emit_inst(c, &(struct etna_inst) {
          .opcode = opc,
          .type = type,
          .skphp = 1,
-         .dst = ra_def(c, &intr->def, &dst_swiz),
+         .dst = dst,
          .src[0] = get_src(c, &intr->src[0]),
          .src[1] = get_src(c, &intr->src[1]),
-         .src[2] = get_src(c, &intr->src[2]),
+         .src[2] = data,
       });
    } break;
    case nir_intrinsic_barrier:
