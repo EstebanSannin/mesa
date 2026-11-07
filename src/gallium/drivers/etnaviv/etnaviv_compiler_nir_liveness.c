@@ -99,6 +99,20 @@ set_src_live(nir_src *src, void *void_state)
    return true;
 }
 
+/* inputs are in their registers from the start of the shader, wherever the
+ * load_input sits */
+static bool
+is_live_from_start(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   return intr->intrinsic == nir_intrinsic_load_input ||
+          intr->intrinsic == nir_intrinsic_load_instance_id ||
+          intr->intrinsic == nir_intrinsic_load_vertex_id;
+}
+
 static bool
 propagate_across_edge(nir_block *pred, nir_block *succ,
                       struct live_defs_state *state)
@@ -132,13 +146,8 @@ etna_live_defs(nir_function_impl *impl, struct live_def *defs, unsigned *live_ma
          defs[state.num_defs] = (struct live_def) {instr, def, state.num_defs, 0};
 
          /* input live from the start */
-         if (instr->type == nir_instr_type_intrinsic) {
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic == nir_intrinsic_load_input ||
-                intr->intrinsic == nir_intrinsic_load_instance_id ||
-                intr->intrinsic == nir_intrinsic_load_vertex_id)
-               defs[state.num_defs].live_start = 0;
-         }
+         if (is_live_from_start(instr))
+            defs[state.num_defs].live_start = 0;
 
          live_map[idx] = state.num_defs;
          state.num_defs++;
@@ -185,8 +194,13 @@ etna_live_defs(nir_function_impl *impl, struct live_def *defs, unsigned *live_ma
             /* the only source of writes to registers is phis:
              * we don't expect any partial write_mask alus
              * so clearing live_in here is OK
+             *
+             * An input is not written here but at the start: a load_input
+             * in a loop must keep its register live around the whole loop,
+             * or the next iteration finds it reused.
              */
-            u_sparse_bitset_clear(&block->live_in, state.index);
+            if (!is_live_from_start(instr))
+               u_sparse_bitset_clear(&block->live_in, state.index);
          }
 
          /* don't set_src_live for not-emitted instructions */
