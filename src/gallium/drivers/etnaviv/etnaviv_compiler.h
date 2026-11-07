@@ -136,6 +136,9 @@ struct etna_shader_variant {
    /* compute: bytes of shared memory per workgroup (one DDR slice each) */
    uint32_t cs_shared_size;
 
+   /* compute: barrier() synchronizes the workgroup */
+   bool cs_uses_barrier;
+
    /* shader is larger than GPU instruction limit, thus needs icache */
    bool needs_icache;
 

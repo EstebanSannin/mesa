@@ -296,6 +296,18 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    const unsigned num_temps = MAX3(v->num_temps, input_count, ctx->compute_min_temps);
    const unsigned num_inst = v->code_size / 4;
 
+   /* With barrier() the whole workgroup must be resident at once, and the
+    * shader cores hold 512 invocation-temporaries each: invocations x temps
+    * <= 1024 on GC7000 r6204 (2 cores), found by experiment at 32 to 256
+    * invocations. Beyond that barrier() never returns and the GPU hangs for
+    * every client: skip the dispatch instead. */
+   if (v->cs_uses_barrier &&
+       block_size * num_temps > 512 * ctx->screen->info->gpu.shader_core_count) {
+      BUG("compute: %u invocations x %u temporaries do not fit with barrier(), dispatch skipped",
+          block_size, num_temps);
+      goto out;
+   }
+
    /* a dispatch can be the first job of a stream: set up the GPU like a draw */
    if (ctx->needs_gpu_state_reset)
       etna_reset_gpu_state(ctx);

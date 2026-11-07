@@ -1879,6 +1879,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
       NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_shared,
                nir_address_format_32bit_offset);
       v->cs_shared_size = align(s->info.shared_size, 16);
+      v->cs_uses_barrier = s->info.uses_control_barrier;
       if (v->cs_shared_size)
          NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_shared_access,
                   nir_metadata_none, &v->cs_shared_size);
