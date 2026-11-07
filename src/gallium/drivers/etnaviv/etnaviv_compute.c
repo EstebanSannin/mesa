@@ -331,7 +331,10 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       ctx->emit_texture_state(ctx);
    }
 
-   etna_set_state(stream, VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENCL);
+   /* OpenGL, not OpenCL, API mode, like NXP's driver for GLES compute: in
+    * OpenCL mode the texture unit takes the layer of a 2D array texture as
+    * a coordinate normalized to the layer count */
+   etna_set_state(stream, VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENGL);
    /* memory the CPU wrote (buffers, uploaded constants) may be stale in L1 */
    etna_set_state(stream, VIVS_GL_FLUSH_CACHE, VIVS_GL_FLUSH_CACHE_SHADER_L1);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
