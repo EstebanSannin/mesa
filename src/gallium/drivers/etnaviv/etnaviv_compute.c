@@ -20,6 +20,7 @@
 #include "etnaviv_resource.h"
 #include "etnaviv_screen.h"
 #include "etnaviv_shader.h"
+#include "etnaviv_texture.h"
 #include "etnaviv_uniforms.h"
 
 #include "hw/common.xml.h"
@@ -110,6 +111,49 @@ etna_memory_barrier(struct pipe_context *pctx, unsigned flags)
    etna_stall(ctx->stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
 }
 
+/* Compute and fragment shaders sample through the same slots. Bind the
+ * compute textures there for the dispatch (saving the fragment bindings in
+ * *saved), or put the fragment bindings back. */
+struct etna_saved_textures {
+   void *sampler[PIPE_MAX_SAMPLERS];
+   struct pipe_sampler_view *view[PIPE_MAX_SAMPLERS];
+   unsigned num_samplers, num_views;
+};
+
+static void
+etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures *saved,
+                           bool compute)
+{
+   struct pipe_context *pctx = &ctx->base;
+   const unsigned n = PIPE_MAX_SAMPLERS / 2;
+   void *samplers[PIPE_MAX_SAMPLERS] = { NULL };
+   struct pipe_sampler_view *views[PIPE_MAX_SAMPLERS] = { NULL };
+
+   if (compute) {
+      saved->num_samplers = ctx->num_fragment_samplers;
+      saved->num_views = ctx->num_fragment_sampler_views;
+      for (unsigned i = 0; i < n; i++) {
+         saved->sampler[i] = ctx->sampler[i];
+         saved->view[i] = NULL;
+         pipe_sampler_view_reference(&saved->view[i], ctx->sampler_view[i]);
+      }
+      memcpy(samplers, ctx->cs_sampler, sizeof(void *) * n);
+      memcpy(views, ctx->cs_sampler_view, sizeof(views[0]) * n);
+   } else {
+      memcpy(samplers, saved->sampler, sizeof(void *) * n);
+      memcpy(views, saved->view, sizeof(views[0]) * n);
+   }
+
+   pctx->bind_sampler_states(pctx, MESA_SHADER_FRAGMENT, 0, n, samplers);
+   pctx->set_sampler_views(pctx, MESA_SHADER_FRAGMENT, 0,
+                           compute ? ctx->cs_num_sampler_views : saved->num_views, 0, views);
+   if (!compute) {
+      ctx->num_fragment_samplers = saved->num_samplers;
+      for (unsigned i = 0; i < n; i++)
+         pipe_sampler_view_reference(&saved->view[i], NULL);
+   }
+}
+
 static bool
 etna_get_grid(struct etna_context *ctx, const struct pipe_grid_info *info,
               uint32_t grid[3])
@@ -196,6 +240,24 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    const unsigned num_temps = MAX3(v->num_temps, input_count, ctx->compute_min_temps);
    const unsigned num_inst = v->code_size / 4;
 
+   /* a dispatch can be the first job of a stream: set up the GPU like a draw */
+   if (ctx->needs_gpu_state_reset)
+      etna_reset_gpu_state(ctx);
+
+   /* textures first: bringing a sampler source up to date may blit */
+   struct etna_saved_textures saved;
+   const uint32_t textures = shader->textures_used;
+
+   if (textures) {
+      etna_compute_swap_textures(ctx, &saved, true);
+      u_foreach_bit(i, ctx->active_sampler_views & textures) {
+         etna_update_sampler_source(ctx->sampler_view[i], i);
+         resource_read(ctx, ctx->sampler_view[i]->texture);
+      }
+      etna_set_state(stream, VIVS_GL_FLUSH_CACHE, VIVS_GL_FLUSH_CACHE_TEXTURE);
+      ctx->emit_texture_state(ctx);
+   }
+
    etna_set_state(stream, VIVS_GL_API_MODE, VIVS_GL_API_MODE_OPENCL);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
 
@@ -263,6 +325,9 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
                   VIVS_GL_FLUSH_CACHE_UNK10 | VIVS_GL_FLUSH_CACHE_UNK11);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
 
+   if (textures)
+      etna_compute_swap_textures(ctx, &saved, false);
+
    /* The dispatch clobbered the 3D shader state: start over at the next draw. */
    ctx->needs_gpu_state_reset = true;
    ctx->dirty = ~0L;
@@ -299,6 +364,9 @@ etna_compute_fini(struct pipe_context *pctx)
 
    if (ctx->compute_shared_bo)
       etna_bo_del(ctx->compute_shared_bo);
+
+   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
+      pipe_sampler_view_reference(&ctx->cs_sampler_view[i], NULL);
 
    for (unsigned s = 0; s < MESA_SHADER_STAGES; s++)
       for (unsigned i = 0; i < ETNA_MAX_SHADER_BUFFERS; i++)

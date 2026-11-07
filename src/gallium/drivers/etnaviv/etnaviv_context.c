@@ -282,7 +282,7 @@ etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
    return true;
 }
 
-static void
+void
 etna_reset_gpu_state(struct etna_context *ctx)
 {
    struct etna_cmd_stream *stream = ctx->stream;

@@ -226,8 +226,8 @@ etna_init_shader_caps(struct etna_screen *screen)
       etna_init_single_shader_caps(screen, MESA_SHADER_COMPUTE);
       caps->max_inputs = 0;
       caps->max_outputs = 0;
-      caps->max_texture_samplers = 0;
-      caps->max_sampler_views = 0;
+      caps->max_texture_samplers = screen->specs.fragment_sampler_count;
+      caps->max_sampler_views = screen->specs.fragment_sampler_count;
       caps->max_shader_buffers = ETNA_MAX_SHADER_BUFFERS;
       caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
    }

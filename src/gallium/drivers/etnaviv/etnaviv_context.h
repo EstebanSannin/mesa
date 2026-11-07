@@ -295,6 +295,10 @@ struct etna_context {
    /* experimental compute */
    uint32_t compute_grid[3];
    struct etna_bo *compute_shared_bo;
+   /* compute textures: bound into the fragment slots for the dispatch only */
+   void *cs_sampler[PIPE_MAX_SAMPLERS];
+   struct pipe_sampler_view *cs_sampler_view[PIPE_MAX_SAMPLERS];
+   unsigned cs_num_samplers, cs_num_sampler_views;
    uint32_t compute_shared_bo_size;
    uint32_t compute_unk924;
    uint32_t compute_thread_alloc;
@@ -357,6 +361,9 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
 
 bool
 etna_render_condition_check(struct pipe_context *pctx);
+
+void
+etna_reset_gpu_state(struct etna_context *ctx);
 
 void
 etna_compute_init(struct pipe_context *pctx);

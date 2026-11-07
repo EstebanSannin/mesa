@@ -59,6 +59,12 @@ etna_bind_sampler_states(struct pipe_context *pctx, mesa_shader_stage shader,
    case MESA_SHADER_VERTEX:
       offset = screen->specs.vertex_sampler_offset;
       break;
+   case MESA_SHADER_COMPUTE:
+      /* kept aside: etna_launch_grid() binds them in the fragment slots */
+      for (unsigned i = 0; i < num_samplers; i++)
+         ctx->cs_sampler[start_slot + i] = samplers[i];
+      ctx->cs_num_samplers = MAX2(ctx->cs_num_samplers, start_slot + num_samplers);
+      return;
    default:
       assert(!"Invalid shader");
       return;
@@ -463,6 +469,12 @@ etna_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
       break;
    case MESA_SHADER_VERTEX:
       etna_vertex_set_sampler_views(ctx, num_views, views);
+      break;
+   case MESA_SHADER_COMPUTE:
+      for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
+         pipe_sampler_view_reference(&ctx->cs_sampler_view[i],
+                                     views && i < num_views ? views[i] : NULL);
+      ctx->cs_num_sampler_views = num_views;
       break;
    default:;
    }
