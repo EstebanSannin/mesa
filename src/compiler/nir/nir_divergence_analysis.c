@@ -1156,6 +1156,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_deref_transpose_amd:
    case nir_intrinsic_load_global_tr_amd:
    case nir_intrinsic_trace_ray_intel:
+   case nir_intrinsic_load_image_etna:
       is_divergent = true;
       break;
 

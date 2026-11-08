@@ -1704,6 +1704,15 @@ intrinsic("load_ssbo_address_etna", src_comp=[1], dest_comp=1, bit_sizes=[32],
 # src[] = { image index }.
 intrinsic("load_image_param_etna", src_comp=[1], dest_comp=1, bit_sizes=[32],
           indices=[BASE], flags=[CAN_ELIMINATE, CAN_REORDER])
+# Hardware image load/store (img_load/img_store) through the descriptor of
+# the image in uniforms; COMPONENT is the plane of a 128-bit format. The
+# coordinate is (x, y), or (x, y, address of the layer) for the 3D form.
+# src[] = { image index, coordinate }.
+intrinsic("load_image_etna", src_comp=[1, 0], dest_comp=4, bit_sizes=[32],
+          indices=[COMPONENT, IMAGE_DIM, IMAGE_ARRAY, FORMAT], flags=[CAN_ELIMINATE])
+# src[] = { image index, coordinate, value }.
+intrinsic("store_image_etna", src_comp=[1, 0, 4],
+          indices=[COMPONENT, IMAGE_DIM, IMAGE_ARRAY, FORMAT])
 
 # IR3-specific bindless handle specifier. Similar to vulkan_resource_index, but
 # without the binding because the hardware expects a single flattened index
