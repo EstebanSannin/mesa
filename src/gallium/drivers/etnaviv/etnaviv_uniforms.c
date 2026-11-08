@@ -129,6 +129,51 @@ get_sampler_lod(const struct etna_context *ctx, bool frag,
    }
 }
 
+/* Format word of an image descriptor, from NXP's driver for the formats it
+ * was seen with (r32ui, r32f, rgba8, rgba8ui, rgba16f, rg32f, rg32ui), and
+ * measured on GC7000 r6204:
+ *   bits 0-2   log2(bytes per texel), for the address
+ *   bits 4-5   2 for one 32-bit component, 1 otherwise (what fills register
+ *              lanes the format does not have: 0 zero, 2 ones, 3 a copy)
+ *   bits 6-9   type: 0 f32, 1 f16, 5 u32, 6 u16?, 7 u8, 2 s32?, 3 s16?,
+ *              4 s8?, plus 8 for normalized (no effect seen on GC7000 r6204)
+ *   bits 10-11 layout: 0 linear, 1 4x4 tiled, 2 super tiled (NXP's
+ *              textures; not tested here)
+ *   bit 12     set; bits 14-15 number of components (4 as 0)
+ *   bits 16-31 swizzle: 4 bits per channel, 0-3 source, 4 zero, 5 one
+ * 128-bit formats are two planes of 64-bit texels, each with its own
+ * descriptor. Returns 0 for formats without a hardware image path. */
+static uint32_t
+etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout)
+{
+   unsigned log2_bpp, cls, type, comps;
+
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT: log2_bpp = 3; cls = 1; type = 0;  comps = 2; break;
+   case PIPE_FORMAT_R32G32B32A32_UINT:  log2_bpp = 3; cls = 1; type = 5;  comps = 2; break;
+   case PIPE_FORMAT_R32G32B32A32_SINT:  log2_bpp = 3; cls = 1; type = 2;  comps = 2; break;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT: log2_bpp = 3; cls = 1; type = 1;  comps = 4; break;
+   case PIPE_FORMAT_R16G16B16A16_UINT:  log2_bpp = 3; cls = 1; type = 6;  comps = 4; break;
+   case PIPE_FORMAT_R16G16B16A16_SINT:  log2_bpp = 3; cls = 1; type = 3;  comps = 4; break;
+   case PIPE_FORMAT_R32_FLOAT:          log2_bpp = 2; cls = 2; type = 0;  comps = 1; break;
+   case PIPE_FORMAT_R32_UINT:           log2_bpp = 2; cls = 2; type = 5;  comps = 1; break;
+   case PIPE_FORMAT_R32_SINT:           log2_bpp = 2; cls = 2; type = 2;  comps = 1; break;
+   case PIPE_FORMAT_R8G8B8A8_UNORM:     log2_bpp = 2; cls = 1; type = 15; comps = 4; break;
+   case PIPE_FORMAT_R8G8B8A8_SNORM:     log2_bpp = 2; cls = 1; type = 12; comps = 4; break;
+   case PIPE_FORMAT_R8G8B8A8_UINT:      log2_bpp = 2; cls = 1; type = 7;  comps = 4; break;
+   case PIPE_FORMAT_R8G8B8A8_SINT:      log2_bpp = 2; cls = 1; type = 4;  comps = 4; break;
+   default:
+      return 0;
+   }
+
+   static const uint32_t swizzle[] = { 0, 0x5440, 0x5410, 0x5210, 0x3210 };
+
+   const unsigned tiling = layout == ETNA_LAYOUT_TILED ? 1 : layout == ETNA_LAYOUT_SUPER_TILED ? 2 : 0;
+
+   return log2_bpp | cls << 4 | type << 6 | tiling << 10 | 1 << 12 |
+          (comps & 3) << 14 | swizzle[comps] << 16;
+}
+
 void
 etna_uniforms_write(const struct etna_context *ctx,
                     const struct etna_shader_variant *sobj,
@@ -269,6 +314,39 @@ etna_uniforms_write(const struct etna_context *ctx,
          };
 
          etna_cmd_stream_emit(stream, v[uinfo->contents[i] - ETNA_UNIFORM_IMAGE_STRIDE]);
+      } break;
+
+      case ETNA_UNIFORM_IMAGE_DESC: {
+         const unsigned index = val & 0xf, plane = (val >> 4) & 0xf, word = val >> 8;
+         const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[index];
+         const struct etna_resource *rsc = etna_resource(img->resource);
+
+         if (!rsc) {
+            etna_cmd_stream_emit(stream, 0);
+            break;
+         }
+
+         const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
+
+         if (word == 0) {
+            etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+               .bo = rsc->bo,
+               .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+               .offset = lev->offset + img->u.tex.first_layer * lev->layer_stride +
+                         plane * etna_resource_level_second_plane_offset(lev),
+            });
+            break;
+         }
+
+         /* stride: of a row of texels, also for tiled images */
+         const uint32_t v[4] = {
+            0,
+            lev->stride,
+            lev->height << 16 | lev->width,
+            etna_image_format_word(img->format, rsc->layout),
+         };
+
+         etna_cmd_stream_emit(stream, v[word & 3]);
       } break;
 
       case ETNA_UNIFORM_SHARED_ADDR:

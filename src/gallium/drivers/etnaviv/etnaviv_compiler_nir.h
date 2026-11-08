@@ -298,6 +298,7 @@ def_for_instr(nir_instr *instr)
       if (intr->intrinsic == nir_intrinsic_load_uniform ||
           intr->intrinsic == nir_intrinsic_load_ubo ||
           intr->intrinsic == nir_intrinsic_load_global_etna ||
+          intr->intrinsic == nir_intrinsic_load_image_etna ||
           intr->intrinsic == nir_intrinsic_global_atomic_etna ||
           intr->intrinsic == nir_intrinsic_global_atomic_swap_etna ||
           intr->intrinsic == nir_intrinsic_load_constant ||

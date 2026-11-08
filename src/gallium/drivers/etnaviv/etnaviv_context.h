@@ -168,6 +168,8 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_IMAGE_DEPTH,
    ETNA_UNIFORM_IMAGE_TILED,
    ETNA_UNIFORM_IMAGE_PLANE_OFFSET,
+   /* word of an image descriptor: image | plane << 4 | word << 8 */
+   ETNA_UNIFORM_IMAGE_DESC,
 };
 
 struct etna_shader_uniform_info {

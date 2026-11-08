@@ -44,7 +44,6 @@
 #include "util/register_allocate.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_deref.h"
-#include "compiler/nir/nir_format_convert.h"
 #include "util/format/u_format.h"
 
 #include "util/compiler.h"
@@ -503,6 +502,7 @@ get_src(struct etna_compile *c, nir_src *src)
       case nir_intrinsic_load_uniform:
       case nir_intrinsic_load_ubo:
       case nir_intrinsic_load_global_etna:
+      case nir_intrinsic_load_image_etna:
       case nir_intrinsic_global_atomic_etna:
       case nir_intrinsic_global_atomic_swap_etna:
       case nir_intrinsic_load_constant:
@@ -708,6 +708,86 @@ atomic_opcode(nir_atomic_op op, enum isa_type *type)
    }
 }
 
+/* An image descriptor fills a uniform register, in order: address, stride,
+ * size, format word (see etna_image_format_word()). */
+static hw_src
+image_desc_src(struct etna_compile *c, unsigned image, unsigned plane)
+{
+   uint64_t want[4];
+
+   for (unsigned i = 0; i < 4; i++)
+      want[i] = CONST_VAL(ETNA_UNIFORM_IMAGE_DESC, image | plane << 4 | i << 8).u64;
+
+   for (unsigned r = 0; r < ETNA_MAX_IMM / 4; r++) {
+      bool match = true, empty = true;
+
+      for (unsigned i = 0; i < 4; i++) {
+         match &= c->consts[r * 4 + i] == want[i];
+         empty &= !c->consts[r * 4 + i];
+      }
+
+      if (match || empty) {
+         memcpy(&c->consts[r * 4], want, sizeof(want));
+         c->const_count = MAX2(c->const_count, r + 1);
+         return SRC_CONST(r, INST_SWIZ_IDENTITY);
+      }
+   }
+
+   c->error = true;
+   return SRC_CONST(0, INST_SWIZ_IDENTITY);
+}
+
+/* img_load/img_store as NXP's compiler emits them for GLES: pack mode, the
+ * register type of the format class (f32 for float and normalized formats,
+ * which the hardware converts; u32/s32 with .denorm, and .sat for stores, for
+ * integer formats), coordinate .xyyy, or .xyzz for the 3D form whose z is the
+ * address of the layer. A load writes the components of the format, a store
+ * takes .xyzw. Without pack mode and with other fields the instructions work
+ * on byte lanes (as for NXP's NPU), one byte per texel. */
+static void
+emit_image(struct etna_compile *c, nir_intrinsic_instr *intr)
+{
+   const bool store = intr->intrinsic == nir_intrinsic_store_image_etna;
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool layered = nir_intrinsic_image_array(intr) || dim == GLSL_SAMPLER_DIM_3D ||
+                        dim == GLSL_SAMPLER_DIM_CUBE;
+   const enum pipe_format format = nir_intrinsic_format(intr);
+   const bool sint = util_format_is_pure_sint(format);
+   const bool uint = util_format_is_pure_uint(format);
+
+   if (!nir_src_is_const(intr->src[0])) {
+      compile_error(c, "dynamically indexed image\n");
+      return;
+   }
+
+   struct etna_inst inst = {
+      .opcode = store ? (layered ? ISA_OPC_IMG_STORE_3D : ISA_OPC_IMG_STORE)
+                      : (layered ? ISA_OPC_IMG_LOAD_3D : ISA_OPC_IMG_LOAD),
+      .type = sint ? ISA_TYPE_S32 : uint ? ISA_TYPE_U32 : ISA_TYPE_F32,
+      .pmode = 1,
+      .denorm = sint || uint,
+      .sat = store && (sint || uint),
+      .src[0] = image_desc_src(c, nir_src_as_uint(intr->src[0]), nir_intrinsic_component(intr)),
+      .src[1] = src_swizzle(get_src(c, &intr->src[1]),
+                            layered ? SWIZZLE(X, Y, Z, Z) : SWIZZLE(X, Y, Y, Y)),
+   };
+
+   if (store) {
+      inst.dst.write_mask = ISA_WRMASK_XYZW;
+      inst.src[2] = get_src(c, &intr->src[2]);
+   } else {
+      /* components of the format; 128-bit formats load two per plane */
+      const unsigned comps = util_format_get_blocksize(format) == 16
+                                ? 2 : util_format_get_nr_components(format);
+      unsigned dst_swiz;
+
+      inst.dst = ra_def(c, &intr->def, &dst_swiz);
+      inst.dst.write_mask &= BITFIELD_MASK(comps);
+   }
+
+   emit_inst(c, &inst);
+}
+
 static void
 emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
 {
@@ -815,6 +895,10 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
          .src[1] = get_src(c, &intr->src[2]),
          .src[2] = get_src(c, &intr->src[0]),
       });
+      break;
+   case nir_intrinsic_load_image_etna:
+   case nir_intrinsic_store_image_etna:
+      emit_image(c, intr);
       break;
    case nir_intrinsic_load_global_etna: {
       unsigned dst_swiz;
@@ -1360,6 +1444,17 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
                nir_src_rewrite(src, nir_mov(&b, src->ssa));
             }
          } break;
+         case nir_intrinsic_load_image_etna:
+         case nir_intrinsic_store_image_etna:
+            /* the descriptor is a uniform: coordinate and value go through
+             * registers (src 0 is the image index) */
+            for (unsigned i = 1; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; i++) {
+               if (nir_src_is_const(intr->src[i])) {
+                  b.cursor = nir_before_instr(instr);
+                  nir_src_rewrite(&intr->src[i], nir_mov(&b, intr->src[i].ssa));
+               }
+            }
+            break;
          case nir_intrinsic_load_global_etna:
          case nir_intrinsic_store_global_etna:
          case nir_intrinsic_global_atomic_etna:
@@ -1608,36 +1703,6 @@ image_param(nir_builder *b, nir_def *index, enum etna_image_param param)
    return nir_load_image_param_etna(b, index, .base = param);
 }
 
-/* f32 to f16 bits with 32-bit integer math (no 16-bit ALU here): round to
- * nearest, tiny values flush to zero, overflow to infinity, NaN stays NaN */
-static nir_def *
-float_to_half_bits(nir_builder *b, nir_def *f)
-{
-   nir_def *sign = nir_iand_imm(b, nir_ushr_imm(b, f, 16), 0x8000);
-   nir_def *abs = nir_iand_imm(b, f, 0x7fffffff);
-   /* rebias the exponent from 127 to 15 and drop 13 mantissa bits, rounding
-    * to nearest even (add 0xfff plus the lowest kept bit) */
-   nir_def *odd = nir_iand_imm(b, nir_ushr_imm(b, abs, 13), 1);
-   nir_def *normal = nir_ushr_imm(b, nir_iadd(b, nir_iadd_imm(b, abs, 0xc8000fff), odd), 13);
-   nir_def *h = nir_bcsel(b, nir_ult(b, abs, nir_imm_int(b, 113 << 23)), nir_imm_int(b, 0), normal);
-   h = nir_bcsel(b, nir_uge(b, abs, nir_imm_int(b, 0x477ff000)), nir_imm_int(b, 0x7c00), h);
-   h = nir_bcsel(b, nir_ult(b, nir_imm_int(b, 0x7f800000), abs), nir_imm_int(b, 0x7e00), h);
-   return nir_ior(b, sign, h);
-}
-
-static nir_def *
-pack_image_texel(nir_builder *b, enum pipe_format format, nir_def *rgba)
-{
-   if (format != PIPE_FORMAT_R16G16B16A16_FLOAT)
-      return nir_format_pack_rgba(b, format, rgba);
-
-   nir_def *h[4];
-   for (unsigned i = 0; i < 4; i++)
-      h[i] = float_to_half_bits(b, nir_channel(b, rgba, i));
-   return nir_vec2(b, nir_ior(b, h[0], nir_ishl_imm(b, h[1], 16)),
-                   nir_ior(b, h[2], nir_ishl_imm(b, h[3], 16)));
-}
-
 static void
 image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *align)
 {
@@ -1647,12 +1712,13 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
    *align = s;
 }
 
-/* Images are linear or 4x4 tiled (see etna_resource_create()): load and store
- * texels with LOAD/STORE and convert them with the format's pack/unpack.
- * Linear: base + layer * layer stride + y * stride + x * bpp. Tiled: tiles of
- * 4x4 texels in rows of stride * 4 bytes. 128-bit formats are two stacked
- * planes of 64-bit texels (xy, then zw), see
- * etna_resource_level_second_plane_offset(). */
+/* Images are linear or 4x4 tiled (see etna_resource_create()). Loads and
+ * stores use img_load/img_store, which address and convert texels through
+ * the image descriptor. 128-bit formats are two stacked planes of 64-bit
+ * texels (xy, then zw), see etna_resource_level_second_plane_offset().
+ * Atomics (r32ui, r32i) address the texel in the shader and use the atomic
+ * instructions: linear base + layer * layer stride + y * stride + x * 4,
+ * tiled in tiles of 4x4 texels in rows of stride * 4 bytes. */
 static bool
 lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 {
@@ -1701,6 +1767,54 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    const bool planes = bpp == 16;
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
+
+   /* img_load/img_store with the image descriptor. The 3D form takes the
+    * address of the layer as its z coordinate. 128-bit formats are two
+    * planes of 64-bit texels, xy then zw, each with its own descriptor. */
+   if (intr->intrinsic == nir_intrinsic_image_load || intr->intrinsic == nir_intrinsic_image_store) {
+      nir_def *hcoord[2];
+
+      for (unsigned p = 0; p < 1 + planes; p++) {
+         if (layered) {
+            nir_def *base = image_param(b, index, ETNA_IMAGE_ADDR);
+            if (p)
+               base = nir_iadd(b, base, image_param(b, index, ETNA_IMAGE_PLANE_OFFSET));
+            nir_def *layer = nir_iadd(b, base, nir_imul(b, nir_channel(b, coord, 2),
+                                                        image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
+            hcoord[p] = nir_vec3(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1), layer);
+         } else {
+            hcoord[p] = nir_trim_vector(b, coord, 2);
+         }
+      }
+
+      if (intr->intrinsic == nir_intrinsic_image_load) {
+         nir_def *t = nir_load_image_etna(b, index, hcoord[0], .component = 0,
+                                          .image_dim = dim, .image_array = array, .format = format);
+         if (planes) {
+            nir_def *hi = nir_load_image_etna(b, index, hcoord[1], .component = 1,
+                                              .image_dim = dim, .image_array = array, .format = format);
+            t = nir_vec4(b, nir_channel(b, t, 0), nir_channel(b, t, 1),
+                         nir_channel(b, hi, 0), nir_channel(b, hi, 1));
+         } else if (util_format_get_nr_components(format) == 1) {
+            /* the load writes .x only: (r, 0, 0, 1) */
+            nir_def *one = util_format_is_pure_integer(format) ? nir_imm_int(b, 1)
+                                                               : nir_imm_float(b, 1.0);
+            t = nir_vec4(b, nir_channel(b, t, 0), nir_imm_int(b, 0), nir_imm_int(b, 0), one);
+         }
+         nir_def_replace(&intr->def, nir_trim_vector(b, t, intr->def.num_components));
+      } else {
+         nir_def *v = intr->src[3].ssa;
+         nir_store_image_etna(b, index, hcoord[0], v, .component = 0,
+                              .image_dim = dim, .image_array = array, .format = format);
+         if (planes)
+            nir_store_image_etna(b, index, hcoord[1], nir_swizzle(b, v, (unsigned[]){ 2, 3, 2, 3 }, 4),
+                                 .component = 1, .image_dim = dim,
+                                 .image_array = array, .format = format);
+         nir_instr_remove(&intr->instr);
+      }
+      return true;
+   }
+
    nir_def *x = nir_channel(b, coord, 0);
    nir_def *y = dim == GLSL_SAMPLER_DIM_1D ? nir_imm_int(b, 0) : nir_channel(b, coord, 1);
    nir_def *stride = image_param(b, index, ETNA_IMAGE_STRIDE);
@@ -1719,35 +1833,17 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
                                             image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
 
    nir_def *addr = image_param(b, index, ETNA_IMAGE_ADDR);
-   nir_def *offset2 = planes ? nir_iadd(b, offset, image_param(b, index, ETNA_IMAGE_PLANE_OFFSET))
-                             : NULL;
-   const unsigned words = DIV_ROUND_UP(texel_bytes, 4);
 
+   /* r32ui and r32i only */
    if (intr->intrinsic == nir_intrinsic_image_atomic) {
-      /* r32ui and r32i only */
       nir_def_replace(&intr->def,
                       nir_global_atomic_etna(b, 32, addr, offset, intr->src[3].ssa,
                                              .atomic_op = nir_intrinsic_atomic_op(intr)));
-   } else if (intr->intrinsic == nir_intrinsic_image_atomic_swap) {
+   } else {
       nir_def_replace(&intr->def,
                       nir_global_atomic_swap_etna(b, 32, addr, offset,
                                                   nir_vec2(b, intr->src[4].ssa, intr->src[3].ssa),
                                                   .atomic_op = nir_intrinsic_atomic_op(intr)));
-   } else if (intr->intrinsic == nir_intrinsic_image_load) {
-      nir_def *texel = nir_load_global_etna(b, words, 32, addr, offset);
-      if (planes)
-         texel = nir_vec4(b, nir_channel(b, texel, 0), nir_channel(b, texel, 1),
-                          nir_channel(b, nir_load_global_etna(b, 2, 32, addr, offset2), 0),
-                          nir_channel(b, nir_load_global_etna(b, 2, 32, addr, offset2), 1));
-      nir_def *rgba = nir_format_unpack_rgba(b, texel, format);
-      nir_def_replace(&intr->def, nir_trim_vector(b, rgba, intr->def.num_components));
-   } else {
-      nir_def *texel = pack_image_texel(b, format, intr->src[3].ssa);
-      nir_store_global_etna(b, nir_channels(b, texel, BITFIELD_MASK(words)), addr, offset,
-                            .write_mask = BITFIELD_MASK(words));
-      if (planes)
-         nir_store_global_etna(b, nir_channels(b, texel, 0xc), addr, offset2, .write_mask = 0x3);
-      nir_instr_remove(&intr->instr);
    }
 
    return true;
