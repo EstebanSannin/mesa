@@ -170,6 +170,7 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_IMAGE_PLANE_OFFSET,
    /* word of an image descriptor: image | plane << 4 | word << 8 */
    ETNA_UNIFORM_IMAGE_DESC,
+   ETNA_UNIFORM_SCRATCH_ADDR,
 };
 
 struct etna_shader_uniform_info {
@@ -319,6 +320,8 @@ struct etna_context {
    struct pipe_sampler_view *cs_sampler_view[PIPE_MAX_SAMPLERS];
    unsigned cs_num_samplers, cs_num_sampler_views;
    uint32_t compute_shared_bo_size;
+   struct etna_bo *compute_scratch_bo;
+   uint32_t compute_scratch_bo_size;
    uint32_t compute_unk924;
    uint32_t compute_thread_alloc;
    uint32_t compute_min_temps;

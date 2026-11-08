@@ -272,6 +272,31 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       }
    }
 
+   /* scratch for the values that folded invocations keep across barrier():
+    * 16 bytes per slot and invocation of the dispatch */
+   if (v->cs_scratch_slots) {
+      const uint64_t need = (uint64_t)v->cs_scratch_slots * 16 * grid[0] * grid[1] * grid[2] *
+                            info->block[0] * info->block[1] * info->block[2];
+
+      if (need > UINT32_MAX) {
+         BUG("compute scratch for %u workgroups does not fit", grid[0] * grid[1] * grid[2]);
+         goto out;
+      }
+
+      if (need > ctx->compute_scratch_bo_size) {
+         if (ctx->compute_scratch_bo)
+            etna_bo_del(ctx->compute_scratch_bo);
+         ctx->compute_scratch_bo_size = align(need, 64 * 1024);
+         ctx->compute_scratch_bo = etna_bo_new(ctx->screen->dev, ctx->compute_scratch_bo_size,
+                                               DRM_ETNA_GEM_CACHE_WC);
+         if (!ctx->compute_scratch_bo) {
+            ctx->compute_scratch_bo_size = 0;
+            BUG("no memory for compute scratch");
+            goto out;
+         }
+      }
+   }
+
    /* Make sure the frontend-visible state of the buffers is tracked. */
    struct etna_shader_buffer_state *sb = &ctx->shader_buffers[MESA_SHADER_COMPUTE];
    u_foreach_bit(i, sb->enabled_mask)
@@ -287,7 +312,14 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    }
 
    const unsigned input_count = MAX2(v->cs_input_count, 1);
-   const unsigned block_size = info->block[0] * info->block[1] * info->block[2];
+   /* a folded variant runs the workgroup as a row of block / fold threads */
+   const unsigned fold = MAX2(v->cs_fold, 1);
+   const unsigned hw_block[3] = {
+      fold > 1 ? info->block[0] * info->block[1] * info->block[2] / fold : info->block[0],
+      fold > 1 ? 1 : info->block[1],
+      fold > 1 ? 1 : info->block[2],
+   };
+   const unsigned block_size = hw_block[0] * hw_block[1] * hw_block[2];
    /* Threads of a workgroup that are resident at the same time, in units of
     * 4-wide threads per shader core. Too few and barrier() does not wait for the
     * whole workgroup; found by experiment on GC7000 r6204. */
@@ -299,10 +331,13 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    /* With barrier() the whole workgroup must be resident at once, and the
     * shader cores hold 512 invocation-temporaries each: invocations x temps
     * <= 1024 on GC7000 r6204 (2 cores), found by experiment at 32 to 256
-    * invocations. Beyond that barrier() never returns and the GPU hangs for
-    * every client: skip the dispatch instead. */
+    * invocations, but the boundary itself hangs under load, with the
+    * temporaries counted in pairs. Beyond that
+    * barrier() never returns and the GPU hangs for every client.
+    * etna_compile_shader() folds such workgroups onto fewer threads; if even
+    * that does not fit, skip the dispatch. */
    if (v->cs_uses_barrier &&
-       block_size * num_temps > 512 * ctx->screen->info->gpu.shader_core_count) {
+       block_size * align(num_temps, 2) >= 512 * ctx->screen->info->gpu.shader_core_count) {
       BUG("compute: %u invocations x %u temporaries do not fit with barrier(), dispatch skipped",
           block_size, num_temps);
       goto out;
@@ -390,9 +425,9 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    /* CL_WORKGROUP_COUNT_{X,Y,Z} and CL_WORKGROUP_SIZE_{X,Y,Z}, minus one */
    const uint32_t groups[6] = {
       grid[0] - 1, grid[1] - 1, grid[2] - 1,
-      (info->block[0] - 1) & 0x3ff,
-      (info->block[1] - 1) & 0x3ff,
-      (info->block[2] - 1) & 0x3ff,
+      (hw_block[0] - 1) & 0x3ff,
+      (hw_block[1] - 1) & 0x3ff,
+      (hw_block[2] - 1) & 0x3ff,
    };
    etna_set_state_multi(stream, VIVS_CL_WORKGROUP_COUNT_X, 6, groups);
 
@@ -451,6 +486,8 @@ etna_compute_fini(struct pipe_context *pctx)
 
    if (ctx->compute_shared_bo)
       etna_bo_del(ctx->compute_shared_bo);
+   if (ctx->compute_scratch_bo)
+      etna_bo_del(ctx->compute_scratch_bo);
 
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
       pipe_sampler_view_reference(&ctx->cs_sampler_view[i], NULL);

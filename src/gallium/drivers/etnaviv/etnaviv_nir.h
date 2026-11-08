@@ -41,6 +41,9 @@ bool
 etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct etna_core_info *info);
 
 bool
+etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots);
+
+bool
 etna_nir_lower_bitfield_insert(nir_shader *shader);
 
 bool

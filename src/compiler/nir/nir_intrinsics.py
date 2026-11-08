@@ -1713,6 +1713,9 @@ intrinsic("load_image_etna", src_comp=[1, 0], dest_comp=4, bit_sizes=[32],
 # src[] = { image index, coordinate, value }.
 intrinsic("store_image_etna", src_comp=[1, 0, 4],
           indices=[COMPONENT, IMAGE_DIM, IMAGE_ARRAY, FORMAT])
+# Copy that CSE does not merge (no CAN_REORDER): keeps values derived from
+# it apart from equal values elsewhere. The driver lowers it to its source.
+intrinsic("opaque_copy_etna", src_comp=[0], dest_comp=0, bit_sizes=src0, flags=[CAN_ELIMINATE])
 
 # IR3-specific bindless handle specifier. Similar to vulkan_resource_index, but
 # without the binding because the hardware expects a single flattened index

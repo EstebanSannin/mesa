@@ -655,6 +655,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
 
    case nir_intrinsic_load_ssbo_address_etna:
    case nir_intrinsic_load_image_param_etna:
+   case nir_intrinsic_opaque_copy_etna:
       is_divergent = src_divergent(instr->src[0], state);
       break;
 

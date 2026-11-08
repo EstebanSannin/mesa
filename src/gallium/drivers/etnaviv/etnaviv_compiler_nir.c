@@ -1383,6 +1383,9 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             case nir_intrinsic_get_ssbo_size:
                value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_SIZE, nir_src_as_uint(intr->src[0]));
                break;
+            case nir_intrinsic_load_scratch_base_ptr:
+               value[0] = CONST_VAL(ETNA_UNIFORM_SCRATCH_ADDR, 0);
+               break;
             case nir_intrinsic_load_shared_base_ptr:
                value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_ADDR, 0);
                break;
@@ -1922,8 +1925,20 @@ alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
    return 4;
 }
 
+/* the copies that keep the segments of etna_nir_fold_workgroup() apart from
+ * CSE, once no CSE runs any more */
 static bool
-compile_shader(struct etna_shader_variant *v, bool spill_constants)
+lower_opaque_copy(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_opaque_copy_etna)
+      return false;
+
+   nir_def_replace(&intr->def, intr->src[0].ssa);
+   return true;
+}
+
+static bool
+compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold)
 {
    if (unlikely(!v))
       return false;
@@ -1969,6 +1984,26 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
 
    if (s->info.stage == MESA_SHADER_COMPUTE) {
       v->uses_discard = false;
+      v->cs_fold = 1;
+
+      if (fold > 1) {
+         if (!etna_nir_fold_workgroup(s, fold, &v->cs_scratch_slots)) {
+            ralloc_free(c->nir);
+            FREE(c);
+            return false;
+         }
+         v->cs_fold = fold;
+
+         bool progress;
+         do {
+            progress = false;
+            NIR_PASS(progress, s, nir_opt_copy_prop);
+            NIR_PASS(progress, s, nir_opt_constant_folding);
+            NIR_PASS(progress, s, nir_opt_algebraic);
+            NIR_PASS(progress, s, nir_opt_cse);
+            NIR_PASS(progress, s, nir_opt_dce);
+         } while (progress);
+      }
 
       NIR_PASS(_, s, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
                glsl_get_cl_type_size_align);
@@ -2083,6 +2118,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    NIR_PASS(_, s, nir_opt_dce);
    NIR_PASS(_, s, nir_opt_cse);
 
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_opaque_copy, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, etna_nir_lower_bitfield_insert);
    NIR_PASS(_, s, nir_lower_bool_to_int32);
    NIR_PASS(_, s, etna_lower_alu, etna_core_has_feature(c->info, ETNA_FEATURE_HAS_FAST_TRANSCENDENTALS));
@@ -2147,17 +2183,66 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    return result;
 }
 
-bool
-etna_compile_shader(struct etna_shader_variant *v)
+static bool
+compile_shader_spill(struct etna_shader_variant *v, unsigned fold)
 {
-   if (compile_shader(v, false))
+   if (compile_shader(v, false, fold))
       return true;
 
    /* the spilled constants are read with LOAD, which needs halti2 */
    if (!v || v->shader->info->halti < 2)
       return false;
 
-   return compile_shader(v, true);
+   return compile_shader(v, true, fold);
+}
+
+/* A compute workgroup with barrier() must be resident in full: invocations x
+ * temporaries <= 512 per shader core (GC7000 r6204). The boundary itself
+ * passes alone but hangs under load (four dEQP processes), counting the
+ * temporaries in pairs: 64 x 16 and 16 x 62 hung. Stay below it.
+ * If it does not fit, run the workgroup with fewer hardware threads, several
+ * invocations each (see etna_nir_fold_workgroup()). ETNA_CS_FOLD sets a
+ * smallest fold factor, for testing. */
+static bool
+fits(const struct etna_shader_variant *v, unsigned invocations)
+{
+   const unsigned temps = align(MAX2(v->num_temps, v->cs_input_count), 2);
+
+   return invocations / v->cs_fold * temps < 512 * v->shader->info->gpu.shader_core_count;
+}
+
+bool
+etna_compile_shader(struct etna_shader_variant *v)
+{
+   if (!v)
+      return false;
+
+   const struct shader_info *info = &v->shader->nir->info;
+   const unsigned n = info->workgroup_size[0] * info->workgroup_size[1] * info->workgroup_size[2];
+   const unsigned min_fold = info->stage == MESA_SHADER_COMPUTE ? debug_get_num_option("ETNA_CS_FOLD", 1) : 1;
+
+   const bool foldable = info->stage == MESA_SHADER_COMPUTE && info->uses_control_barrier &&
+                         !info->workgroup_size_variable;
+
+   if (!foldable || min_fold <= 1) {
+      if (!compile_shader_spill(v, 1))
+         return false;
+      if (!foldable || fits(v, n))
+         return true;
+   }
+
+   /* at least 32 threads: the folded code grows with the fold factor, in
+    * size and in temporaries, and a 16-thread variant of 2600 instructions
+    * still hung under load */
+   for (unsigned fold = MAX2(min_fold, 2); fold <= n / 32; fold *= 2) {
+      if (n % fold)
+         break;
+      if (compile_shader_spill(v, fold) && fits(v, n))
+         return true;
+   }
+
+   /* nothing fits: the dispatch refuses it, see etna_launch_grid() */
+   return compile_shader_spill(v, 1);
 }
 
 static const struct etna_shader_inout *

@@ -139,6 +139,12 @@ struct etna_shader_variant {
    /* compute: barrier() synchronizes the workgroup */
    bool cs_uses_barrier;
 
+   /* compute: invocations run by each hardware thread (1, or the fold factor
+    * of etna_nir_fold_workgroup()), and the scratch slots of 16 bytes per
+    * invocation that this needs */
+   uint32_t cs_fold;
+   uint32_t cs_scratch_slots;
+
    /* shader is larger than GPU instruction limit, thus needs icache */
    bool needs_icache;
 
