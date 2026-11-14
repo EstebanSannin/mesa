@@ -1509,6 +1509,20 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
       }
    }
 
+   /* the backend has 32-bit registers only (and 1-bit booleans) */
+   nir_foreach_block(block, c->impl) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+         if (def && (def->bit_size == 8 || def->bit_size == 16) &&
+             instr->type != nir_instr_type_load_const) {
+            char *str = nir_instr_as_str(instr, NULL);
+            compile_error(c, "%u-bit value not lowered: %s\n", def->bit_size, str);
+            ralloc_free(str);
+            return false;
+         }
+      }
+   }
+
    /* call directly to avoid validation (load_const don't pass validation at this point) */
    nir_convert_from_ssa(shader, true, false);
    nir_trivialize_registers(shader);
@@ -1885,6 +1899,86 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    return true;
 }
 
+/* Memory is accessed in aligned 32-bit words: narrower or unaligned loads
+ * become word loads plus extraction, narrower stores atomic and/or on the
+ * word (OpenCL char and short data, 8-bit kernel arguments). */
+static nir_mem_access_size_align
+etna_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size,
+                           uint32_t align_mul, uint32_t align_offset, bool offset_is_const,
+                           enum gl_access_qualifier access, const void *cb_data)
+{
+   return (nir_mem_access_size_align){
+      .num_components = MIN2(DIV_ROUND_UP(bytes, 4), 4),
+      .bit_size = 32,
+      .align = 4,
+      .shift = nir_mem_access_shift_method_scalar,
+   };
+}
+
+/* no 8- or 16-bit arithmetic: do it in 32 bits */
+static unsigned
+etna_lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
+{
+   if (instr->type == nir_instr_type_phi) {
+      const unsigned size = nir_instr_as_phi(instr)->def.bit_size;
+      return size == 8 || size == 16 ? 32 : 0;
+   }
+
+   if (instr->type != nir_instr_type_alu)
+      return 0;
+
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   unsigned size = alu->def.bit_size;
+
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+      if (alu->src[i].src.ssa->bit_size != 1)
+         size = MIN2(size == 1 ? 32 : size, alu->src[i].src.ssa->bit_size);
+
+   return size == 8 || size == 16 ? 32 : 0;
+}
+
+/* After nir_lower_bit_size(): widen(narrow(x)) of a 32-bit x is a mask or a
+ * sign extension in 32 bits (with lower_extract_byte, nir_opt_algebraic
+ * leaves u2u32(u2u8(x)) alone, and the 8-bit value would reach the backend) */
+static bool
+fold_narrow_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   bool sign, to_float;
+
+   switch (alu->op) {
+   case nir_op_u2u32: sign = false; to_float = false; break;
+   case nir_op_i2i32: sign = true; to_float = false; break;
+   case nir_op_u2f32: sign = false; to_float = true; break;
+   case nir_op_i2f32: sign = true; to_float = true; break;
+   default:
+      return false;
+   }
+
+   if (!nir_def_is_alu(alu->src[0].src.ssa))
+      return false;
+
+   nir_alu_instr *narrow = nir_instr_as_alu(nir_def_instr(alu->src[0].src.ssa));
+   if ((narrow->op != nir_op_u2u8 && narrow->op != nir_op_u2u16 &&
+        narrow->op != nir_op_i2i8 && narrow->op != nir_op_i2i16) ||
+       narrow->src[0].src.ssa->bit_size != 32)
+      return false;
+
+   const unsigned bits = narrow->def.bit_size;
+   b->cursor = nir_before_instr(&alu->instr);
+
+   unsigned swiz[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < alu->def.num_components; i++)
+      swiz[i] = alu->src[0].swizzle[i];
+   nir_def *x = nir_swizzle(b, nir_ssa_for_alu_src(b, narrow, 0), swiz, alu->def.num_components);
+   nir_def *v = sign ? nir_ishr_imm(b, nir_ishl_imm(b, x, 32 - bits), 32 - bits) :
+                       nir_iand_imm(b, x, BITFIELD_MASK(bits));
+   if (to_float)
+      v = sign ? nir_i2f32(b, v) : nir_u2f32(b, v);
+
+   nir_def_replace(&alu->def, v);
+   return true;
+}
+
 /* SSBO access becomes address + offset: the address is a uniform the driver
  * fills with the GPU address of the bound buffer */
 static bool
@@ -2076,6 +2170,21 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
                glsl_get_cl_type_size_align);
       NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_shared,
                nir_address_format_32bit_offset);
+
+      const nir_lower_mem_access_bit_sizes_options mem_opts = {
+         .callback = etna_mem_access_size_align,
+         .modes = nir_var_mem_ubo | nir_var_mem_global | nir_var_mem_constant |
+                  nir_var_mem_shared | nir_var_mem_ssbo,
+         .may_lower_unaligned_stores_to_atomics = true,
+      };
+      if (OPT(s, nir_lower_mem_access_bit_sizes, &mem_opts)) {
+         NIR_PASS(_, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
+         NIR_PASS(_, s, nir_shader_alu_pass, fold_narrow_conversion,
+                  nir_metadata_control_flow, NULL);
+         NIR_PASS(_, s, nir_opt_constant_folding);
+         NIR_PASS(_, s, nir_opt_algebraic);
+         NIR_PASS(_, s, nir_opt_dce);
+      }
       v->cs_shared_size = align(s->info.shared_size, 16);
       v->cs_uses_barrier = s->info.uses_control_barrier;
       if (v->cs_shared_size)
@@ -2156,6 +2265,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    NIR_PASS(_, s, etna_lower_io, v);
    NIR_PASS(_, s, nir_lower_pack);
+   /* lowering byte extracts can leave widen(narrow(x)) behind again */
+   NIR_PASS(_, s, nir_shader_alu_pass, fold_narrow_conversion, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_opt_combine_stores, nir_var_shader_out);
    etna_optimize_loop(s);
 
@@ -2179,6 +2290,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, s, nir_opt_algebraic_late);
+   NIR_PASS(_, s, nir_shader_alu_pass, fold_narrow_conversion, nir_metadata_control_flow, NULL);
 
    NIR_PASS(_, s, nir_move_vec_src_uses_to_dest, false);
    NIR_PASS(_, s, nir_opt_copy_prop);
