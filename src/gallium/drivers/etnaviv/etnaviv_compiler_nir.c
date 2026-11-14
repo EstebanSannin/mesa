@@ -1937,6 +1937,23 @@ lower_opaque_copy(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    return true;
 }
 
+/* nir_lower_frexp() emits fisfinite, which only nir_opt_algebraic_late
+ * lowers, after the bool lowering has turned it into fisfinite32. Test the
+ * exponent bits: a float compare against infinity doesn't work here. */
+static bool
+lower_fisfinite(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_fisfinite)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   uint64_t exp_mask = x->bit_size == 16 ? 0x7c00 : 0x7f800000;
+   nir_def *mask = nir_imm_intN_t(b, exp_mask, x->bit_size);
+   nir_def_replace(&alu->def, nir_ine(b, nir_iand(b, x, mask), mask));
+   return true;
+}
+
 static bool
 compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold)
 {
@@ -2066,6 +2083,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    NIR_PASS(_, s, etna_nir_lower_texture, &v->key, v->shader->info);
    NIR_PASS(_, s, etna_nir_lower_128bit, &v->key);
+   NIR_PASS(_, s, nir_lower_frexp);
+   NIR_PASS(_, s, nir_shader_alu_pass, lower_fisfinite, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_alu_width, alu_width_cb, NULL);
 
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
