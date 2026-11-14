@@ -368,7 +368,9 @@ etna_init_screen_caps(struct etna_screen *screen)
    caps->max_stream_output_interleaved_components = 64;
 
    caps->max_vertex_attrib_stride = screen->info->halti >= 2 ? 2048 : 128;
-   caps->max_vertex_element_src_offset = 255;
+   /* START is 8 bits in FE_VERTEX_ELEMENT_CONFIG, 11 (at least) in
+    * NFE_GENERIC_ATTRIB_CONFIG0: tested up to 2040 on GC7000 r6204 */
+   caps->max_vertex_element_src_offset = screen->info->halti >= 5 ? 2047 : 255;
    caps->max_vertex_buffers = screen->info->gpu.stream_count;
    caps->vs_instanceid =
    caps->vertex_element_instance_divisor = VIV_FEATURE(screen, ETNA_FEATURE_HALTI2);
