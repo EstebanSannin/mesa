@@ -434,9 +434,16 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
    etna_set_state(stream, VIVS_CL_KICKER, 0xbadabeeb);
 
+   /* Wait for the dispatch before the state of the next one: the FE->PE
+    * stall alone can let the last invocations of a dispatch run on into the
+    * next dispatch's uniforms (their stores land in the next buffer range).
+    * A TS flush before it, as NXP's driver has between dispatches and the
+    * kernel at the end of a job, makes the stall wait for them. */
    etna_set_state(stream, VIVS_GL_FLUSH_CACHE,
                   VIVS_GL_FLUSH_CACHE_TEXTURE | VIVS_GL_FLUSH_CACHE_SHADER_L1 |
                   VIVS_GL_FLUSH_CACHE_UNK10 | VIVS_GL_FLUSH_CACHE_UNK11);
+   if (!VIV_FEATURE(ctx->screen, ETNA_FEATURE_BLT_ENGINE))
+      etna_set_state(stream, VIVS_TS_FLUSH_CACHE, VIVS_TS_FLUSH_CACHE_FLUSH);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
 
    /* the linear base is now the newest copy of written images */
