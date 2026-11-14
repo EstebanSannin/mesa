@@ -591,6 +591,17 @@ etna_resource_alloc_layout(struct pipe_screen *pscreen, unsigned layout,
    if (border_shadow)
       size += rsc->border_tail;
 
+   /* The border clamp shadow is filled by the RS or the BLT. A format they
+    * can't copy (8 bpp on the RS) would be sampled from an empty shadow, so
+    * it gets the tail in the resource itself and needs no shadow.
+    */
+   if (!border_shadow && rsc->border_tail &&
+       !VIV_FEATURE(screen, ETNA_FEATURE_TX_BORDER_CLAMP_FIX) &&
+       !etna_resource_hw_tileable(VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE), templat)) {
+      size += rsc->border_tail;
+      rsc->border_tail = 0;
+   }
+
    if (unlikely(templat->bind & PIPE_BIND_SCANOUT) && screen->ro) {
       struct pipe_resource scanout_templat = *templat;
       struct winsys_handle handle;
