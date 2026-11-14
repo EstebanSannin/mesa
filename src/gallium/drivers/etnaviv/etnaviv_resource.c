@@ -698,7 +698,10 @@ etna_resource_create(struct pipe_screen *pscreen,
    if (templat->bind & PIPE_BIND_DEPTH_STENCIL) {
       if (screen->specs.pe_multitiled)
          layout |= ETNA_LAYOUT_BIT_MULTI;
-      if (VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED))
+      /* A format the resolve engine can't tile (S8 without the BLT) stays
+       * 4x4 tiled: CPU transfers can't handle super tiling. */
+      if (VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED) &&
+          etna_resource_hw_tileable(VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE), templat))
          layout |= ETNA_LAYOUT_BIT_SUPER;
    } else if (VIV_FEATURE(screen, ETNA_FEATURE_SUPER_TILED) &&
               VIV_FEATURE(screen, ETNA_FEATURE_SUPERTILED_TEXTURE) &&
