@@ -283,6 +283,14 @@ etna_uniforms_write(const struct etna_context *ctx,
          etna_cmd_stream_emit(stream, ctx->compute_grid[val]);
          break;
 
+      case ETNA_UNIFORM_WORKGROUP_SIZE:
+         etna_cmd_stream_emit(stream, ctx->compute_block[val]);
+         break;
+
+      case ETNA_UNIFORM_SHARED_SLICE:
+         etna_cmd_stream_emit(stream, ctx->compute_shared_slice);
+         break;
+
       case ETNA_UNIFORM_IMAGE_ADDR: {
          const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
          const struct etna_resource *rsc = etna_resource(img->resource);

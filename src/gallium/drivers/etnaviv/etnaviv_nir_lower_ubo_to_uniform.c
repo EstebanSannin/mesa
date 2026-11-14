@@ -56,6 +56,26 @@ lower_ubo_to_uniform(nir_builder *b, nir_instr *instr, void *_data)
    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
    b->cursor = nir_before_instr(instr);
 
+   /* OpenCL kernel arguments (rusticl) sit at any 4-byte offset: read each
+    * 32-bit component from its vec4 uniform and channel */
+   const unsigned off = nir_src_as_uint(intr->src[1]) - nir_intrinsic_range_base(intr);
+   if ((off % 16 || intr->num_components > 4) && off % 4 == 0 && intr->def.bit_size == 32) {
+      nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+
+      for (unsigned i = 0; i < intr->num_components; i++) {
+         const unsigned byte = off + 4 * i;
+         nir_def *vec = nir_load_uniform(b, 4, 32, nir_imm_int(b, byte / 16),
+                                         .base = nir_intrinsic_range_base(intr) / 16,
+                                         .range = DIV_ROUND_UP(nir_intrinsic_range(intr), 16),
+                                         .dest_type = nir_type_float32);
+         comps[i] = nir_channel(b, vec, (byte % 16) / 4);
+      }
+
+      nir_def *uniform = nir_vec(b, comps, intr->num_components);
+      nir_def_rewrite_uses(&intr->def, uniform);
+      return uniform;
+   }
+
    /* Undo the operations done in nir_lower_uniforms_to_ubo. */
    nir_def *ubo_offset = intr->src[1].ssa;
    nir_def *range_base = nir_imm_int(b, nir_intrinsic_range_base(intr));

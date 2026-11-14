@@ -117,6 +117,11 @@ struct etna_shader {
 
    uint16_t tex_lod_samplers;
    uint16_t tg4_shadow_samplers;
+   /* OpenCL pairs any image with any sampler; the hardware samples a texture
+    * slot with that slot's sampler state. Texture slots in sampler_remap take
+    * the state of sampler sampler_for_texture[] (see etna_launch_grid). */
+   uint16_t sampler_remap;
+   uint8_t sampler_for_texture[16];
    uint32_t textures_used;
 
    struct util_shader_variant_list variants;

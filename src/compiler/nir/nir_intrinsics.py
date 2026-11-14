@@ -1104,6 +1104,9 @@ system_value("aa_line_width", 1)
 system_value("scratch_base_ptr", 0, bit_sizes=[32,64], indices=[BASE])
 system_value("constant_base_ptr", 0, bit_sizes=[32,64])
 system_value("shared_base_ptr", 0, bit_sizes=[32,64])
+# etnaviv: bytes of shared memory per workgroup of the dispatch (OpenCL kernels
+# with __local arguments, whose size is set at launch)
+system_value("shared_slice_etna", 1)
 system_value("global_base_ptr", 0, bit_sizes=[32,64])
 # Address and size of a transform feedback buffer, indexed by BASE
 system_value("xfb_address", 1, bit_sizes=[32,64], indices=[BASE])

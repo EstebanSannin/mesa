@@ -1376,6 +1376,10 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             case nir_intrinsic_load_first_vertex:
                value[0] = CONST_VAL(ETNA_UNIFORM_XFB_FIRST_VERTEX, 0);
                break;
+            case nir_intrinsic_load_workgroup_size:
+               for (unsigned i = 0; i < 3; i++)
+                  value[i] = CONST_VAL(ETNA_UNIFORM_WORKGROUP_SIZE, i);
+               break;
             case nir_intrinsic_load_num_workgroups:
                for (unsigned i = 0; i < intr->def.num_components; i++)
                   value[i] = CONST_VAL(ETNA_UNIFORM_NUM_WORKGROUPS, i);
@@ -1385,6 +1389,9 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
                break;
             case nir_intrinsic_load_scratch_base_ptr:
                value[0] = CONST_VAL(ETNA_UNIFORM_SCRATCH_ADDR, 0);
+               break;
+            case nir_intrinsic_load_shared_slice_etna:
+               value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_SLICE, 0);
                break;
             case nir_intrinsic_load_shared_base_ptr:
                value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_ADDR, 0);
@@ -1656,13 +1663,21 @@ lower_cs_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       val = load_cs_input(b, 2, input_count);
       break;
    case nir_intrinsic_load_local_invocation_index: {
-      const uint16_t *size = b->shader->info.workgroup_size;
       nir_def *id = load_cs_input(b, 1, input_count);
+      nir_def *size;
+
+      /* OpenCL kernels have the workgroup size of the dispatch */
+      if (b->shader->info.workgroup_size_variable) {
+         size = nir_load_workgroup_size(b);
+      } else {
+         const uint16_t *s = b->shader->info.workgroup_size;
+         size = nir_imm_ivec3(b, s[0], s[1], s[2]);
+      }
 
       val = nir_iadd(b, nir_channel(b, id, 0),
-                     nir_imul_imm(b, nir_iadd(b, nir_channel(b, id, 1),
-                                              nir_imul_imm(b, nir_channel(b, id, 2), size[1])),
-                                  size[0]));
+                     nir_imul(b, nir_iadd(b, nir_channel(b, id, 1),
+                                          nir_imul(b, nir_channel(b, id, 2), nir_channel(b, size, 1))),
+                              nir_channel(b, size, 0)));
       break;
    }
    default:
@@ -1704,7 +1719,10 @@ lower_shared_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                                       nir_iadd(b, nir_channel(b, wid, 1),
                                                nir_imul(b, nir_channel(b, num, 1),
                                                         nir_channel(b, wid, 2)))));
-   nir_def *offset = nir_iadd(b, nir_imul_imm(b, group, slice),
+   /* with __local kernel arguments the slice size is the dispatch's */
+   nir_def *slice_size = b->shader->info.cs.has_variable_shared_mem ?
+                         nir_load_shared_slice_etna(b) : nir_imm_int(b, slice);
+   nir_def *offset = nir_iadd(b, nir_imul(b, group, slice_size),
                               nir_iadd_imm(b, intr->src[off_src].ssa, nir_intrinsic_base(intr)));
    nir_def *addr = nir_load_shared_base_ptr(b, 1, 32);
    nir_def *repl = NULL;
@@ -1980,7 +1998,8 @@ fold_narrow_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
 }
 
 /* SSBO access becomes address + offset: the address is a uniform the driver
- * fills with the GPU address of the bound buffer */
+ * fills with the GPU address of the bound buffer. OpenCL global access
+ * (32-bit addresses) is the same with offset 0. */
 static bool
 lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 {
@@ -1989,6 +2008,26 @@ lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    b->cursor = nir_before_instr(&intr->instr);
 
    switch (intr->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size,
+                                  intr->src[0].ssa, nir_imm_int(b, 0));
+      break;
+   case nir_intrinsic_store_global:
+      nir_store_global_etna(b, intr->src[0].ssa, intr->src[1].ssa, nir_imm_int(b, 0),
+                            .write_mask = nir_intrinsic_write_mask(intr));
+      break;
+   case nir_intrinsic_global_atomic:
+      repl = nir_global_atomic_etna(b, intr->def.bit_size, intr->src[0].ssa, nir_imm_int(b, 0),
+                                    intr->src[1].ssa,
+                                    .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   case nir_intrinsic_global_atomic_swap:
+      repl = nir_global_atomic_swap_etna(b, intr->def.bit_size, intr->src[0].ssa,
+                                         nir_imm_int(b, 0),
+                                         nir_vec2(b, intr->src[2].ssa, intr->src[1].ssa),
+                                         .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
    case nir_intrinsic_load_ssbo:
       repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size,
                                   nir_load_ssbo_address_etna(b, intr->src[0].ssa),
@@ -2187,7 +2226,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       }
       v->cs_shared_size = align(s->info.shared_size, 16);
       v->cs_uses_barrier = s->info.uses_control_barrier;
-      if (v->cs_shared_size)
+      if (v->cs_shared_size || s->info.cs.has_variable_shared_mem)
          NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_shared_access,
                   nir_metadata_none, &v->cs_shared_size);
 

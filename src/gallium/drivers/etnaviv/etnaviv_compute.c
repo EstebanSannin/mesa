@@ -112,6 +112,11 @@ etna_create_compute_state(struct pipe_context *pctx,
       .ir.nir = (struct nir_shader *)pcs->prog,
    };
 
+   /* OpenCL kernels (rusticl) arrive lowered to explicit memory access and
+    * kernel arguments in constant buffer 0: run them as compute shaders */
+   if (pss.ir.nir->info.stage == MESA_SHADER_KERNEL)
+      pss.ir.nir->info.stage = MESA_SHADER_COMPUTE;
+
    return pctx->create_fs_state(pctx, &pss);
 }
 
@@ -135,8 +140,22 @@ etna_get_compute_state_info(struct pipe_context *pctx, void *cso,
                             struct pipe_compute_state_object_info *info)
 {
    struct etna_screen *screen = etna_screen(pctx->screen);
+   struct etna_shader_key key = {};
+   struct etna_shader_variant *v = etna_shader_variant(cso, &key, &pctx->debug, true);
 
    info->max_threads = screen->base.compute_caps.max_threads_per_block;
+
+   /* With barrier() a whole workgroup must be resident: invocations x
+    * temporaries (in pairs) below 512 per shader core, as etna_launch_grid()
+    * checks. Report the largest multiple of 4 invocations that fits. */
+   if (v && v->cs_uses_barrier && v->cs_fold <= 1) {
+      const unsigned temps = align(MAX3(v->num_temps, MAX2(v->cs_input_count, 1),
+                                        etna_context(pctx)->compute_min_temps), 2);
+      const unsigned fit = (512 * screen->info->gpu.shader_core_count - 1) / temps;
+
+      info->max_threads = MIN2(info->max_threads, MAX2(fit & ~3u, 4));
+   }
+
    info->private_memory = 0;
    info->preferred_simd_size = 4;
    info->simd_sizes = 4;
@@ -162,9 +181,30 @@ struct etna_saved_textures {
    unsigned num_samplers, num_views;
 };
 
+/* A texture slot only works with a sampler state, but OpenCL reads images
+ * without one (texel fetch): such textures get a nearest, clamp-to-edge one. */
+static void *
+etna_compute_fetch_sampler(struct etna_context *ctx)
+{
+   if (!ctx->cs_fetch_sampler) {
+      const struct pipe_sampler_state ss = {
+         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      };
+
+      ctx->cs_fetch_sampler = ctx->base.create_sampler_state(&ctx->base, &ss);
+   }
+
+   return ctx->cs_fetch_sampler;
+}
+
 static void
 etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures *saved,
-                           bool compute)
+                           bool compute, const struct etna_shader *shader)
 {
    struct pipe_context *pctx = &ctx->base;
    const unsigned n = PIPE_MAX_SAMPLERS / 2;
@@ -181,6 +221,12 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
       }
       memcpy(samplers, ctx->cs_sampler, sizeof(void *) * n);
       memcpy(views, ctx->cs_sampler_view, sizeof(views[0]) * n);
+      u_foreach_bit(t, shader->sampler_remap)
+         samplers[t] = ctx->cs_sampler[shader->sampler_for_texture[t]];
+      u_foreach_bit(t, shader->textures_used & BITFIELD_MASK(n)) {
+         if (!samplers[t])
+            samplers[t] = etna_compute_fetch_sampler(ctx);
+      }
    } else {
       memcpy(samplers, saved->sampler, sizeof(void *) * n);
       memcpy(views, saved->view, sizeof(views[0]) * n);
@@ -230,7 +276,7 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    struct etna_shader_key key = {};
 
    if (textures) {
-      etna_compute_swap_textures(ctx, &saved, true);
+      etna_compute_swap_textures(ctx, &saved, true, shader);
       etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers,
                                       shader->tg4_shadow_samplers);
    }
@@ -249,10 +295,13 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    }
 
    memcpy(ctx->compute_grid, grid, sizeof(ctx->compute_grid));
+   memcpy(ctx->compute_block, info->block, sizeof(ctx->compute_block));
 
-   /* one shared memory slice per workgroup of this dispatch */
-   if (v->cs_shared_size) {
-      const uint64_t need = (uint64_t)v->cs_shared_size * grid[0] * grid[1] * grid[2];
+   /* one shared memory slice per workgroup of this dispatch: the shader's own
+    * shared memory, then the __local kernel arguments (OpenCL) */
+   ctx->compute_shared_slice = align(v->cs_shared_size + info->variable_shared_mem, 16);
+   if (ctx->compute_shared_slice) {
+      const uint64_t need = (uint64_t)ctx->compute_shared_slice * grid[0] * grid[1] * grid[2];
 
       if (need > UINT32_MAX) {
          BUG("shared memory for %u workgroups does not fit", grid[0] * grid[1] * grid[2]);
@@ -375,6 +424,14 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    etna_set_state(stream, VIVS_GL_FLUSH_CACHE, VIVS_GL_FLUSH_CACHE_SHADER_L1);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
 
+   /* global buffers are only addressed from the kernel arguments: reference
+    * them in the submit */
+   u_foreach_bit(i, ctx->global_bindings_mask) {
+      resource_written(ctx, ctx->global_bindings[i]);
+      etna_cmd_stream_ref_bo(stream, etna_buffer_resource(ctx->global_bindings[i])->bo,
+                             ETNA_RELOC_READ | ETNA_RELOC_WRITE);
+   }
+
    etna_uniforms_write(ctx, v, ctx->constant_buffer[MESA_SHADER_COMPUTE].cb);
 
    etna_set_state(stream, VIVS_PS_VARYING_NUM_COMPONENTS(0), 0);
@@ -462,7 +519,37 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
 out:
    if (textures)
-      etna_compute_swap_textures(ctx, &saved, false);
+      etna_compute_swap_textures(ctx, &saved, false, shader);
+}
+
+/* OpenCL global buffers: each handle holds an offset into its buffer, the
+ * kernel gets the GPU address (32-bit, address_bits = 32) */
+static void
+etna_set_global_binding(struct pipe_context *pctx, unsigned first, unsigned count,
+                        struct pipe_resource **resources, uint32_t **handles)
+{
+   struct etna_context *ctx = etna_context(pctx);
+
+   assert(first + count <= ARRAY_SIZE(ctx->global_bindings));
+
+   for (unsigned i = 0; i < count; i++) {
+      const unsigned n = first + i;
+
+      if (resources && resources[i]) {
+         pipe_resource_reference(&ctx->global_bindings[n], resources[i]);
+         ctx->global_bindings_mask |= BITFIELD_BIT(n);
+
+         if (handles && handles[i]) {
+            uint32_t offset;
+            memcpy(&offset, handles[i], sizeof(offset));
+            offset += etna_bo_gpu_va(etna_buffer_resource(resources[i])->bo);
+            memcpy(handles[i], &offset, sizeof(offset));
+         }
+      } else {
+         pipe_resource_reference(&ctx->global_bindings[n], NULL);
+         ctx->global_bindings_mask &= ~BITFIELD_BIT(n);
+      }
+   }
 }
 
 void
@@ -484,6 +571,7 @@ etna_compute_init(struct pipe_context *pctx)
    pctx->launch_grid = etna_launch_grid;
    pctx->set_shader_buffers = etna_set_shader_buffers;
    pctx->set_shader_images = etna_set_shader_images;
+   pctx->set_global_binding = etna_set_global_binding;
    pctx->memory_barrier = etna_memory_barrier;
 }
 
@@ -499,6 +587,9 @@ etna_compute_fini(struct pipe_context *pctx)
 
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
       pipe_sampler_view_reference(&ctx->cs_sampler_view[i], NULL);
+
+   if (ctx->cs_fetch_sampler)
+      pctx->delete_sampler_state(pctx, ctx->cs_fetch_sampler);
 
    for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
       for (unsigned i = 0; i < ETNA_MAX_SHADER_BUFFERS; i++)

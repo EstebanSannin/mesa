@@ -158,7 +158,9 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_SSBO_ADDR,
    ETNA_UNIFORM_SSBO_SIZE,
    ETNA_UNIFORM_NUM_WORKGROUPS,
+   ETNA_UNIFORM_WORKGROUP_SIZE,
    ETNA_UNIFORM_SHARED_ADDR,
+   ETNA_UNIFORM_SHARED_SLICE,
    /* image parameters, in the order of the BASE of load_image_param_etna */
    ETNA_UNIFORM_IMAGE_ADDR,
    ETNA_UNIFORM_IMAGE_STRIDE,
@@ -268,6 +270,10 @@ struct etna_context {
    struct etna_constbuf_state constant_buffer[MESA_SHADER_STAGES];
    struct etna_shader_buffer_state shader_buffers[MESA_SHADER_STAGES];
    struct etna_shader_image_state shader_images[MESA_SHADER_STAGES];
+   /* OpenCL global buffers (set_global_binding): kernels address them by
+    * their GPU address, so they are only referenced by the submit */
+   struct pipe_resource *global_bindings[32];
+   uint32_t global_bindings_mask;
    struct etna_vertexbuf_state vertex_buffer;
    struct etna_index_buffer index_buffer;
    struct etna_shader_state shader;
@@ -316,9 +322,13 @@ struct etna_context {
 
    /* experimental compute */
    uint32_t compute_grid[3];
+   uint32_t compute_block[3];
+   uint32_t compute_shared_slice;
    struct etna_bo *compute_shared_bo;
    /* compute textures: bound into the fragment slots for the dispatch only */
    void *cs_sampler[PIPE_MAX_SAMPLERS];
+   /* for textures read without a sampler (OpenCL), created on first use */
+   void *cs_fetch_sampler;
    struct pipe_sampler_view *cs_sampler_view[PIPE_MAX_SAMPLERS];
    unsigned cs_num_samplers, cs_num_sampler_views;
    uint32_t compute_shared_bo_size;

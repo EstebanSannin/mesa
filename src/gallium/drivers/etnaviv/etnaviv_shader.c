@@ -714,6 +714,37 @@ gather_tg4_shadow_samplers(const nir_shader *nir)
    return mask;
 }
 
+/* Sample each texture slot with that slot's sampler state: record which
+ * sampler a texture is used with when it isn't its own (OpenCL). A texture
+ * used with two different samplers keeps the first. */
+static void
+remap_samplers(struct etna_shader *shader)
+{
+   nir_foreach_function_impl(impl, shader->nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            const unsigned t = tex->texture_index, s = tex->sampler_index;
+
+            if (!nir_tex_instr_need_sampler(tex) || t == s || t >= 16)
+               continue;
+
+            if (!(shader->sampler_remap & BITFIELD_BIT(t))) {
+               shader->sampler_remap |= BITFIELD_BIT(t);
+               shader->sampler_for_texture[t] = s;
+            } else if (shader->sampler_for_texture[t] != s) {
+               mesa_loge("etnaviv: texture %u used with samplers %u and %u", t,
+                         shader->sampler_for_texture[t], s);
+            }
+            tex->sampler_index = t;
+         }
+      }
+   }
+}
+
 static void *
 etna_create_shader_state(struct pipe_context *pctx,
                          const struct pipe_shader_state *pss)
@@ -741,6 +772,7 @@ etna_create_shader_state(struct pipe_context *pctx,
    if (ctx->mag_switchover_half)
       gather_tex_lod_samplers(shader->nir, &shader->tex_lod_samplers);
 
+   remap_samplers(shader);
    shader->tg4_shadow_samplers = gather_tg4_shadow_samplers(shader->nir);
    shader->textures_used = shader->nir->info.textures_used[0];
 

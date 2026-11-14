@@ -349,6 +349,8 @@ etna_init_screen_caps(struct etna_screen *screen)
    caps->draw_indirect = VIV_FEATURE(screen, ETNA_FEATURE_HALTI5);
 
    caps->compute = etna_compute_supported(screen);
+   /* image instructions take the format from the descriptor (OpenCL images) */
+   caps->image_store_formatted = etna_compute_supported(screen);
    if (caps->compute) {
       caps->shader_buffer_offset_alignment = 16;
       caps->max_shader_buffer_size = 1 << 27;
@@ -661,6 +663,10 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
    /* Always allowed */
    allowed |=
       usage & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT | PIPE_BIND_SHARED);
+
+   /* rusticl adds it to every query: OpenCL uses what the other bits allow */
+   if (pscreen->caps.compute)
+      allowed |= usage & PIPE_BIND_OPENCL;
 
    if (usage != allowed) {
       DBG("not supported: format=%s, target=%d, sample_count=%d, "
