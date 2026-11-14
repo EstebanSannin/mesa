@@ -231,7 +231,8 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
    if (textures) {
       etna_compute_swap_textures(ctx, &saved, true);
-      etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers);
+      etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers,
+                                      shader->tg4_shadow_samplers);
    }
 
    struct etna_shader_variant *v =

@@ -4,6 +4,7 @@
  */
 
 #include "etnaviv_nir.h"
+#include "nir_builtin_builder.h"
 
 static bool
 lower_txs(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
@@ -554,6 +555,40 @@ lower_offset_filter(const nir_instr *instr, const void *data)
    return false;
 }
 
+/* nir_lower_tex_shadow() leaves gathers alone, and the TG4 compare doesn't
+ * work: compare each of the four gathered texels in the shader. */
+static bool
+lower_tg4_shadow(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+
+   if (tex->op != nir_texop_tg4 || !tex->is_shadow)
+      return false;
+
+   int comp_index = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   assert(comp_index >= 0);
+   nir_def *ref = tex->src[comp_index].src.ssa;
+
+   tex->is_shadow = false;
+   tex->component = 0;
+   nir_tex_instr_remove_src(tex, comp_index);
+
+   b->cursor = nir_after_instr(&tex->instr);
+
+   if (!key->shadow_compare_no_clamp)
+      ref = nir_fsat(b, ref);
+
+   enum compare_func func = tex->texture_index < key->num_texture_states ?
+      key->tex_compare_func[tex->texture_index] : COMPARE_FUNC_ALWAYS;
+
+   nir_def *res[4];
+   for (unsigned i = 0; i < 4; i++)
+      res[i] = nir_b2f32(b, nir_compare_func(b, func, ref, nir_channel(b, &tex->def, i)));
+
+   nir_def_rewrite_uses_after(&tex->def, nir_vec(b, res, 4));
+   return true;
+}
+
 bool
 etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct etna_core_info *info)
 {
@@ -583,6 +618,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
                                                   key->tex_compare_func,
                                                   key->tex_swizzle,
                                                   !key->shadow_compare_no_clamp);
+
+   if (key->has_sample_tex_compare || key->has_tg4_compare)
+      NIR_PASS(progress, s, nir_shader_tex_pass, lower_tg4_shadow,
+               nir_metadata_control_flow, key);
 
    NIR_PASS(progress, s, nir_shader_tex_pass, lower_txs,
          nir_metadata_control_flow, NULL);

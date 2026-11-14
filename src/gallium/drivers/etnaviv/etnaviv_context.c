@@ -228,12 +228,13 @@ etna_get_vs(struct etna_context *ctx, struct etna_shader_key* const key)
  * there for the dispatch. */
 void
 etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key *key,
-                                uint16_t lod_samplers)
+                                uint16_t lod_samplers, uint16_t tg4_shadow_samplers)
 {
    /* update the key if we need to run nir_lower_sample_tex_compare(..).
     * halti < 2 has no HW shadow compare. halti >= 2 has it, but depth32f is
     * emulated as D24S8 and the float compare ref must not be clamped to the
-    * D24 range, so it must compare in the shader (and not clamp the ref). */
+    * D24 range, so it must compare in the shader (and not clamp the ref).
+    * Shadow gathers always compare in the shader: TG4 doesn't compare. */
    for (unsigned int i = 0; i < ctx->num_fragment_sampler_views; i++) {
       if (!ctx->sampler[i] || !ctx->sampler_view[i])
          continue;
@@ -243,13 +244,18 @@ etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key
 
       const bool emulated_z32f = eil_format_is_emulated_z32f(ctx->sampler_view[i]->format);
 
-      if (ctx->screen->info->halti >= 2 && !emulated_z32f)
+      const bool tg4_compare = tg4_shadow_samplers & BITFIELD_BIT(i);
+
+      if (ctx->screen->info->halti >= 2 && !emulated_z32f && !tg4_compare)
          continue;
 
       if (emulated_z32f)
          key->shadow_compare_no_clamp = 1;
 
-      key->has_sample_tex_compare = 1;
+      if (ctx->screen->info->halti < 2 || emulated_z32f)
+         key->has_sample_tex_compare = 1;
+      else
+         key->has_tg4_compare = 1;
       key->num_texture_states = ctx->num_fragment_sampler_views;
 
       etna_shader_key_set_tex_swizzle(key, i, ctx->sampler_view[i]);
@@ -279,7 +285,8 @@ etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
    key->use_xfb_emu = false;
    key->rt_pack_rgba16 = ctx->framebuffer_s.rt_pack_rgba16;
 
-   etna_shader_key_set_fs_textures(ctx, key, fs->tex_lod_samplers);
+   etna_shader_key_set_fs_textures(ctx, key, fs->tex_lod_samplers,
+                                   fs->tg4_shadow_samplers);
 
    ctx->shader.fs = etna_shader_variant(fs, key, &ctx->base.debug, true);
 

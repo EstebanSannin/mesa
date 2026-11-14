@@ -58,6 +58,8 @@ struct etna_shader_key
          unsigned has_sample_tex_compare : 1;
          /* lowered shadow compare must not clamp the ref (float depth32f) */
          unsigned shadow_compare_no_clamp : 1;
+         /* compare shadow gathers in the shader (the TG4 compare doesn't work) */
+         unsigned has_tg4_compare : 1;
          /* color varyings should be flat shaded */
          unsigned flatshade : 1;
          unsigned has_128bit_rt : 1;
@@ -85,6 +87,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
 {
    /* slow-path if we need to check tex_{swizzle,compare_func} */
    if (unlikely(a->has_sample_tex_compare || b->has_sample_tex_compare) ||
+       unlikely(a->has_tg4_compare || b->has_tg4_compare) ||
        unlikely(a->tex_is_128bit || b->tex_is_128bit) ||
        unlikely(a->tex_mag_switchover || b->tex_mag_switchover) ||
        unlikely(a->rt_is_128bit || b->rt_is_128bit))
@@ -105,6 +108,7 @@ struct etna_shader {
    struct etna_screen *screen;
 
    uint16_t tex_lod_samplers;
+   uint16_t tg4_shadow_samplers;
    uint32_t textures_used;
 
    struct util_shader_variant_list variants;

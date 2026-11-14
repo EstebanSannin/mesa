@@ -690,6 +690,30 @@ gather_tex_lod_samplers(const nir_shader *nir, uint16_t *mask)
    }
 }
 
+static uint16_t
+gather_tg4_shadow_samplers(const nir_shader *nir)
+{
+   uint16_t mask = 0;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+
+            const nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+            if (tex->op == nir_texop_tg4 && tex->is_shadow) {
+               assert(tex->sampler_index < 16);
+               mask |= BITFIELD_BIT(tex->sampler_index);
+            }
+         }
+      }
+   }
+
+   return mask;
+}
+
 static void *
 etna_create_shader_state(struct pipe_context *pctx,
                          const struct pipe_shader_state *pss)
@@ -717,6 +741,7 @@ etna_create_shader_state(struct pipe_context *pctx,
    if (ctx->mag_switchover_half)
       gather_tex_lod_samplers(shader->nir, &shader->tex_lod_samplers);
 
+   shader->tg4_shadow_samplers = gather_tg4_shadow_samplers(shader->nir);
    shader->textures_used = shader->nir->info.textures_used[0];
 
    etna_disk_cache_init_shader_key(screen, shader);
