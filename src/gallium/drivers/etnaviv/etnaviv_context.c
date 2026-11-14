@@ -52,6 +52,7 @@
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include "util/hash_table.h"
+#include "util/log.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_blitter.h"
 #include "util/u_draw.h"
@@ -863,7 +864,12 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->const_uploader = pctx->stream_uploader;
 
    screen = etna_screen(pscreen);
-   pipe = (compute_only && screen->pipe_nn) ? screen->pipe_nn : screen->pipe;
+   /* Compute-only contexts run machine learning jobs (Teflon) on the NPU.
+    * With compute shaders they also run OpenCL kernels (rusticl), which need
+    * the GPU: then they start on the GPU and move to the NPU at their first
+    * machine learning job (etna_context_use_npu). */
+   ctx->on_npu = compute_only && screen->pipe_nn && !pscreen->caps.compute;
+   pipe = ctx->on_npu ? screen->pipe_nn : screen->pipe;
    ctx->stream = etna_cmd_stream_new(pipe, 0x2000,
                                      &etna_context_force_flush, pctx);
    if (ctx->stream == NULL)
@@ -945,6 +951,28 @@ fail:
    pctx->destroy(pctx);
 
    return NULL;
+}
+
+/* Move the context's command stream to the NPU, for machine learning jobs */
+void
+etna_context_use_npu(struct etna_context *ctx)
+{
+   struct etna_cmd_stream *stream;
+
+   if (ctx->on_npu || !ctx->screen->pipe_nn)
+      return;
+
+   stream = etna_cmd_stream_new(ctx->screen->pipe_nn, 0x2000,
+                                &etna_context_force_flush, &ctx->base);
+   if (!stream) {
+      mesa_loge("etnaviv: could not create the NPU command stream");
+      return;
+   }
+
+   etna_flush(&ctx->base, NULL, 0, true);
+   etna_cmd_stream_del(ctx->stream);
+   ctx->stream = stream;
+   ctx->on_npu = true;
 }
 
 bool

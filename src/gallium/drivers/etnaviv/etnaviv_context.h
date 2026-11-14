@@ -303,6 +303,8 @@ struct etna_context {
    bool is_noop;
 
    bool compute_only;
+   /* the command stream goes to the NPU (machine learning jobs) */
+   bool on_npu;
    bool in_atomic_emit;
    bool in_transfer_blit;
 
@@ -409,5 +411,8 @@ static inline void clear_atomic_emit_flag(struct etna_context **ctx_ptr) {
 #else
 #define ETNA_CONTEXT_ATOMIC_EMIT(_ctx)
 #endif
+
+void
+etna_context_use_npu(struct etna_context *ctx);
 
 #endif
