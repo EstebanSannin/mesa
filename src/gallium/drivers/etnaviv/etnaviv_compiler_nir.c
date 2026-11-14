@@ -1954,6 +1954,22 @@ lower_fisfinite(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+/* gl_HelperInvocation: no hardware source is known on GC7000 (the internal
+ * register group gives the front face in .x; no component or register
+ * flags helper lanes). Report every invocation as a covered one: shaders
+ * using it compile and run, but can't tell helper lanes apart. */
+static bool
+lower_helper_invocation(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_helper_invocation &&
+       intr->intrinsic != nir_intrinsic_is_helper_invocation)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_false(b));
+   return true;
+}
+
 static bool
 compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold)
 {
@@ -2083,6 +2099,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    NIR_PASS(_, s, etna_nir_lower_texture, &v->key, v->shader->info);
    NIR_PASS(_, s, etna_nir_lower_128bit, &v->key);
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_helper_invocation,
+            nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_frexp);
    NIR_PASS(_, s, nir_shader_alu_pass, lower_fisfinite, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_alu_width, alu_width_cb, NULL);
