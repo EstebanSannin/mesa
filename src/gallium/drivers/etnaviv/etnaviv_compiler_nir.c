@@ -1481,6 +1481,34 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
       }
    }
 
+   /* An input or a system value sits in a fixed register and emits no
+    * instruction. As a phi source, nir_convert_from_ssa() can merge it into
+    * the phi's register web, which then gets a single fixed register: with
+    * two inputs feeding one phi, one of them is read from the other's
+    * register, and the first input's register is free for other values.
+    * Copy such sources in the predecessor block instead.
+    */
+   nir_foreach_block(block, c->impl) {
+      nir_foreach_phi(phi, block) {
+         nir_foreach_phi_src(src, phi) {
+            nir_instr *instr = nir_def_instr(src->src.ssa);
+            bool fixed = is_sysval(instr);
+
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+               fixed |= op == nir_intrinsic_load_input ||
+                        op == nir_intrinsic_load_instance_id ||
+                        op == nir_intrinsic_load_vertex_id;
+            }
+            if (!fixed)
+               continue;
+
+            b.cursor = nir_after_block_before_jump(src->pred);
+            nir_src_rewrite(&src->src, nir_mov(&b, src->src.ssa));
+         }
+      }
+   }
+
    /* call directly to avoid validation (load_const don't pass validation at this point) */
    nir_convert_from_ssa(shader, true, false);
    nir_trivialize_registers(shader);
