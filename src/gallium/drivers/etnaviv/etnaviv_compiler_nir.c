@@ -1485,7 +1485,12 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
    nir_convert_from_ssa(shader, true, false);
    nir_trivialize_registers(shader);
 
-   etna_ra_assign(c, shader);
+   if (!etna_ra_assign(c, shader)) {
+      mesa_loge("etnaviv: register allocation failed (%u nodes)", c->num_nodes);
+      ralloc_free(c->g);
+      ralloc_free(c->live_map);
+      return false;
+   }
 
    emit_cf_list(c, &nir_shader_get_entrypoint(shader)->body);
 

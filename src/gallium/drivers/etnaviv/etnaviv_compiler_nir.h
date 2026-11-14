@@ -413,7 +413,7 @@ static inline int reg_get_base(struct etna_compile *c, int virt_reg)
 struct ra_regs *
 etna_ra_setup(void *mem_ctx);
 
-void
+bool
 etna_ra_assign(struct etna_compile *c, nir_shader *shader);
 
 unsigned
@@ -422,6 +422,16 @@ etna_ra_finish(struct etna_compile *c);
 static inline void
 emit_inst(struct etna_compile *c, struct etna_inst *inst)
 {
+   /* A shader longer than the code buffer fails to compile (writing past
+    * it overwrote the constants and the register allocation state). */
+   if (c->inst_ptr >= (int)ARRAY_SIZE(c->code)) {
+      if (!c->error)
+         mesa_loge("etnaviv: shader longer than %u instructions",
+                   (unsigned)ARRAY_SIZE(c->code));
+      c->error = true;
+      return;
+   }
+
    c->code[c->inst_ptr++] = *inst;
 }
 

@@ -112,7 +112,7 @@ etna_ra_setup(void *mem_ctx)
    return regs;
 }
 
-void
+bool
 etna_ra_assign(struct etna_compile *c, nir_shader *shader)
 {
    struct etna_compiler *compiler = c->variant->shader->compiler;
@@ -258,13 +258,15 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
 
    ralloc_free(defs);
 
-   /* Allocate registers */
-   ASSERTED bool ok = ra_allocate(g);
-   assert(ok);
+   /* Allocate registers. There is no spilling: a shader that doesn't fit
+    * fails to compile. */
+   bool ok = ra_allocate(g);
 
    c->g = g;
    c->live_map = live_map;
    c->num_nodes = num_nodes;
+
+   return ok;
 }
 
 unsigned
