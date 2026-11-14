@@ -73,6 +73,14 @@ struct etna_shader_key
    nir_lower_tex_shadow_swizzle tex_swizzle[16];
    enum compare_func tex_compare_func[16];
 
+   /* Compared depth32f samplers (D24 storage, so the hardware clamps the
+    * border depth) with a border depth outside [0, 1]: the axes that wrap
+    * to the border, and the border depth the shader uses for border texels.
+    */
+   unsigned tex_float_border_s : 16;
+   unsigned tex_float_border_t : 16;
+   float tex_border_depth[16];
+
    unsigned tex_is_128bit : 16;
    unsigned tex_mag_switchover : 16;
    unsigned sampler_companion[16];

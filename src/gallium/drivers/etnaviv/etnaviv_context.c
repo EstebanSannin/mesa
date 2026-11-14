@@ -252,6 +252,20 @@ etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key
       if (emulated_z32f)
          key->shadow_compare_no_clamp = 1;
 
+      /* a float depth border keeps values outside [0, 1] (+-inf in dEQP),
+       * which the D24 storage can't hold: the shader substitutes it */
+      const struct pipe_sampler_state *ss = ctx->sampler[i];
+      const float border = ss->border_color.f[0];
+
+      if (emulated_z32f && etna_sampler_uses_border(ss) &&
+          !(border >= 0.0f && border <= 1.0f)) {
+         if (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER)
+            key->tex_float_border_s |= BITFIELD_BIT(i);
+         if (ss->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER)
+            key->tex_float_border_t |= BITFIELD_BIT(i);
+         key->tex_border_depth[i] = border;
+      }
+
       if (ctx->screen->info->halti < 2 || emulated_z32f)
          key->has_sample_tex_compare = 1;
       else

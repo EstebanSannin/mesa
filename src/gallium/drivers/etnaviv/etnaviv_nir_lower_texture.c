@@ -555,6 +555,86 @@ lower_offset_filter(const nir_instr *instr, const void *data)
    return false;
 }
 
+/* Emulated depth32f is D24 storage, so the texture unit clamps the border
+ * depth to [0, 1]. A float depth border outside that range is in the shader
+ * key (tex_border_depth), and the shader compares border texels with it.
+ */
+static bool
+has_float_border(const struct etna_shader_key *key, const nir_tex_instr *tex)
+{
+   const unsigned i = tex->texture_index;
+
+   return i < 16 && tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+          ((key->tex_float_border_s | key->tex_float_border_t) & BITFIELD_BIT(i));
+}
+
+/* texel (x, y) of the base level, xy as ivec2: is it a border texel */
+static nir_def *
+is_border_texel(nir_builder *b, const struct etna_shader_key *key, unsigned i,
+                nir_def *size, nir_def *xy)
+{
+   nir_def *border = nir_imm_false(b);
+
+   for (unsigned c = 0; c < 2; c++) {
+      if (!((c ? key->tex_float_border_t : key->tex_float_border_s) & BITFIELD_BIT(i)))
+         continue;
+
+      nir_def *v = nir_channel(b, xy, c);
+      border = nir_ior(b, border, nir_ior(b, nir_ilt_imm(b, v, 0),
+                                          nir_ige(b, v, nir_channel(b, size, c))));
+   }
+
+   return border;
+}
+
+/* base level texel of a 2D coordinate, plus the texture offset */
+static nir_def *
+base_texel(nir_builder *b, nir_tex_instr *tex, nir_def *size, float bias)
+{
+   nir_def *uv = nir_channels(b, nir_get_tex_src(tex, nir_tex_src_coord), 0x3);
+   nir_def *p = nir_fadd_imm(b, nir_fmul(b, uv, nir_i2f32(b, nir_trim_vector(b, size, 2))), bias);
+   nir_def *xy = nir_f2i32(b, nir_ffloor(b, p));
+   nir_def *offset = nir_get_tex_src(tex, nir_tex_src_offset);
+
+   return offset ? nir_iadd(b, xy, nir_trim_vector(b, offset, 2)) : xy;
+}
+
+static nir_def *
+border_compare(nir_builder *b, const struct etna_shader_key *key, unsigned i, nir_def *ref)
+{
+   enum compare_func func = i < key->num_texture_states ?
+      key->tex_compare_func[i] : COMPARE_FUNC_ALWAYS;
+
+   return nir_b2f32(b, nir_compare_func(b, func, ref, nir_imm_float(b, key->tex_border_depth[i])));
+}
+
+/* shadow texture() on a float border sampler: a border texel compares with
+ * the key's border depth. Runs before nir_lower_tex_shadow(), which turns the
+ * result used here into the compare of the sampled depth. */
+static bool
+lower_float_border_tex(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+
+   if (!tex->is_shadow || tex->def.num_components != 1 || !has_float_border(key, tex) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl))
+      return false;
+
+   nir_def *ref = nir_get_tex_src(tex, nir_tex_src_comparator);
+   if (!ref || !nir_get_tex_src(tex, nir_tex_src_coord))
+      return false;
+
+   const unsigned i = tex->texture_index;
+   b->cursor = nir_after_instr(&tex->instr);
+
+   nir_def *size = nir_load_texture_size_etna(b, 32, nir_imm_int(b, i));
+   nir_def *border = is_border_texel(b, key, i, size, base_texel(b, tex, size, 0.0f));
+   nir_def *res = nir_bcsel(b, border, border_compare(b, key, i, ref), &tex->def);
+
+   nir_def_rewrite_uses_after(&tex->def, res);
+   return true;
+}
+
 /* nir_lower_tex_shadow() leaves gathers alone, and the TG4 compare doesn't
  * work: compare each of the four gathered texels in the shader. */
 static bool
@@ -581,9 +661,28 @@ lower_tg4_shadow(nir_builder *b, nir_tex_instr *tex, void *data)
    enum compare_func func = tex->texture_index < key->num_texture_states ?
       key->tex_compare_func[tex->texture_index] : COMPARE_FUNC_ALWAYS;
 
+   /* the footprint is texels i0..i0+1, j0..j0+1, gathered in the order
+    * (i0, j1), (i1, j1), (i1, j0), (i0, j0) */
+   nir_def *border[4] = { NULL };
+   if (has_float_border(key, tex) && !nir_tex_instr_has_explicit_tg4_offsets(tex) &&
+       nir_get_tex_src(tex, nir_tex_src_coord)) {
+      const unsigned s = tex->texture_index;
+      nir_def *size = nir_load_texture_size_etna(b, 32, nir_imm_int(b, s));
+      nir_def *ij = base_texel(b, tex, size, -0.5f);
+      static const int dx[4] = { 0, 1, 1, 0 }, dy[4] = { 1, 1, 0, 0 };
+
+      for (unsigned i = 0; i < 4; i++)
+         border[i] = is_border_texel(b, key, s, size,
+                                     nir_iadd(b, ij, nir_imm_ivec2(b, dx[i], dy[i])));
+   }
+
    nir_def *res[4];
-   for (unsigned i = 0; i < 4; i++)
-      res[i] = nir_b2f32(b, nir_compare_func(b, func, ref, nir_channel(b, &tex->def, i)));
+   for (unsigned i = 0; i < 4; i++) {
+      nir_def *depth = nir_channel(b, &tex->def, i);
+      if (border[i])
+         depth = nir_bcsel(b, border[i], nir_imm_float(b, key->tex_border_depth[tex->texture_index]), depth);
+      res[i] = nir_b2f32(b, nir_compare_func(b, func, ref, depth));
+   }
 
    nir_def_rewrite_uses_after(&tex->def, nir_vec(b, res, 4));
    return true;
@@ -612,6 +711,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
    }
 
    NIR_PASS(progress, s, nir_lower_tex, &lower_tex_options);
+
+   if (key->tex_float_border_s | key->tex_float_border_t)
+      NIR_PASS(progress, s, nir_shader_tex_pass, lower_float_border_tex,
+               nir_metadata_control_flow, key);
 
    if (key->has_sample_tex_compare)
       NIR_PASS(progress, s, nir_lower_tex_shadow, key->num_texture_states,
