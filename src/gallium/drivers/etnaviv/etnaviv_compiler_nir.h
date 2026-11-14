@@ -46,9 +46,11 @@ struct etna_compile {
    /* block # to instr index */
    unsigned *block_ptr;
 
-   /* Code generation */
+   /* Code generation: HALTI5 fetches shaders from memory, so the code grows
+    * as needed, up to ETNA_MAX_SHADER_INSTRUCTIONS */
    int inst_ptr; /* current instruction pointer */
-   struct etna_inst code[ETNA_MAX_INSTRUCTIONS * ETNA_INST_SIZE];
+   struct etna_inst *code;
+   unsigned code_alloc;
 
    /* constants */
    uint64_t consts[ETNA_MAX_IMM];
@@ -419,17 +421,30 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader);
 unsigned
 etna_ra_finish(struct etna_compile *c);
 
+/* verified up to about 65400 instructions (cscap long<n>); 65535 keeps the
+ * instruction count and ICACHE_COUNT within 16 bits */
+#define ETNA_MAX_SHADER_INSTRUCTIONS (65535)
+
 static inline void
 emit_inst(struct etna_compile *c, struct etna_inst *inst)
 {
-   /* A shader longer than the code buffer fails to compile (writing past
-    * it overwrote the constants and the register allocation state). */
-   if (c->inst_ptr >= (int)ARRAY_SIZE(c->code)) {
-      if (!c->error)
-         mesa_loge("etnaviv: shader longer than %u instructions",
-                   (unsigned)ARRAY_SIZE(c->code));
-      c->error = true;
+   if (c->error)
       return;
+
+   if (c->inst_ptr >= (int)c->code_alloc) {
+      struct etna_inst *code = NULL;
+      unsigned alloc = MIN2(MAX2(c->code_alloc * 2, 1024), ETNA_MAX_SHADER_INSTRUCTIONS);
+
+      if (alloc > c->code_alloc)
+         code = realloc(c->code, alloc * sizeof(*code));
+      if (!code) {
+         mesa_loge("etnaviv: shader longer than %u instructions",
+                   ETNA_MAX_SHADER_INSTRUCTIONS);
+         c->error = true;
+         return;
+      }
+      c->code = code;
+      c->code_alloc = alloc;
    }
 
    c->code[c->inst_ptr++] = *inst;

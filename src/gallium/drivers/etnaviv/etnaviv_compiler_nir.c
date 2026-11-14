@@ -2055,6 +2055,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       if (fold > 1) {
          if (!etna_nir_fold_workgroup(s, fold, &v->cs_scratch_slots)) {
             ralloc_free(c->nir);
+            free(c->code);
             FREE(c);
             return false;
          }
@@ -2209,6 +2210,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    bool ok = emit_shader(c, &v->num_temps, &num_consts);
    if (!ok || num_consts > max_uniforms(v)) {
       ralloc_free(c->nir);
+      free(c->code);
       FREE(c);
       return false;
    }
@@ -2249,6 +2251,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    bool result = etna_compile_check_limits(v);
    ralloc_free(c->nir);
+   free(c->code);
    FREE(c);
    return result;
 }
