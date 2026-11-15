@@ -2485,7 +2485,10 @@ compile_shader_spill(struct etna_shader_variant *v, unsigned fold)
 /* A compute workgroup with barrier() must be resident in full: invocations x
  * temporaries <= 512 per shader core (GC7000 r6204). The boundary itself
  * passes alone but hangs under load (four dEQP processes), counting the
- * temporaries in pairs: 64 x 16 and 16 x 62 hung. Stay below it.
+ * temporaries in pairs: 64 x 16 and 16 x 62 hung. So did 168 x 6 = 1008 for
+ * an OpenCL copy kernel with two barriers, even with 100 workgroups, while
+ * 160 x 6 passed with 1749: stay at 480 per core or below
+ * (etna_cs_barrier_capacity()).
  * If it does not fit, run the workgroup with fewer hardware threads, several
  * invocations each (see etna_nir_fold_workgroup()). ETNA_CS_FOLD sets a
  * smallest fold factor, for testing. */
@@ -2494,7 +2497,7 @@ fits(const struct etna_shader_variant *v, unsigned invocations)
 {
    const unsigned temps = align(MAX2(v->num_temps, v->cs_input_count), 2);
 
-   return invocations / v->cs_fold * temps < 512 * v->shader->info->gpu.shader_core_count;
+   return invocations / v->cs_fold * temps <= etna_cs_barrier_capacity(v->shader->info);
 }
 
 bool

@@ -179,6 +179,15 @@ etna_compiler_get_options(struct etna_compiler *compiler);
 bool
 etna_compile_shader(struct etna_shader_variant *shader);
 
+/* Invocations x temporaries (counted in pairs) that a compute workgroup with
+ * barrier() may use: it must be resident in full. See fits() in
+ * etnaviv_compiler_nir.c. */
+static inline unsigned
+etna_cs_barrier_capacity(const struct etna_core_info *info)
+{
+   return 480 * info->gpu.shader_core_count;
+}
+
 void
 etna_dump_shader(const struct etna_shader_variant *shader);
 

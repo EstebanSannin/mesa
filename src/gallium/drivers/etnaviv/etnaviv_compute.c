@@ -146,12 +146,13 @@ etna_get_compute_state_info(struct pipe_context *pctx, void *cso,
    info->max_threads = screen->base.compute_caps.max_threads_per_block;
 
    /* With barrier() a whole workgroup must be resident: invocations x
-    * temporaries (in pairs) below 512 per shader core, as etna_launch_grid()
-    * checks. Report the largest multiple of 4 invocations that fits. */
+    * temporaries (in pairs) within etna_cs_barrier_capacity(), as
+    * etna_launch_grid() checks. Report the largest multiple of 4 invocations
+    * that fits. */
    if (v && v->cs_uses_barrier && v->cs_fold <= 1) {
       const unsigned temps = align(MAX3(v->num_temps, MAX2(v->cs_input_count, 1),
                                         etna_context(pctx)->compute_min_temps), 2);
-      const unsigned fit = (512 * screen->info->gpu.shader_core_count - 1) / temps;
+      const unsigned fit = etna_cs_barrier_capacity(screen->info) / temps;
 
       info->max_threads = MIN2(info->max_threads, MAX2(fit & ~3u, 4));
    }
@@ -382,12 +383,13 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
     * shader cores hold 512 invocation-temporaries each: invocations x temps
     * <= 1024 on GC7000 r6204 (2 cores), found by experiment at 32 to 256
     * invocations, but the boundary itself hangs under load, with the
-    * temporaries counted in pairs. Beyond that
-    * barrier() never returns and the GPU hangs for every client.
+    * temporaries counted in pairs, and 1008 hangs for some kernels: the
+    * limit is etna_cs_barrier_capacity(). Beyond it barrier() never returns
+    * and the GPU hangs for every client.
     * etna_compile_shader() folds such workgroups onto fewer threads; if even
     * that does not fit, skip the dispatch. */
    if (v->cs_uses_barrier &&
-       block_size * align(num_temps, 2) >= 512 * ctx->screen->info->gpu.shader_core_count) {
+       block_size * align(num_temps, 2) > etna_cs_barrier_capacity(ctx->screen->info)) {
       BUG("compute: %u invocations x %u temporaries do not fit with barrier(), dispatch skipped",
           block_size, num_temps);
       goto out;
