@@ -596,6 +596,48 @@ handle_clc_fn(struct vtn_builder *b, enum OpenCLstd_Entrypoints opcode,
    return ret_deref ? nir_load_deref(&b->nb, ret_deref) : NULL;
 }
 
+/* fma(p, x, y) with p a constant +-2^k, k >= 0 (the same k in every
+ * component), for hardware without a fused multiply-add: p * x is exact
+ * unless it overflows, so a multiply and an add round once, as fma does.
+ * When p * x overflows (|x| >= 2^(128 - k)), 2^k (p 2^-k x + y 2^-k) is
+ * exact: the scaled y can only lose what is negligible next to x, and the
+ * final scaling only grows. NULL for any other fma: software emulation. */
+static nir_def *
+fma_pow2(nir_builder *nb, nir_def **srcs)
+{
+   for (unsigned pi = 0; pi < 2; pi++) {
+      nir_def *p = srcs[pi];
+      int k = -1;
+
+      for (unsigned i = 0; i < p->num_components; i++) {
+         nir_scalar s = nir_get_scalar(p, i);
+         int e;
+
+         if (!nir_scalar_is_const(s) ||
+             frexp(fabs(nir_scalar_as_float(s)), &e) != 0.5 ||
+             e - 1 < 0 || e - 1 > 126 || (k >= 0 && e - 1 != k)) {
+            k = -1;
+            break;
+         }
+         k = e - 1;
+      }
+      if (k < 0)
+         continue;
+
+      nir_def *x = srcs[1 - pi], *y = srcs[2];
+      nir_def *mad = nir_fadd(nb, nir_fmul(nb, p, x), y);
+      nir_def *scaled =
+         nir_fmul_imm(nb,
+                      nir_fadd(nb, nir_fmul(nb, x, nir_fmul_imm(nb, p, ldexp(1.0, -k))),
+                               nir_fmul_imm(nb, y, ldexp(1.0, -k))),
+                      ldexp(1.0, k));
+      return nir_bcsel(nb, nir_fge_imm(nb, nir_fabs(nb, x), ldexp(1.0, 128 - k)),
+                       scaled, mad);
+   }
+
+   return NULL;
+}
+
 static nir_def *
 handle_special(struct vtn_builder *b, uint32_t opcode,
                unsigned num_srcs, nir_def **srcs, struct vtn_type **src_types,
@@ -687,8 +729,17 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
       return nir_ldexp(nb, srcs[0], srcs[1]);
    case OpenCLstd_Fma: {
       /* FIXME: the software implementation only supports fp32 for now. */
-      if (srcs[0]->bit_size != 64 && !nir_has_ffma(nb->shader, srcs[0]->bit_size))
+      if (srcs[0]->bit_size != 64 && !nir_has_ffma(nb->shader, srcs[0]->bit_size)) {
+         if (srcs[0]->bit_size == 32) {
+            const unsigned save_math_ctrl = nb->fp_math_ctrl;
+            nb->fp_math_ctrl |= nir_fp_exact;
+            nir_def *res = fma_pow2(nb, srcs);
+            nb->fp_math_ctrl = save_math_ctrl;
+            if (res)
+               return res;
+         }
          break;
+      }
 
       /* OpenCL FMA is not allowed to be split. */
       const unsigned save_math_ctrl = nb->fp_math_ctrl;
