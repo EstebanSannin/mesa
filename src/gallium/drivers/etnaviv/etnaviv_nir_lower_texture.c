@@ -625,6 +625,54 @@ lower_unnormalized_coords(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/* k / d correctly rounded, for an integer k with |k| <= 255 and d 255 or 127:
+ * k * (1 / d) is one ULP off for 126 of the 256 UNORM8 values, and a read
+ * through the texture unit must equal one through the image instructions
+ * (OpenCL CTS samplerless_reads), which convert exactly. Correct with the
+ * residual, computed exactly by splitting the quotient (q_hi * d and q_lo * d
+ * fit in 24 bits). Exact float math: the algebra must not fold it. */
+static nir_def *
+div_small_exact(nir_builder *b, nir_def *k, float d)
+{
+   const uint32_t fp_math_ctrl = b->fp_math_ctrl;
+   const float c = 1.0f / d;
+
+   b->fp_math_ctrl |= nir_fp_exact;
+   nir_def *q = nir_fmul_imm(b, k, c);
+   nir_def *qh = nir_iand_imm(b, q, 0xfffff000);
+   nir_def *ql = nir_fsub(b, q, qh);
+   nir_def *r = nir_fsub(b, nir_fsub(b, k, nir_fmul_imm(b, qh, d)), nir_fmul_imm(b, ql, d));
+   nir_def *v = nir_fadd(b, q, nir_fmul_imm(b, r, c));
+   b->fp_math_ctrl = fp_math_ctrl;
+
+   return v;
+}
+
+/* k / 65535 correctly rounded for a 16-bit unsigned k: k * 2^-16 * (1 + 2^-16
+ * + 2^-32), the terms exact, added from the smallest */
+static nir_def *
+unorm16_exact(nir_builder *b, nir_def *k_uint)
+{
+   const uint32_t fp_math_ctrl = b->fp_math_ctrl;
+   nir_def *k = nir_u2f32(b, k_uint);
+
+   b->fp_math_ctrl |= nir_fp_exact;
+   nir_def *v = nir_fadd(b, nir_fmul_imm(b, k, 0x1p-16),
+                         nir_fadd(b, nir_fmul_imm(b, k, 0x1p-32), nir_fmul_imm(b, k, 0x1p-48)));
+   b->fp_math_ctrl = fp_math_ctrl;
+
+   return v;
+}
+
+/* the exact value of a texel read as v, of an 8-bit UNORM (steps 255) or
+ * SNORM (127) format */
+static nir_def *
+snap_value(nir_builder *b, nir_def *v, float steps, bool snorm)
+{
+   v = div_small_exact(b, nir_fround_even(b, nir_fmul_imm(b, v, steps)), steps);
+   return snorm ? nir_fmax_imm(b, v, -1.0f) : v;
+}
+
 /* 8-bit normalized texels convert to float slightly off in the texture unit
  * (see etna_launch_grid()): a read that doesn't filter, a fetch or a nearest
  * sample, snaps to the nearest k / 255 (k / 127 for SNORM). The error is far
@@ -650,9 +698,7 @@ snap_norm8(nir_builder *b, nir_tex_instr *tex, void *data)
 
    b->cursor = nir_after_instr(&tex->instr);
 
-   nir_def *v = nir_fmul_imm(b, nir_fround_even(b, nir_fmul_imm(b, &tex->def, steps)), 1.0f / steps);
-   if (key->tex_snorm8 & BITFIELD_BIT(i))
-      v = nir_fmax_imm(b, v, -1.0f);
+   nir_def *v = snap_value(b, &tex->def, steps, key->tex_snorm8 & BITFIELD_BIT(i));
 
    nir_def_rewrite_uses_after(&tex->def, v);
    return true;
@@ -702,12 +748,11 @@ nearest_tap(nir_builder *b, nir_tex_instr *tex, nir_def *coord, const struct etn
       nir_src_rewrite(&t->src[nir_tex_instr_src_index(t, nir_tex_src_coord)].src, coord);
 
    if (unorm16)
-      return nir_fmul_imm(b, nir_u2f32(b, &t->def), 1.0f / 65535.0f);
+      return unorm16_exact(b, &t->def);
 
    if ((key->tex_unorm8 | key->tex_snorm8) & BITFIELD_BIT(i)) {
       const float steps = (key->tex_unorm8 & BITFIELD_BIT(i)) ? 255.0f : 127.0f;
-      nir_def *v = nir_fmul_imm(b, nir_fround_even(b, nir_fmul_imm(b, &t->def, steps)), 1.0f / steps);
-      return (key->tex_snorm8 & BITFIELD_BIT(i)) ? nir_fmax_imm(b, v, -1.0f) : v;
+      return snap_value(b, &t->def, steps, key->tex_snorm8 & BITFIELD_BIT(i));
    }
 
    return &t->def;
