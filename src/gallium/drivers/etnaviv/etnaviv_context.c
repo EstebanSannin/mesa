@@ -240,6 +240,9 @@ etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key
       if (!ctx->sampler[i] || !ctx->sampler_view[i])
          continue;
 
+      if (ctx->sampler[i]->unnormalized_coords)
+         key->tex_unnormalized |= BITFIELD_BIT(i);
+
       if (ctx->sampler[i]->compare_mode == PIPE_TEX_COMPARE_NONE)
          continue;
 

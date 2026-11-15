@@ -555,6 +555,61 @@ lower_offset_filter(const nir_instr *instr, const void *data)
    return false;
 }
 
+/* is component c of a coordinate an integer converted to float */
+static bool
+is_int_coord(nir_def *coord, unsigned c)
+{
+   nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(coord, c));
+
+   if (!nir_scalar_is_alu(s))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(s);
+   return op == nir_op_i2f32 || op == nir_op_u2f32;
+}
+
+/* Samplers with unnormalized coordinates (OpenCL) are in the key: the texture
+ * unit takes normalized ones only, so divide by the base level size. An
+ * integer coordinate (read_image*(image, sampler, int2)) names a texel: move
+ * it to the texel centre first, so that nearest filtering cannot round it
+ * down to the previous texel after the division. The array layer stays. */
+static bool
+lower_unnormalized_coords(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+   const unsigned i = tex->texture_index;
+
+   if (i >= 16 || !(key->tex_unnormalized & BITFIELD_BIT(i)))
+      return false;
+
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txd && tex->op != nir_texop_tg4)
+      return false;
+
+   const int idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *coord = tex->src[idx].src.ssa;
+   const unsigned n = tex->coord_components - tex->is_array;
+   nir_def *size = nir_i2f32(b, nir_trim_vector(b, nir_load_texture_size_etna(b, 32, nir_imm_int(b, i)), n));
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+
+   for (unsigned c = 0; c < tex->coord_components; c++) {
+      comps[c] = nir_channel(b, coord, c);
+      if (c >= n)
+         continue;
+      if (is_int_coord(coord, c))
+         comps[c] = nir_fadd_imm(b, comps[c], 0.5f);
+      comps[c] = nir_fdiv(b, comps[c], nir_channel(b, size, c));
+   }
+
+   nir_src_rewrite(&tex->src[idx].src, nir_vec(b, comps, tex->coord_components));
+   return true;
+}
+
 /* Emulated depth32f is D24 storage, so the texture unit clamps the border
  * depth to [0, 1]. A float depth border outside that range is in the shader
  * key (tex_border_depth), and the shader compares border texels with it.
@@ -711,6 +766,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
    }
 
    NIR_PASS(progress, s, nir_lower_tex, &lower_tex_options);
+
+   if (key->tex_unnormalized)
+      NIR_PASS(progress, s, nir_shader_tex_pass, lower_unnormalized_coords,
+               nir_metadata_control_flow, key);
 
    if (key->tex_float_border_s | key->tex_float_border_t)
       NIR_PASS(progress, s, nir_shader_tex_pass, lower_float_border_tex,
