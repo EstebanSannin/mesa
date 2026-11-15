@@ -60,6 +60,7 @@ files_etnaviv = files(
   'etnaviv_query_acc.h',
   'etnaviv_query_sw.c',
   'etnaviv_query_sw.h',
+  'etnaviv_query_time.c',
   'etnaviv_rasterizer.c',
   'etnaviv_rasterizer.h',
   'etnaviv_resource.c',

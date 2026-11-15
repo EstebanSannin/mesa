@@ -354,6 +354,13 @@ etna_init_screen_caps(struct etna_screen *screen)
    if (caps->compute) {
       caps->shader_buffer_offset_alignment = 16;
       caps->max_shader_buffer_size = 1 << 27;
+
+      /* timestamps from the fence of a flush at the query point
+       * (etnaviv_query_time.c): OpenCL profiling, and in GL
+       * EXT_disjoint_timer_query. The fences signal from the interrupt, so
+       * claim a microsecond. */
+      caps->query_timestamp = true;
+      caps->timer_resolution = 1000;
    }
 
    caps->glsl_feature_level =
