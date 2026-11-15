@@ -243,36 +243,57 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
          }
       }
 
-      /* The shader filters linear samplers (lower_shader_linear), bound as a
-       * nearest copy: RGBA16 UNORM samples as integers, which don't filter, and
-       * OpenCL (compute-only contexts) needs more precise weights than the
-       * texture unit's (an 8-bit UNORM sample at a weight of 0.6 was 1.6 steps
-       * off, the CTS allows half a step). */
+      /* Per slot, a copy of the sampler made for its view:
+       * - the shader filters linear samplers (lower_shader_linear), bound as a
+       *   nearest copy: RGBA16 UNORM samples as integers, which don't filter,
+       *   and OpenCL (compute-only contexts) needs more precise weights than
+       *   the texture unit's (an 8-bit UNORM sample at a weight of 0.6 was 1.6
+       *   steps off, the CTS allows half a step);
+       * - OpenCL's CL_ADDRESS_CLAMP border is (0, 0, 0, 1) for a format without
+       *   alpha: the texture unit doesn't swizzle the border color. */
       ctx->cs_shader_linear = 0;
       for (unsigned t = 0; t < n; t++) {
          const struct pipe_sampler_state *ss = samplers[t];
 
-         if (!views[t] || !ss ||
-             (views[t]->format != PIPE_FORMAT_R16G16B16A16_UNORM && !ctx->compute_only) ||
-             (ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
-              ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST))
+         if (!views[t] || !ss)
             continue;
 
-         struct pipe_sampler_state nearest = *ss;
-         nearest.min_img_filter = PIPE_TEX_FILTER_NEAREST;
-         nearest.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
-         nearest.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+         struct pipe_sampler_state copy = *ss;
+         bool changed = false;
 
-         if (!ctx->cs_nearest_sampler[t] ||
-             memcmp(&nearest, &ctx->cs_nearest_state[t], sizeof(nearest))) {
-            if (ctx->cs_nearest_sampler[t])
-               pctx->delete_sampler_state(pctx, ctx->cs_nearest_sampler[t]);
-            ctx->cs_nearest_sampler[t] = pctx->create_sampler_state(pctx, &nearest);
-            ctx->cs_nearest_state[t] = nearest;
+         if ((views[t]->format == PIPE_FORMAT_R16G16B16A16_UNORM || ctx->compute_only) &&
+             (ss->min_img_filter != PIPE_TEX_FILTER_NEAREST ||
+              ss->mag_img_filter != PIPE_TEX_FILTER_NEAREST)) {
+            copy.min_img_filter = PIPE_TEX_FILTER_NEAREST;
+            copy.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+            copy.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+            ctx->cs_shader_linear |= BITFIELD_BIT(t);
+            changed = true;
          }
 
-         samplers[t] = ctx->cs_nearest_sampler[t];
-         ctx->cs_shader_linear |= BITFIELD_BIT(t);
+         if (ctx->compute_only && !util_format_has_alpha(views[t]->format) &&
+             (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+              ss->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+              ss->wrap_r == PIPE_TEX_WRAP_CLAMP_TO_BORDER)) {
+            if (util_format_is_pure_integer(views[t]->format))
+               copy.border_color.ui[3] = 1;
+            else
+               copy.border_color.f[3] = 1.0f;
+            changed = true;
+         }
+
+         if (!changed)
+            continue;
+
+         if (!ctx->cs_sampler_copy[t] ||
+             memcmp(&copy, &ctx->cs_sampler_copy_state[t], sizeof(copy))) {
+            if (ctx->cs_sampler_copy[t])
+               pctx->delete_sampler_state(pctx, ctx->cs_sampler_copy[t]);
+            ctx->cs_sampler_copy[t] = pctx->create_sampler_state(pctx, &copy);
+            ctx->cs_sampler_copy_state[t] = copy;
+         }
+
+         samplers[t] = ctx->cs_sampler_copy[t];
       }
    } else {
       memcpy(samplers, saved->sampler, sizeof(void *) * n);
@@ -720,9 +741,9 @@ etna_compute_fini(struct pipe_context *pctx)
 
    if (ctx->cs_fetch_sampler)
       pctx->delete_sampler_state(pctx, ctx->cs_fetch_sampler);
-   for (unsigned i = 0; i < ARRAY_SIZE(ctx->cs_nearest_sampler); i++) {
-      if (ctx->cs_nearest_sampler[i])
-         pctx->delete_sampler_state(pctx, ctx->cs_nearest_sampler[i]);
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->cs_sampler_copy); i++) {
+      if (ctx->cs_sampler_copy[i])
+         pctx->delete_sampler_state(pctx, ctx->cs_sampler_copy[i]);
    }
 
    for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
