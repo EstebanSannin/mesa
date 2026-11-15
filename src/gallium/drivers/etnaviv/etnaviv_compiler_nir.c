@@ -2488,6 +2488,10 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_frexp);
    NIR_PASS(_, s, nir_shader_alu_pass, lower_fisfinite, nir_metadata_control_flow, NULL);
+   /* nir_lower_int64() leaves phis 64-bit, joined to their 32-bit halves by
+    * packs (OpenCL: libclc's software fma() in a loop): split them, and the
+    * optimizations cancel the packs */
+   NIR_PASS(_, s, nir_lower_64bit_phis);
    NIR_PASS(_, s, nir_lower_alu_width, alu_width_cb, NULL);
    NIR_PASS(_, s, nir_lower_phis_to_scalar, phi_width_cb, NULL);
 

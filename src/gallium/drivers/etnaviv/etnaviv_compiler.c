@@ -73,13 +73,15 @@ etna_compiler_create(const struct etna_core_info *info)
       .max_unroll_iterations = 32,
       .max_samples = ETNA_MAX_SAMPLES,
       .lower_pack_32_2x16_split = true,
-      .lower_pack_64_2x32_split = true,
+      /* the 64-bit packs stay: nir_lower_int64() splits 64-bit values into
+       * them, and the optimizations cancel them out. Lowered, they turned
+       * back into 64-bit arithmetic (u2u64) after the frontend's int64
+       * lowering had run (OpenCL: libclc's software fma()) */
       .lower_pack_half_2x16 = true,
       .lower_pack_snorm_2x16 = true,
       .lower_pack_split = true,
       .lower_pack_unorm_2x16 = true,
       .lower_unpack_32_2x16_split = true,
-      .lower_unpack_64_2x32_split = true,
       .lower_unpack_half_2x16 = true,
       .lower_unpack_snorm_2x16 = true,
       .lower_unpack_unorm_2x16 = true,
