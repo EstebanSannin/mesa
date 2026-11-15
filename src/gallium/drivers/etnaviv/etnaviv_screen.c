@@ -628,7 +628,13 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
     * (OpenCL, which adds PIPE_BIND_OPENCL to every query) */
    const bool cl_only = format == PIPE_FORMAT_R16G16B16A16_UNORM && !(usage & PIPE_BIND_OPENCL);
 
-   if ((usage & PIPE_BIND_SAMPLER_VIEW) && !cl_only) {
+   /* a buffer texture (OpenCL 1D image buffer) is read with the image
+    * instructions, in the formats they know */
+   const bool texbuf_ok = target != PIPE_BUFFER ||
+                          (pscreen->caps.compute && (usage & PIPE_BIND_OPENCL) &&
+                           etna_format_is_image_format(format));
+
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) && !cl_only && texbuf_ok) {
       uint32_t fmt = ETNA_NO_MATCH;
 
       if (gpu_supports_texture_format(screen, format))

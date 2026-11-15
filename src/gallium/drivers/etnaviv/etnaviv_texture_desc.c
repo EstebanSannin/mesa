@@ -227,6 +227,17 @@ etna_create_sampler_view_desc(struct pipe_context *pctx, struct pipe_resource *p
    if (!sv)
       return NULL;
 
+   /* a buffer (OpenCL 1D image buffer): read with the image instructions,
+    * never bound to the texture unit (etna_compute_swap_textures) */
+   if (so->target == PIPE_BUFFER) {
+      sv->base = *so;
+      pipe_reference_init(&sv->base.reference, 1);
+      sv->base.texture = NULL;
+      pipe_resource_reference(&sv->base.texture, prsc);
+      sv->base.context = pctx;
+      return &sv->base;
+   }
+
    /* Determine whether target supported */
    if (translate_texture_target(so->target) == ETNA_NO_MATCH) {
       BUG("Unhandled texture target");

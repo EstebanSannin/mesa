@@ -143,6 +143,39 @@ get_sampler_lod(const struct etna_context *ctx, bool frag,
  *   bits 16-31 swizzle: 4 bits per channel, 0-3 source, 4 zero, 5 one
  * 128-bit formats are two planes of 64-bit texels, each with its own
  * descriptor. Returns 0 for formats without a hardware image path. */
+/* Image descriptors 0-7 are the shader images, 8-15 the compute textures 0-7
+ * that are buffers (OpenCL 1D image buffers, read with the image
+ * instructions). */
+static const struct pipe_image_view *
+etna_uniform_image(const struct etna_context *ctx, mesa_shader_stage stage, unsigned index,
+                   struct pipe_image_view *tmp)
+{
+   if (index < ETNA_MAX_SHADER_IMAGES)
+      return &ctx->shader_images[stage].img[index];
+
+   const struct pipe_sampler_view *sv = ctx->cs_sampler_view[index - ETNA_MAX_SHADER_IMAGES];
+
+   memset(tmp, 0, sizeof(*tmp));
+   if (sv) {
+      tmp->resource = sv->texture;
+      tmp->format = sv->format;
+      tmp->access = PIPE_IMAGE_ACCESS_READ;
+      tmp->u.buf.offset = sv->u.buf.offset;
+      tmp->u.buf.size = sv->u.buf.size;
+   }
+   return tmp;
+}
+
+/* texel bytes of a buffer image: 128-bit formats are addressed as 64-bit
+ * texels, two per texel (see lower_image_access()) */
+static uint32_t
+etna_buffer_image_texel(enum pipe_format format)
+{
+   const uint32_t bpp = util_format_get_blocksize(format);
+
+   return bpp == 16 ? 8 : bpp;
+}
+
 static uint32_t
 etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout)
 {
@@ -294,7 +327,8 @@ etna_uniforms_write(const struct etna_context *ctx,
          break;
 
       case ETNA_UNIFORM_IMAGE_ADDR: {
-         const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
+         struct pipe_image_view tmp;
+         const struct pipe_image_view *img = etna_uniform_image(ctx, sobj->stage, val, &tmp);
 
          if (img->resource && img->resource->target == PIPE_BUFFER) {
             etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
@@ -322,7 +356,8 @@ etna_uniforms_write(const struct etna_context *ctx,
       case ETNA_UNIFORM_IMAGE_DEPTH:
       case ETNA_UNIFORM_IMAGE_TILED:
       case ETNA_UNIFORM_IMAGE_PLANE_OFFSET: {
-         const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
+         struct pipe_image_view tmp;
+         const struct pipe_image_view *img = etna_uniform_image(ctx, sobj->stage, val, &tmp);
 
          if (img->resource && img->resource->target == PIPE_BUFFER) {
             /* a linear image of one row */
@@ -348,7 +383,8 @@ etna_uniforms_write(const struct etna_context *ctx,
 
       case ETNA_UNIFORM_IMAGE_DESC: {
          const unsigned index = val & 0xf, plane = (val >> 4) & 0xf, word = val >> 8;
-         const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[index];
+         struct pipe_image_view tmp;
+         const struct pipe_image_view *img = etna_uniform_image(ctx, sobj->stage, index, &tmp);
          const struct etna_resource *rsc = etna_resource(img->resource);
 
          if (!rsc) {
@@ -358,7 +394,7 @@ etna_uniforms_write(const struct etna_context *ctx,
 
          if (img->resource->target == PIPE_BUFFER) {
             /* a linear image of one row; the width field has 16 bits */
-            const uint32_t bpp = util_format_get_blocksize(img->format);
+            const uint32_t bpp = etna_buffer_image_texel(img->format);
             const uint32_t width = MIN2(img->u.buf.size / bpp, 0xffff);
 
             if (word == 0) {

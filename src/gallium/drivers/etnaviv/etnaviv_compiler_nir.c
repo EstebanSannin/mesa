@@ -1833,6 +1833,39 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
    *align = s;
 }
 
+/* OpenCL 1D image buffers that are read only come as buffer textures, which
+ * the texture unit can't sample: read them with the image instructions, as
+ * images 8 + texture index (see etna_uniform_image()). */
+static bool
+lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+{
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF || tex->texture_index >= 8 ||
+       (tex->op != nir_texop_txf && tex->op != nir_texop_txs))
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *index = nir_imm_int(b, 8 + tex->texture_index);
+   nir_def *repl;
+
+   if (tex->op == nir_texop_txs) {
+      repl = nir_image_size(b, tex->def.num_components, 32, index, nir_imm_int(b, 0),
+                            .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false);
+   } else {
+      nir_def *x = nir_channel(b, nir_get_tex_src(tex, nir_tex_src_coord), 0);
+      nir_def *zero = nir_imm_int(b, 0);
+
+      repl = nir_image_load(b, tex->def.num_components, 32, index,
+                            nir_vec4(b, x, zero, zero, zero), zero, zero,
+                            .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false,
+                            .format = PIPE_FORMAT_NONE, .access = ACCESS_NON_WRITEABLE,
+                            .dest_type = tex->dest_type);
+   }
+
+   nir_def_replace(&tex->def, repl);
+   return true;
+}
+
 /* Images are linear or 4x4 tiled (see etna_resource_create()). Loads and
  * stores use img_load/img_store, which address and convert texels through
  * the image descriptor. 128-bit formats are two stacked planes of 64-bit
@@ -1895,7 +1928,7 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    /* without a format (OpenCL), the key says which images are 128-bit */
    const bool planes = bpp == 16 ||
                        (format == PIPE_FORMAT_NONE && nir_src_is_const(intr->src[0]) &&
-                        nir_src_as_uint(intr->src[0]) < 8 &&
+                        nir_src_as_uint(intr->src[0]) < 16 &&
                         (key->img_128bit & BITFIELD_BIT(nir_src_as_uint(intr->src[0]))));
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
@@ -1920,6 +1953,10 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
             nir_def *layer = nir_iadd(b, base, nir_imul(b, nir_channel(b, coord, 2),
                                                         image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
             hcoord[p] = nir_vec3(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1), layer);
+         } else if (planes && dim == GLSL_SAMPLER_DIM_BUF) {
+            /* a buffer of 128-bit texels: 64-bit texels 2x and 2x + 1 */
+            hcoord[p] = nir_vec2(b, nir_iadd_imm(b, nir_ishl_imm(b, nir_channel(b, coord, 0), 1), p),
+                                 nir_imm_int(b, 0));
          } else {
             hcoord[p] = nir_trim_vector(b, coord, 2);
          }
@@ -2363,6 +2400,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
                nir_metadata_control_flow, &v->cs_input_count);
    }
 
+   NIR_PASS(_, s, nir_shader_tex_pass, lower_texbuf_to_image, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_image_access,
             nir_metadata_control_flow, &v->key);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,

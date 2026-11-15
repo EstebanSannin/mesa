@@ -232,6 +232,17 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
             samplers[t] = etna_compute_fetch_sampler(ctx);
       }
 
+      /* buffers (OpenCL 1D image buffers) are read with the image
+       * instructions as images 8 + slot, see lower_texbuf_to_image(): the
+       * texture unit doesn't get them */
+      ctx->cs_texbuf_mask = 0;
+      for (unsigned t = 0; t < n; t++) {
+         if (views[t] && views[t]->target == PIPE_BUFFER) {
+            ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
+            views[t] = NULL;
+         }
+      }
+
       /* RGBA16 UNORM samples as integers, which don't filter: bind a nearest
        * copy of a linear sampler, the shader filters (lower_unorm16) */
       ctx->cs_unorm16_linear = 0;
@@ -307,6 +318,10 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    const uint32_t textures = shader->textures_used;
    struct etna_shader_key key = {};
 
+   /* set by etna_compute_swap_textures() for this dispatch */
+   ctx->cs_texbuf_mask = 0;
+   ctx->cs_unorm16_linear = 0;
+
    if (textures) {
       etna_compute_swap_textures(ctx, &saved, true, shader);
       etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers,
@@ -350,6 +365,10 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    u_foreach_bit(i, bound->enabled_mask) {
       if (util_format_get_blocksize(bound->img[i].format) == 16)
          key.img_128bit |= BITFIELD_BIT(i);
+   }
+   u_foreach_bit(t, ctx->cs_texbuf_mask) {
+      if (util_format_get_blocksize(ctx->cs_sampler_view[t]->format) == 16)
+         key.img_128bit |= BITFIELD_BIT(ETNA_MAX_SHADER_IMAGES + t);
    }
 
    struct etna_shader_variant *v =
@@ -502,6 +521,9 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       else
          resource_read(ctx, images->img[i].resource);
    }
+
+   u_foreach_bit(t, ctx->cs_texbuf_mask)
+      resource_read(ctx, ctx->cs_sampler_view[t]->texture);
 
    if (textures) {
       u_foreach_bit(i, ctx->active_sampler_views & textures) {

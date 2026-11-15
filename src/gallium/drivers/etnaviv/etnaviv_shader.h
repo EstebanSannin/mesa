@@ -93,7 +93,7 @@ struct etna_shader_key
    unsigned tex_nearest : 16;
    /* compute: images bound with a 128-bit format, for image access that
     * takes its format from the descriptor (OpenCL) */
-   unsigned img_128bit : 8;
+   unsigned img_128bit : 16;
    /* compute: RGBA16 UNORM textures, sampled as integers and converted, and
     * those with a linear sampler, filtered in the shader */
    unsigned tex_unorm16 : 16;
