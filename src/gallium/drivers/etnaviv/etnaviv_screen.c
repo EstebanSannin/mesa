@@ -260,10 +260,14 @@ etna_init_compute_caps(struct etna_screen *screen)
    caps->max_clock_frequency = 1000;
    caps->subgroup_sizes = 4;
 
+   /* OpenCL wants allocations of at least a quarter of the global memory
+    * (up to 1 GB) from a device that isn't CL_DEVICE_TYPE_CUSTOM: report four
+    * times the largest allocation. NXP's OpenCL reports 256 MB, with 128 MB
+    * allocations. */
    uint64_t system_memory;
    if (os_get_total_physical_memory(&system_memory)) {
-      caps->max_global_size = system_memory;
       caps->max_mem_alloc_size = MIN2(system_memory, 1u << 27);
+      caps->max_global_size = MIN2(system_memory, 4 * caps->max_mem_alloc_size);
    }
 }
 
