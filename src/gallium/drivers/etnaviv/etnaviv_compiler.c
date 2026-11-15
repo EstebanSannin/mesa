@@ -93,6 +93,18 @@ etna_compiler_create(const struct etna_core_info *info)
       .no_integers = info->halti < 2,
    };
 
+   /* ETNA_MESA_DEBUG=fast_fma, experimental and not conformant: claim a fused
+    * multiply-add, so that OpenCL's fma() becomes the hardware's unfused
+    * multiply-add instead of the exact software emulation (dozens of
+    * instructions). libclc's own math then takes its hardware fma path too,
+    * and rusticl reports CL_FP_FMA. fma() is no longer correctly rounded and
+    * its product can overflow on its own: CTS bruteforce fma fails, for
+    * example fma(-FLT_MAX, -FLT_MAX, -inf) is NaN, not -inf. For image work
+    * where a difference in the last bit doesn't matter (OpenCV's warpAffine:
+    * 13 fma() per pixel). */
+   if (DBG_ENABLED(ETNA_DBG_FAST_FMA))
+      compiler->options.float_mul_add32 |= nir_float_muladd_support_has_ffma;
+
    compiler->regs = etna_ra_setup(compiler);
    if (!compiler->regs) {
       ralloc_free((void *)compiler);

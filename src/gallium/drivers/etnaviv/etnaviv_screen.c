@@ -83,6 +83,7 @@ static const struct debug_named_value etna_debug_options[] = {
    {"shared_ts",      ETNA_DBG_SHARED_TS, "Enable TS sharing"},
    {"perf",           ETNA_DBG_PERF, "Enable performance warnings"},
    {"npu_parallel",   ETNA_DBG_NPU_PARALLEL, "Enable parallelism inside NPU batches (unsafe)"},
+   {"fast_fma",       ETNA_DBG_FAST_FMA, "OpenCL fma() as an unfused multiply-add: faster, not correctly rounded (not conformant)"},
    {"npu_no_batching",ETNA_DBG_NPU_NO_BATCHING, "Disable batching NPU jobs"},
    {"no_texdesc"     ,ETNA_DBG_NO_TEXDESC, "Disable texture descriptor"},
    {"no_unified_samplers", ETNA_DBG_NO_UNIFIED_SAMPLERS, "Disable unified sampler allocation"},

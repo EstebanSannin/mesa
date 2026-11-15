@@ -45,6 +45,9 @@ enum etna_dbg {
    ETNA_DBG_PERF            = BITFIELD_BIT(7),
    ETNA_DBG_ML_MSGS         = BITFIELD_BIT(8),
 
+   /* Not conformant */
+   ETNA_DBG_FAST_FMA        = BITFIELD_BIT(11), /* fma() as an unfused multiply-add */
+
    /* Bypasses */
    ETNA_DBG_NO_TS           = BITFIELD_BIT(12), /* Disable TS */
    ETNA_DBG_NO_AUTODISABLE  = BITFIELD_BIT(13), /* Disable autodisable */

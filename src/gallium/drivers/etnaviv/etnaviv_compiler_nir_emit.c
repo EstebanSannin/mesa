@@ -51,6 +51,9 @@ static const struct etna_op_info etna_ops[] = {
 #define UOP(nir, op) UOPC(nir, op, TRUE)
    OP(mov, MOV), OP(fneg, MOV), OP(fabs, MOV), OP(fsat, MOV),
    OP(fmul, MUL), OP(fadd, ADD), OP(fmad, MAD),
+   /* only with ETNA_MESA_DEBUG=fast_fma, which claims a fused multiply-add:
+    * the unfused MAD all the same (not conformant) */
+   OP(ffma, MAD),
    OP(fdot2, DP2), OP(fdot3, DP3), OP(fdot4, DP4),
    OPC(fmin, SELECT, GT), OPC(fmax, SELECT, LT),
    OP(ffract, FRC), OP(frcp, RCP), OP(frsq, RSQ),
