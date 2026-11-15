@@ -2274,6 +2274,14 @@ alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
    return 4;
 }
 
+/* registers have four components: a wider phi (an OpenCL float8 carried
+ * around a loop that isn't unrolled) is split into phis of four */
+static uint8_t
+phi_width_cb(UNUSED const nir_instr *instr, UNUSED const void *data)
+{
+   return 4;
+}
+
 /* the copies that keep the segments of etna_nir_fold_workgroup() apart from
  * CSE, once no CSE runs any more */
 static bool
@@ -2481,6 +2489,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    NIR_PASS(_, s, nir_lower_frexp);
    NIR_PASS(_, s, nir_shader_alu_pass, lower_fisfinite, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_alu_width, alu_width_cb, NULL);
+   NIR_PASS(_, s, nir_lower_phis_to_scalar, phi_width_cb, NULL);
 
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
    if (c->info->halti >= 2) {
