@@ -651,8 +651,9 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
          allowed |= PIPE_BIND_VERTEX_BUFFER;
    }
 
+   /* buffers too: OpenCL 1D image buffers (a linear image of one row) */
    if ((usage & PIPE_BIND_SHADER_IMAGE) && pscreen->caps.compute && !cl_only &&
-       target != PIPE_BUFFER && sample_count <= 1 && etna_format_is_image_format(format))
+       sample_count <= 1 && etna_format_is_image_format(format))
       allowed |= PIPE_BIND_SHADER_IMAGE;
 
    if (usage & PIPE_BIND_INDEX_BUFFER) {

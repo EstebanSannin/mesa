@@ -295,6 +295,16 @@ etna_uniforms_write(const struct etna_context *ctx,
 
       case ETNA_UNIFORM_IMAGE_ADDR: {
          const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
+
+         if (img->resource && img->resource->target == PIPE_BUFFER) {
+            etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+               .bo = etna_buffer_resource(img->resource)->bo,
+               .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+               .offset = img->u.buf.offset,
+            });
+            break;
+         }
+
          const struct etna_resource *rsc = etna_resource(img->resource);
          const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
 
@@ -313,6 +323,16 @@ etna_uniforms_write(const struct etna_context *ctx,
       case ETNA_UNIFORM_IMAGE_TILED:
       case ETNA_UNIFORM_IMAGE_PLANE_OFFSET: {
          const struct pipe_image_view *img = &ctx->shader_images[sobj->stage].img[val];
+
+         if (img->resource && img->resource->target == PIPE_BUFFER) {
+            /* a linear image of one row */
+            const uint32_t width = img->u.buf.size / util_format_get_blocksize(img->format);
+            const uint32_t v[] = { img->u.buf.size, img->u.buf.size, width, 1, 1, 0, 0 };
+
+            etna_cmd_stream_emit(stream, v[uinfo->contents[i] - ETNA_UNIFORM_IMAGE_STRIDE]);
+            break;
+         }
+
          const struct etna_resource *rsc = etna_resource(img->resource);
          const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
          const uint32_t v[] = {
@@ -333,6 +353,27 @@ etna_uniforms_write(const struct etna_context *ctx,
 
          if (!rsc) {
             etna_cmd_stream_emit(stream, 0);
+            break;
+         }
+
+         if (img->resource->target == PIPE_BUFFER) {
+            /* a linear image of one row; the width field has 16 bits */
+            const uint32_t bpp = util_format_get_blocksize(img->format);
+            const uint32_t width = MIN2(img->u.buf.size / bpp, 0xffff);
+
+            if (word == 0) {
+               etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+                  .bo = etna_buffer_resource(img->resource)->bo,
+                  .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+                  .offset = img->u.buf.offset,
+               });
+            } else {
+               const uint32_t v[4] = {
+                  0, width * bpp, 1 << 16 | width,
+                  etna_image_format_word(img->format, ETNA_LAYOUT_LINEAR),
+               };
+               etna_cmd_stream_emit(stream, v[word & 3]);
+            }
             break;
          }
 

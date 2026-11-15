@@ -1872,6 +1872,8 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
    const bool array = nir_intrinsic_image_array(intr);
    const bool layered = array || dim == GLSL_SAMPLER_DIM_3D || dim == GLSL_SAMPLER_DIM_CUBE;
+   /* 1D and buffer images have one row: y is 0, a 1D array has its layer in y */
+   const bool one_row = dim == GLSL_SAMPLER_DIM_1D || dim == GLSL_SAMPLER_DIM_BUF;
 
    if (intr->intrinsic == nir_intrinsic_image_size) {
       nir_def *size[3] = {
@@ -1894,6 +1896,12 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                         (key->img_128bit & BITFIELD_BIT(nir_src_as_uint(intr->src[0]))));
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
+
+   if (one_row) {
+      nir_def *zero = nir_imm_int(b, 0);
+      coord = nir_vec4(b, nir_channel(b, coord, 0), zero,
+                       array ? nir_channel(b, coord, 1) : zero, zero);
+   }
 
    /* img_load/img_store with the image descriptor. The 3D form takes the
     * address of the layer as its z coordinate. 128-bit formats are two

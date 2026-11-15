@@ -75,8 +75,8 @@ etna_set_shader_images(struct pipe_context *pctx, mesa_shader_stage shader,
       if (n >= ETNA_MAX_SHADER_IMAGES)
          break;
 
-      if (i < count && images && images[i].resource &&
-          images[i].resource->target != PIPE_BUFFER) {
+      /* buffers too: OpenCL 1D image buffers */
+      if (i < count && images && images[i].resource) {
          util_copy_image_view(dst, &images[i]);
          so->enabled_mask |= BITFIELD_BIT(n);
       } else {
@@ -91,6 +91,9 @@ etna_set_shader_images(struct pipe_context *pctx, mesa_shader_stage shader,
 static void
 etna_compute_prepare_image(struct etna_context *ctx, const struct pipe_image_view *img)
 {
+   if (img->resource->target == PIPE_BUFFER)
+      return;
+
    struct etna_resource *base = etna_resource(img->resource);
    const unsigned lvl = img->u.tex.level;
 
@@ -598,7 +601,8 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
    /* the linear base is now the newest copy of written images */
    u_foreach_bit(i, images->enabled_mask) {
-      if (images->img[i].access & PIPE_IMAGE_ACCESS_WRITE)
+      if ((images->img[i].access & PIPE_IMAGE_ACCESS_WRITE) &&
+          images->img[i].resource->target != PIPE_BUFFER)
          etna_resource_level_mark_changed(
             &etna_resource(images->img[i].resource)->levels[images->img[i].u.tex.level]);
    }
