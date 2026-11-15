@@ -1692,7 +1692,9 @@ load("shared_ir3", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 # Etnaviv-specific load/glboal intrinsics. They take a 32-bit base address and
 # a 32-bit offset, which doesn't need to be an immediate.
 # src[] = { value, address, 32-bit offset }.
-store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
+# src_type: the type stored, nir_type_uint8/16 for a narrow store of a 32-bit
+# value (0: 32 bits).
+store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET, SRC_TYPE])
 # src[] = { address, 32-bit offset }.
 load("global_etna", [1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 # Atomics on the same address + offset form. src[] = { address, 32-bit offset, data }.

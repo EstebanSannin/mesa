@@ -913,7 +913,8 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
    case nir_intrinsic_store_global_etna:
       emit_inst(c, &(struct etna_inst) {
          .opcode = ISA_OPC_STORE,
-         .type = ISA_TYPE_U32,
+         .type = nir_intrinsic_src_type(intr) == nir_type_uint8 ? ISA_TYPE_U8 :
+                 nir_intrinsic_src_type(intr) == nir_type_uint16 ? ISA_TYPE_U16 : ISA_TYPE_U32,
          .denorm = 1,
          .dst = {
             .write_mask = nir_intrinsic_write_mask(intr),
@@ -1690,6 +1691,20 @@ lower_cs_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* a narrow store: STORE.u8/u16 takes a 32-bit register and writes its low
+ * byte or half */
+static nir_def *
+store_value32(nir_builder *b, nir_def *v)
+{
+   return v->bit_size < 32 ? nir_u2u32(b, v) : v;
+}
+
+static nir_alu_type
+store_type(const nir_def *v)
+{
+   return v->bit_size < 32 ? (nir_alu_type)(nir_type_uint | v->bit_size) : nir_type_invalid;
+}
+
 /* OpenCL private memory that stays memory (dynamically indexed arrays) comes
  * as scratch access: each invocation of the dispatch has a slot of
  * scratch_size bytes in the private buffer, addressed as global memory. */
@@ -1785,8 +1800,9 @@ lower_shared_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size, addr, offset);
       break;
    case nir_intrinsic_store_shared:
-      nir_store_global_etna(b, intr->src[0].ssa, addr, offset,
-                            .write_mask = nir_intrinsic_write_mask(intr));
+      nir_store_global_etna(b, store_value32(b, intr->src[0].ssa), addr, offset,
+                            .write_mask = nir_intrinsic_write_mask(intr),
+                            .src_type = store_type(intr->src[0].ssa));
       break;
    case nir_intrinsic_shared_atomic:
       repl = nir_global_atomic_etna(b, intr->def.bit_size, addr, offset, intr->src[1].ssa,
@@ -2060,6 +2076,19 @@ etna_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_s
                            uint32_t align_mul, uint32_t align_offset, bool offset_is_const,
                            enum gl_access_qualifier access, const void *cb_data)
 {
+   /* STORE.u8 / STORE.u16 write one narrow value: no atomics for a store
+    * that isn't whole 32-bit words */
+   const uint32_t align = nir_combined_align(align_mul, align_offset);
+   if ((intrin == nir_intrinsic_store_global || intrin == nir_intrinsic_store_shared) &&
+       bit_size < 32 && align >= bit_size / 8 && (align < 4 || bytes % 4)) {
+      return (nir_mem_access_size_align){
+         .num_components = 1,
+         .bit_size = bit_size,
+         .align = bit_size / 8,
+         .shift = nir_mem_access_shift_method_scalar,
+      };
+   }
+
    return (nir_mem_access_size_align){
       .num_components = MIN2(DIV_ROUND_UP(bytes, 4), 4),
       .bit_size = 32,
@@ -2197,8 +2226,9 @@ lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
                                   intr->src[0].ssa, nir_imm_int(b, 0));
       break;
    case nir_intrinsic_store_global:
-      nir_store_global_etna(b, intr->src[0].ssa, intr->src[1].ssa, nir_imm_int(b, 0),
-                            .write_mask = nir_intrinsic_write_mask(intr));
+      nir_store_global_etna(b, store_value32(b, intr->src[0].ssa), intr->src[1].ssa, nir_imm_int(b, 0),
+                            .write_mask = nir_intrinsic_write_mask(intr),
+                            .src_type = store_type(intr->src[0].ssa));
       break;
    case nir_intrinsic_global_atomic:
       repl = nir_global_atomic_etna(b, intr->def.bit_size, intr->src[0].ssa, nir_imm_int(b, 0),
