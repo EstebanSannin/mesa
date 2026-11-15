@@ -1841,8 +1841,10 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
  * instructions: linear base + layer * layer stride + y * stride + x * 4,
  * tiled in tiles of 4x4 texels in rows of stride * 4 bytes. */
 static bool
-lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   const struct etna_shader_key *key = data;
+
    b->cursor = nir_before_instr(&intr->instr);
 
    /* image derefs to binding indices, like gl_nir_lower_images() */
@@ -1885,7 +1887,11 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 
    const enum pipe_format format = nir_intrinsic_format(intr);
    const unsigned bpp = util_format_get_blocksize(format);
-   const bool planes = bpp == 16;
+   /* without a format (OpenCL), the key says which images are 128-bit */
+   const bool planes = bpp == 16 ||
+                       (format == PIPE_FORMAT_NONE && nir_src_is_const(intr->src[0]) &&
+                        nir_src_as_uint(intr->src[0]) < 8 &&
+                        (key->img_128bit & BITFIELD_BIT(nir_src_as_uint(intr->src[0]))));
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
 
@@ -2343,7 +2349,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    }
 
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_image_access,
-            nir_metadata_control_flow, NULL);
+            nir_metadata_control_flow, &v->key);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,
             nir_metadata_control_flow, NULL);
 

@@ -307,6 +307,14 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       }
    }
 
+   /* 128-bit images are two planes: access without a format in the shader
+    * (OpenCL) needs to know which */
+   const struct etna_shader_image_state *bound = &ctx->shader_images[MESA_SHADER_COMPUTE];
+   u_foreach_bit(i, bound->enabled_mask) {
+      if (util_format_get_blocksize(bound->img[i].format) == 16)
+         key.img_128bit |= BITFIELD_BIT(i);
+   }
+
    struct etna_shader_variant *v =
       etna_shader_variant(shader, &key, &ctx->base.debug, true);
    if (!v)

@@ -91,6 +91,9 @@ struct etna_shader_key
    unsigned tex_unorm8 : 16;
    unsigned tex_snorm8 : 16;
    unsigned tex_nearest : 16;
+   /* compute: images bound with a 128-bit format, for image access that
+    * takes its format from the descriptor (OpenCL) */
+   unsigned img_128bit : 8;
    unsigned sampler_companion[16];
 
    unsigned rt_is_128bit : ETNA_MAX_128BIT_RTS;
@@ -108,6 +111,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
        unlikely(a->tex_mag_switchover || b->tex_mag_switchover) ||
        unlikely(a->tex_unnormalized || b->tex_unnormalized) ||
        unlikely(a->tex_unorm8 || b->tex_unorm8 || a->tex_snorm8 || b->tex_snorm8) ||
+       unlikely(a->img_128bit || b->img_128bit) ||
        unlikely(a->rt_is_128bit || b->rt_is_128bit))
       return memcmp(a, b, sizeof(struct etna_shader_key)) == 0;
    else
