@@ -743,8 +743,16 @@ etna_resource_create(struct pipe_screen *pscreen,
        layout != ETNA_LAYOUT_LINEAR)
       layout = ETNA_LAYOUT_TILED;
 
+   /* An emulated 128 bit format is two 64 bit planes, which only the tiled
+    * layout handles (the texture unit reads the planes, the CPU transfers
+    * split and merge them). It stays tiled for a linear request that isn't
+    * scanout, such as OpenCL CL_MEM_ALLOC_HOST_PTR images: a linear one was
+    * mapped at the 64 bit plane pixel size. */
+   const bool keep_128bit_tiled = eil_format_is_emulated_128bit(templat->format) &&
+                                  !(templat->bind & PIPE_BIND_SCANOUT);
+
    if (/* linear base or scanout without modifier requested */
-       (templat->bind & (PIPE_BIND_LINEAR | PIPE_BIND_SCANOUT)) ||
+       ((templat->bind & (PIPE_BIND_LINEAR | PIPE_BIND_SCANOUT)) && !keep_128bit_tiled) ||
        /* compressed textures don't use tiling, they have their own "tiles" */
        util_format_is_compressed(templat->format)) {
       layout = ETNA_LAYOUT_LINEAR;
