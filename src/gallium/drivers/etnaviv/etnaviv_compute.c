@@ -367,10 +367,14 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    u_foreach_bit(i, bound->enabled_mask) {
       if (util_format_get_blocksize(bound->img[i].format) == 16)
          key.img_128bit |= BITFIELD_BIT(i);
+      if (util_format_get_nr_components(bound->img[i].format) == 1)
+         key.img_1comp |= BITFIELD_BIT(i);
    }
    u_foreach_bit(t, ctx->cs_texbuf_mask) {
       if (util_format_get_blocksize(ctx->cs_sampler_view[t]->format) == 16)
          key.img_128bit |= BITFIELD_BIT(ETNA_MAX_SHADER_IMAGES + t);
+      if (util_format_get_nr_components(ctx->cs_sampler_view[t]->format) == 1)
+         key.img_1comp |= BITFIELD_BIT(ETNA_MAX_SHADER_IMAGES + t);
    }
 
    struct etna_shader_variant *v =

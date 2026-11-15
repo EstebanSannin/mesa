@@ -1933,6 +1933,29 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
 
+   /* Without a format in the shader (OpenCL) the descriptor converts, but the
+    * instruction still takes the register type and the components from the
+    * format (emit_image()): give it a stand-in of the access's type, with one
+    * component, four, or two per plane of a 128-bit format. */
+   enum pipe_format emit_format = format;
+   if (format == PIPE_FORMAT_NONE &&
+       (intr->intrinsic == nir_intrinsic_image_load || intr->intrinsic == nir_intrinsic_image_store)) {
+      const bool load = intr->intrinsic == nir_intrinsic_image_load;
+      const nir_alu_type base = nir_alu_type_get_base_type(load ? nir_intrinsic_dest_type(intr)
+                                                                : nir_intrinsic_src_type(intr));
+      const bool one = nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) < 16 &&
+                       (key->img_1comp & BITFIELD_BIT(nir_src_as_uint(intr->src[0])));
+      static const enum pipe_format stand_in[3][3] = {
+         /* float, uint, int */
+         { PIPE_FORMAT_R32_FLOAT, PIPE_FORMAT_R32_UINT, PIPE_FORMAT_R32_SINT },
+         { PIPE_FORMAT_R16G16B16A16_FLOAT, PIPE_FORMAT_R16G16B16A16_UINT, PIPE_FORMAT_R16G16B16A16_SINT },
+         { PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_UINT, PIPE_FORMAT_R32G32B32A32_SINT },
+      };
+      const unsigned t = base == nir_type_uint ? 1 : base == nir_type_int ? 2 : 0;
+
+      emit_format = stand_in[planes ? 2 : one ? 0 : 1][t];
+   }
+
    if (one_row) {
       nir_def *zero = nir_imm_int(b, 0);
       coord = nir_vec4(b, nir_channel(b, coord, 0), zero,
@@ -1964,27 +1987,32 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
       if (intr->intrinsic == nir_intrinsic_image_load) {
          nir_def *t = nir_load_image_etna(b, index, hcoord[0], .component = 0,
-                                          .image_dim = dim, .image_array = array, .format = format);
+                                          .image_dim = dim, .image_array = array, .format = emit_format);
          if (planes) {
             nir_def *hi = nir_load_image_etna(b, index, hcoord[1], .component = 1,
-                                              .image_dim = dim, .image_array = array, .format = format);
+                                              .image_dim = dim, .image_array = array, .format = emit_format);
             t = nir_vec4(b, nir_channel(b, t, 0), nir_channel(b, t, 1),
                          nir_channel(b, hi, 0), nir_channel(b, hi, 1));
-         } else if (util_format_get_nr_components(format) == 1) {
-            /* the load writes .x only: (r, 0, 0, 1) */
-            nir_def *one = util_format_is_pure_integer(format) ? nir_imm_int(b, 1)
-                                                               : nir_imm_float(b, 1.0);
+         } else if (format != PIPE_FORMAT_NONE ? util_format_get_nr_components(format) == 1 :
+                    nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) < 16 &&
+                    (key->img_1comp & BITFIELD_BIT(nir_src_as_uint(intr->src[0])))) {
+            /* the load writes .x only: (r, 0, 0, 1); without a format in the
+             * shader (OpenCL) the key says which images, and the result type
+             * the type of the 1 */
+            const bool int_one = format != PIPE_FORMAT_NONE ? util_format_is_pure_integer(format) :
+               nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) != nir_type_float;
+            nir_def *one = int_one ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0);
             t = nir_vec4(b, nir_channel(b, t, 0), nir_imm_int(b, 0), nir_imm_int(b, 0), one);
          }
          nir_def_replace(&intr->def, nir_trim_vector(b, t, intr->def.num_components));
       } else {
          nir_def *v = intr->src[3].ssa;
          nir_store_image_etna(b, index, hcoord[0], v, .component = 0,
-                              .image_dim = dim, .image_array = array, .format = format);
+                              .image_dim = dim, .image_array = array, .format = emit_format);
          if (planes)
             nir_store_image_etna(b, index, hcoord[1], nir_swizzle(b, v, (unsigned[]){ 2, 3, 2, 3 }, 4),
                                  .component = 1, .image_dim = dim,
-                                 .image_array = array, .format = format);
+                                 .image_array = array, .format = emit_format);
          nir_instr_remove(&intr->instr);
       }
       return true;
