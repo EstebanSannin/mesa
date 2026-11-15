@@ -602,11 +602,11 @@ translate_texture_target(unsigned target)
       return TEXTURE_TYPE_1D;
    case PIPE_TEXTURE_2D:
    case PIPE_TEXTURE_RECT:
-   case PIPE_TEXTURE_1D_ARRAY:
       return TEXTURE_TYPE_2D;
    case PIPE_TEXTURE_CUBE:
       return TEXTURE_TYPE_CUBE_MAP;
    case PIPE_TEXTURE_3D:
+   case PIPE_TEXTURE_1D_ARRAY:
    case PIPE_TEXTURE_2D_ARRAY:
       return TEXTURE_TYPE_3D;
    default:

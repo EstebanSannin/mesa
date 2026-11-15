@@ -704,13 +704,15 @@ snap_norm8(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
-/* A 1D texture is a 2D texture of one row (etna_create_sampler_view_desc(),
- * with the V wrap mode REPEAT), but the coordinate has x only: a fetch took an
- * undefined y. Give 1D (not array) texture instructions y = 0. */
+/* A 1D texture is a 2D texture of one row, and a 1D array a 2D array texture
+ * of one row per layer (etna_create_sampler_view_desc(), with the V wrap mode
+ * REPEAT), but the coordinate has no y: a fetch took an undefined y, and an
+ * array took the layer as y. Give 1D texture instructions y = 0, before the
+ * layer. */
 static bool
 lower_1d_coords(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
 {
-   if (tex->sampler_dim != GLSL_SAMPLER_DIM_1D || tex->is_array || tex->op == nir_texop_txs ||
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_1D || tex->op == nir_texop_txs ||
        tex->op == nir_texop_query_levels || tex->op == nir_texop_lod)
       return false;
 
@@ -724,8 +726,11 @@ lower_1d_coords(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
    nir_def *zero = tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms ?
                    nir_imm_int(b, 0) : nir_imm_float(b, 0.0f);
 
-   nir_src_rewrite(&tex->src[ci].src, nir_vec2(b, nir_channel(b, coord, 0), zero));
-   tex->coord_components = 2;
+   nir_def *comps[3] = { nir_channel(b, coord, 0), zero,
+                         tex->is_array ? nir_channel(b, coord, 1) : NULL };
+
+   tex->coord_components = 2 + tex->is_array;
+   nir_src_rewrite(&tex->src[ci].src, nir_vec(b, comps, tex->coord_components));
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
    return true;
 }

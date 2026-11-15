@@ -166,9 +166,8 @@ etna_texture_desc_fill(struct etna_context *ctx,
       target_hw = TEXTURE_TYPE_2D;
       break;
    case PIPE_TEXTURE_1D_ARRAY:
-      is_array = true;
-      base_height = res->base.array_size;
-      break;
+      /* a 2D array texture of one row: the layers are layer_stride apart,
+       * not the rows of a 2D texture */
    case PIPE_TEXTURE_2D_ARRAY:
       is_array = true;
       base_depth = res->base.array_size;
@@ -268,7 +267,7 @@ etna_create_sampler_view_desc(struct pipe_context *pctx, struct pipe_resource *p
    if (util_format_is_srgb(so->format))
       sv->SAMP_CTRL1 |= VIVS_NTE_DESCRIPTOR_SAMP_CTRL1_SRGB;
 
-   if (sv->base.target == PIPE_TEXTURE_1D) {
+   if (sv->base.target == PIPE_TEXTURE_1D || sv->base.target == PIPE_TEXTURE_1D_ARRAY) {
       sv->SAMP_CTRL0_MASK = ~VIVS_NTE_DESCRIPTOR_SAMP_CTRL0_VWRAP__MASK;
       sv->SAMP_CTRL0 = VIVS_NTE_DESCRIPTOR_SAMP_CTRL0_VWRAP(TEXTURE_WRAPMODE_REPEAT);
    }
