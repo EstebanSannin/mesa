@@ -237,6 +237,12 @@ etna_clear_render_target(struct pipe_context *pctx, struct pipe_surface *dst,
 {
    struct etna_context *ctx = etna_context(pctx);
 
+   /* compute-only contexts (OpenCL image fills) have no blitter */
+   if (!ctx->blitter) {
+      util_clear_render_target(pctx, dst, color, dstx, dsty, width, height);
+      return;
+   }
+
    /* XXX could fall back to RS when target area is full screen / resolveable
     * and no TS. */
    etna_blit_save_state(ctx, false);
@@ -250,6 +256,11 @@ etna_clear_depth_stencil(struct pipe_context *pctx, struct pipe_surface *dst,
                          unsigned height, bool render_condition_enabled)
 {
    struct etna_context *ctx = etna_context(pctx);
+
+   if (!ctx->blitter) {
+      util_clear_depth_stencil(pctx, dst, clear_flags, depth, stencil, dstx, dsty, width, height);
+      return;
+   }
 
    /* XXX could fall back to RS when target area is full screen / resolveable
     * and no TS. */
