@@ -643,6 +643,87 @@ snap_norm8(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/* one nearest tap of an RGBA16 UNORM texture: the texel as 16-bit unsigned
+ * integers, converted to float. coord NULL keeps the instruction's. */
+static nir_def *
+unorm16_tap(nir_builder *b, nir_tex_instr *tex, nir_def *coord)
+{
+   nir_tex_instr *t = nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+
+   t->dest_type = nir_type_uint32;
+   /* the clone joins the use lists of its sources on insertion */
+   nir_builder_instr_insert(b, &t->instr);
+   if (coord)
+      nir_src_rewrite(&t->src[nir_tex_instr_src_index(t, nir_tex_src_coord)].src, coord);
+
+   return nir_fmul_imm(b, nir_u2f32(b, &t->def), 1.0f / 65535.0f);
+}
+
+/* RGBA16 UNORM (OpenCL) has no texture format: the texture unit samples it as
+ * 16-bit unsigned integers with a nearest sampler (etna_compute_swap_textures)
+ * and the shader converts. A linear sampler filters here, from the nearest
+ * taps around the coordinate, which the texture unit wraps or clamps as the
+ * sampler says. Runs after lower_unnormalized_coords(). */
+static bool
+lower_unorm16(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+   const unsigned i = tex->texture_index;
+
+   if (i >= 16 || !(key->tex_unorm16 & BITFIELD_BIT(i)) ||
+       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float)
+      return false;
+
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txd && tex->op != nir_texop_txf)
+      return false;
+
+   b->cursor = nir_after_instr(&tex->instr);
+
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   nir_def *v = NULL;
+
+   if (tex->op == nir_texop_txf || ci < 0 || !(key->tex_unorm16_linear & BITFIELD_BIT(i))) {
+      v = unorm16_tap(b, tex, NULL);
+   } else {
+      nir_def *coord = tex->src[ci].src.ssa;
+      const unsigned n = tex->coord_components - tex->is_array;
+      nir_def *size = nir_i2f32(b, nir_trim_vector(b, nir_load_texture_size_etna(b, 32, nir_imm_int(b, i)), n));
+      nir_def *lo[3], *hi[3], *frac[3];
+
+      for (unsigned c = 0; c < n; c++) {
+         nir_def *s = nir_channel(b, size, c);
+         nir_def *x = nir_fadd_imm(b, nir_fmul(b, nir_channel(b, coord, c), s), -0.5f);
+         nir_def *x0 = nir_ffloor(b, x);
+
+         frac[c] = nir_fsub(b, x, x0);
+         lo[c] = nir_fdiv(b, nir_fadd_imm(b, x0, 0.5f), s);
+         hi[c] = nir_fdiv(b, nir_fadd_imm(b, x0, 1.5f), s);
+      }
+
+      for (unsigned m = 0; m < (1u << n); m++) {
+         nir_def *comps[4];
+         nir_def *w = nir_imm_float(b, 1.0f);
+
+         for (unsigned c = 0; c < tex->coord_components; c++) {
+            if (c >= n) {
+               comps[c] = nir_channel(b, coord, c);
+               continue;
+            }
+            const bool up = m & BITFIELD_BIT(c);
+            comps[c] = up ? hi[c] : lo[c];
+            w = nir_fmul(b, w, up ? frac[c] : nir_fsub_imm(b, 1.0f, frac[c]));
+         }
+
+         nir_def *tap = nir_fmul(b, unorm16_tap(b, tex, nir_vec(b, comps, tex->coord_components)), w);
+         v = v ? nir_fadd(b, v, tap) : tap;
+      }
+   }
+
+   nir_def_replace(&tex->def, v);
+   return true;
+}
+
 /* Emulated depth32f is D24 storage, so the texture unit clamps the border
  * depth to [0, 1]. A float depth border outside that range is in the shader
  * key (tex_border_depth), and the shader compares border texels with it.
@@ -806,6 +887,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
 
    if (key->tex_unorm8 | key->tex_snorm8)
       NIR_PASS(progress, s, nir_shader_tex_pass, snap_norm8,
+               nir_metadata_control_flow, key);
+
+   if (key->tex_unorm16)
+      NIR_PASS(progress, s, nir_shader_tex_pass, lower_unorm16,
                nir_metadata_control_flow, key);
 
    if (key->tex_float_border_s | key->tex_float_border_t)

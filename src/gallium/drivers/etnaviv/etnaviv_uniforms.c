@@ -155,6 +155,8 @@ etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout)
    case PIPE_FORMAT_R16G16B16A16_FLOAT: log2_bpp = 3; cls = 1; type = 1;  comps = 4; break;
    case PIPE_FORMAT_R16G16B16A16_UINT:  log2_bpp = 3; cls = 1; type = 6;  comps = 4; break;
    case PIPE_FORMAT_R16G16B16A16_SINT:  log2_bpp = 3; cls = 1; type = 3;  comps = 4; break;
+   /* type from NXP's OpenCL (RGBA UNORM_INT16 images) */
+   case PIPE_FORMAT_R16G16B16A16_UNORM: log2_bpp = 3; cls = 1; type = 14; comps = 4; break;
    case PIPE_FORMAT_R32_FLOAT:          log2_bpp = 2; cls = 2; type = 0;  comps = 1; break;
    case PIPE_FORMAT_R32_UINT:           log2_bpp = 2; cls = 2; type = 5;  comps = 1; break;
    case PIPE_FORMAT_R32_SINT:           log2_bpp = 2; cls = 2; type = 2;  comps = 1; break;

@@ -228,6 +228,34 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
          if (!samplers[t])
             samplers[t] = etna_compute_fetch_sampler(ctx);
       }
+
+      /* RGBA16 UNORM samples as integers, which don't filter: bind a nearest
+       * copy of a linear sampler, the shader filters (lower_unorm16) */
+      ctx->cs_unorm16_linear = 0;
+      for (unsigned t = 0; t < n; t++) {
+         const struct pipe_sampler_state *ss = samplers[t];
+
+         if (!views[t] || views[t]->format != PIPE_FORMAT_R16G16B16A16_UNORM || !ss ||
+             (ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
+              ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST))
+            continue;
+
+         struct pipe_sampler_state nearest = *ss;
+         nearest.min_img_filter = PIPE_TEX_FILTER_NEAREST;
+         nearest.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+         nearest.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+
+         if (!ctx->cs_nearest_sampler[t] ||
+             memcmp(&nearest, &ctx->cs_nearest_state[t], sizeof(nearest))) {
+            if (ctx->cs_nearest_sampler[t])
+               pctx->delete_sampler_state(pctx, ctx->cs_nearest_sampler[t]);
+            ctx->cs_nearest_sampler[t] = pctx->create_sampler_state(pctx, &nearest);
+            ctx->cs_nearest_state[t] = nearest;
+         }
+
+         samplers[t] = ctx->cs_nearest_sampler[t];
+         ctx->cs_unorm16_linear |= BITFIELD_BIT(t);
+      }
    } else {
       memcpy(samplers, saved->sampler, sizeof(void *) * n);
       memcpy(views, saved->view, sizeof(views[0]) * n);
@@ -304,6 +332,12 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          if (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
              ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST)
             key.tex_nearest |= BITFIELD_BIT(i);
+
+         if (sv->format == PIPE_FORMAT_R16G16B16A16_UNORM) {
+            key.tex_unorm16 |= BITFIELD_BIT(i);
+            if (ctx->cs_unorm16_linear & BITFIELD_BIT(i))
+               key.tex_unorm16_linear |= BITFIELD_BIT(i);
+         }
       }
    }
 
@@ -651,6 +685,10 @@ etna_compute_fini(struct pipe_context *pctx)
 
    if (ctx->cs_fetch_sampler)
       pctx->delete_sampler_state(pctx, ctx->cs_fetch_sampler);
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->cs_nearest_sampler); i++) {
+      if (ctx->cs_nearest_sampler[i])
+         pctx->delete_sampler_state(pctx, ctx->cs_nearest_sampler[i]);
+   }
 
    for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
       for (unsigned i = 0; i < ETNA_MAX_SHADER_BUFFERS; i++)

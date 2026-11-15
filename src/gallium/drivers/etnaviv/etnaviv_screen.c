@@ -624,7 +624,11 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
          allowed |= PIPE_BIND_DEPTH_STENCIL;
    }
 
-   if (usage & PIPE_BIND_SAMPLER_VIEW) {
+   /* RGBA16 UNORM samples as integers that only compute shaders convert
+    * (OpenCL, which adds PIPE_BIND_OPENCL to every query) */
+   const bool cl_only = format == PIPE_FORMAT_R16G16B16A16_UNORM && !(usage & PIPE_BIND_OPENCL);
+
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) && !cl_only) {
       uint32_t fmt = ETNA_NO_MATCH;
 
       if (gpu_supports_texture_format(screen, format))
@@ -647,7 +651,7 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
          allowed |= PIPE_BIND_VERTEX_BUFFER;
    }
 
-   if ((usage & PIPE_BIND_SHADER_IMAGE) && pscreen->caps.compute &&
+   if ((usage & PIPE_BIND_SHADER_IMAGE) && pscreen->caps.compute && !cl_only &&
        target != PIPE_BUFFER && sample_count <= 1 && etna_format_is_image_format(format))
       allowed |= PIPE_BIND_SHADER_IMAGE;
 

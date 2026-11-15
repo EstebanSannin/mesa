@@ -75,6 +75,7 @@ etna_format_is_image_format(enum pipe_format format)
    switch (format) {
    case PIPE_FORMAT_R32G32B32A32_FLOAT:
    case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
    case PIPE_FORMAT_R32_FLOAT:
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_SNORM:
