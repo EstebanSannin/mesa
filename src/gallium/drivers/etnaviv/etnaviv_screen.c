@@ -628,6 +628,11 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
     * (OpenCL, which adds PIPE_BIND_OPENCL to every query) */
    const bool cl_only = format == PIPE_FORMAT_R16G16B16A16_UNORM && !(usage & PIPE_BIND_OPENCL);
 
+   /* OpenCL CL_UNORM_INT_2_101010_EXT (an optional extension): the texture
+    * unit converts the 10-bit channels slightly off */
+   if (format == PIPE_FORMAT_R10G10B10A2_UNORM && (usage & PIPE_BIND_OPENCL))
+      return false;
+
    /* a buffer texture (OpenCL 1D image buffer) is read with the image
     * instructions, in the formats they know */
    const bool texbuf_ok = target != PIPE_BUFFER ||
