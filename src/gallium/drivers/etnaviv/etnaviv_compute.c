@@ -280,6 +280,31 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       etna_compute_swap_textures(ctx, &saved, true, shader);
       etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers,
                                       shader->tg4_shadow_samplers);
+
+      /* The texture unit converts 8-bit normalized texels to float slightly
+       * off (UNORM 67 reads as 67.02 / 255, 128 as 128.06 / 255; 0 and 255
+       * are exact), in 2D and 3D, sampled or fetched. OpenCL wants the exact
+       * value: reads that don't filter snap back to it in the shader. */
+      u_foreach_bit(i, textures & BITFIELD_MASK(16)) {
+         const struct pipe_sampler_view *sv = ctx->sampler_view[i];
+         const struct pipe_sampler_state *ss = ctx->sampler[i];
+
+         if (!sv)
+            continue;
+
+         const struct util_format_description *desc = util_format_description(sv->format);
+         if (desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB)
+            continue;
+
+         if (util_format_is_unorm8(desc))
+            key.tex_unorm8 |= BITFIELD_BIT(i);
+         else if (util_format_is_snorm8(sv->format))
+            key.tex_snorm8 |= BITFIELD_BIT(i);
+
+         if (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
+             ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST)
+            key.tex_nearest |= BITFIELD_BIT(i);
+      }
    }
 
    struct etna_shader_variant *v =

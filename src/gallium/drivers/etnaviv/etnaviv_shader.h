@@ -86,6 +86,11 @@ struct etna_shader_key
    /* samplers with unnormalized coordinates (OpenCL): the shader divides
     * the coordinates by the texture size */
    unsigned tex_unnormalized : 16;
+   /* compute: 8-bit UNORM and SNORM textures, and the samplers that filter
+    * nearest: those reads snap to the exact value (etna_launch_grid) */
+   unsigned tex_unorm8 : 16;
+   unsigned tex_snorm8 : 16;
+   unsigned tex_nearest : 16;
    unsigned sampler_companion[16];
 
    unsigned rt_is_128bit : ETNA_MAX_128BIT_RTS;
@@ -102,6 +107,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
        unlikely(a->tex_is_128bit || b->tex_is_128bit) ||
        unlikely(a->tex_mag_switchover || b->tex_mag_switchover) ||
        unlikely(a->tex_unnormalized || b->tex_unnormalized) ||
+       unlikely(a->tex_unorm8 || b->tex_unorm8 || a->tex_snorm8 || b->tex_snorm8) ||
        unlikely(a->rt_is_128bit || b->rt_is_128bit))
       return memcmp(a, b, sizeof(struct etna_shader_key)) == 0;
    else

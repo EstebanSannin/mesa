@@ -610,6 +610,39 @@ lower_unnormalized_coords(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/* 8-bit normalized texels convert to float slightly off in the texture unit
+ * (see etna_launch_grid()): a read that doesn't filter, a fetch or a nearest
+ * sample, snaps to the nearest k / 255 (k / 127 for SNORM). The error is far
+ * below half a step. */
+static bool
+snap_norm8(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+   const unsigned i = tex->texture_index;
+
+   if (i >= 16 || !((key->tex_unorm8 | key->tex_snorm8) & BITFIELD_BIT(i)) ||
+       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float)
+      return false;
+
+   const bool fetch = tex->op == nir_texop_txf || tex->op == nir_texop_tg4;
+   const bool sample = tex->op == nir_texop_tex || tex->op == nir_texop_txb ||
+                       tex->op == nir_texop_txl || tex->op == nir_texop_txd;
+
+   if (!fetch && !(sample && (key->tex_nearest & BITFIELD_BIT(i))))
+      return false;
+
+   const float steps = (key->tex_unorm8 & BITFIELD_BIT(i)) ? 255.0f : 127.0f;
+
+   b->cursor = nir_after_instr(&tex->instr);
+
+   nir_def *v = nir_fmul_imm(b, nir_fround_even(b, nir_fmul_imm(b, &tex->def, steps)), 1.0f / steps);
+   if (key->tex_snorm8 & BITFIELD_BIT(i))
+      v = nir_fmax_imm(b, v, -1.0f);
+
+   nir_def_rewrite_uses_after(&tex->def, v);
+   return true;
+}
+
 /* Emulated depth32f is D24 storage, so the texture unit clamps the border
  * depth to [0, 1]. A float depth border outside that range is in the shader
  * key (tex_border_depth), and the shader compares border texels with it.
@@ -769,6 +802,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
 
    if (key->tex_unnormalized)
       NIR_PASS(progress, s, nir_shader_tex_pass, lower_unnormalized_coords,
+               nir_metadata_control_flow, key);
+
+   if (key->tex_unorm8 | key->tex_snorm8)
+      NIR_PASS(progress, s, nir_shader_tex_pass, snap_norm8,
                nir_metadata_control_flow, key);
 
    if (key->tex_float_border_s | key->tex_float_border_t)
