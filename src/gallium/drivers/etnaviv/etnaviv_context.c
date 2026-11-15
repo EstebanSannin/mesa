@@ -51,6 +51,7 @@
 #include "nir/nir_xfb_info.h"
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
+#include "util/os_file.h"
 #include "util/hash_table.h"
 #include "util/log.h"
 #include "util/perf/cpu_trace.h"
@@ -139,6 +140,10 @@ etna_context_destroy(struct pipe_context *pctx)
 
    if (ctx->in_fence_fd >= 0)
       close(ctx->in_fence_fd);
+
+   util_dynarray_foreach(&ctx->job_fence_fds, int, fd)
+      close(*fd);
+   util_dynarray_fini(&ctx->job_fence_fds);
 
    FREE(pctx);
 }
@@ -786,13 +791,25 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
       _mesa_set_clear(ctx->updated_resources, NULL);
    }
 
+   /* A compute-only context (OpenCL) gets a fence fd with every fence: its
+    * status tells a job the hang check killed (etna_screen_fence_finish()). */
+   const bool fence_fd = (flags & PIPE_FLUSH_FENCE_FD) || (fence && ctx->compute_only);
+
    etna_cmd_stream_flush(ctx->stream, ctx->in_fence_fd,
-                          (flags & PIPE_FLUSH_FENCE_FD) ? &out_fence_fd : NULL,
+                          fence_fd ? &out_fence_fd : NULL,
                           ctx->is_noop);
 
    if (ctx->in_fence_fd >= 0) {
       close(ctx->in_fence_fd);
       ctx->in_fence_fd = -1;
+   }
+
+   /* a copy of the job's fence fd for etna_get_device_reset_status() */
+   if (ctx->compute_only && out_fence_fd >= 0) {
+      int fd = os_dupfd_cloexec(out_fence_fd);
+
+      if (fd >= 0)
+         util_dynarray_append_typed(&ctx->job_fence_fds, int, fd);
    }
 
    if (fence)
@@ -811,6 +828,35 @@ etna_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
                    enum pipe_flush_flags flags)
 {
    etna_flush(pctx, fence, flags, false);
+}
+
+/* OpenCL: a job of this context that the kernel's hang check killed (its fence
+ * completed with an error) is a reset this context caused. The job's events
+ * already failed (etna_screen_fence_finish()); rusticl then fails the events
+ * of the queue from there on, so a later read doesn't return incomplete
+ * results as if they were valid. */
+static enum pipe_reset_status
+etna_get_device_reset_status(struct pipe_context *pctx)
+{
+   struct etna_context *ctx = etna_context(pctx);
+   enum pipe_reset_status status = PIPE_NO_RESET;
+   unsigned pending = 0;
+
+   util_dynarray_foreach(&ctx->job_fence_fds, int, fd) {
+      const int s = etna_fence_fd_status(*fd);
+
+      if (s == 0) {
+         *util_dynarray_element(&ctx->job_fence_fds, int, pending++) = *fd;
+         continue;
+      }
+
+      if (s < 0)
+         status = PIPE_GUILTY_CONTEXT_RESET;
+      close(*fd);
+   }
+   util_dynarray_resize(&ctx->job_fence_fds, int, pending);
+
+   return status;
 }
 
 static void
@@ -900,6 +946,7 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    ctx->needs_gpu_state_reset = true;
 
    ctx->in_fence_fd = -1;
+   util_dynarray_init(&ctx->job_fence_fds, NULL);
 
    pctx->destroy = etna_context_destroy;
    pctx->draw_vbo = etna_draw_vbo;
@@ -910,6 +957,8 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->set_debug_callback = etna_set_debug_callback;
    pctx->create_fence_fd = etna_create_fence_fd;
    pctx->fence_server_sync = etna_fence_server_sync;
+   if (ctx->compute_only)
+      pctx->get_device_reset_status = etna_get_device_reset_status;
    pctx->emit_string_marker = etna_emit_string_marker;
    pctx->set_frontend_noop = etna_set_frontend_noop;
    pctx->set_context_param = etna_set_context_param;
