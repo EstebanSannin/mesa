@@ -173,6 +173,7 @@ enum etna_uniform_contents {
    /* word of an image descriptor: image | plane << 4 | word << 8 */
    ETNA_UNIFORM_IMAGE_DESC,
    ETNA_UNIFORM_SCRATCH_ADDR,
+   ETNA_UNIFORM_PRIVATE_ADDR,
 };
 
 struct etna_shader_uniform_info {
@@ -334,6 +335,9 @@ struct etna_context {
    uint32_t compute_shared_bo_size;
    struct etna_bo *compute_scratch_bo;
    uint32_t compute_scratch_bo_size;
+   /* OpenCL private memory: one slot per invocation of the dispatch */
+   struct etna_bo *compute_private_bo;
+   uint32_t compute_private_bo_size;
    uint32_t compute_unk924;
    uint32_t compute_thread_alloc;
    uint32_t compute_min_temps;

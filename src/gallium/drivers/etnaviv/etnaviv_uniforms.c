@@ -364,6 +364,13 @@ etna_uniforms_write(const struct etna_context *ctx,
          });
          break;
 
+      case ETNA_UNIFORM_PRIVATE_ADDR:
+         etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+            .bo = ctx->compute_private_bo,
+            .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+         });
+         break;
+
       case ETNA_UNIFORM_SHARED_ADDR:
          etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
             .bo = ctx->compute_shared_bo,

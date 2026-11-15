@@ -157,7 +157,7 @@ etna_get_compute_state_info(struct pipe_context *pctx, void *cso,
       info->max_threads = MIN2(info->max_threads, MAX2(fit & ~3u, 4));
    }
 
-   info->private_memory = 0;
+   info->private_memory = v ? v->cs_private_size : 0;
    info->preferred_simd_size = 4;
    info->simd_sizes = 4;
 }
@@ -368,6 +368,30 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          if (!ctx->compute_scratch_bo) {
             ctx->compute_scratch_bo_size = 0;
             BUG("no memory for compute scratch");
+            goto out;
+         }
+      }
+   }
+
+   /* OpenCL private memory: one slot per invocation of the dispatch */
+   if (v->cs_private_size) {
+      const uint64_t need = (uint64_t)v->cs_private_size * grid[0] * grid[1] * grid[2] *
+                            info->block[0] * info->block[1] * info->block[2];
+
+      if (need > 512 * 1024 * 1024) {
+         BUG("private memory of %" PRIu64 " bytes for the dispatch is too large, dispatch skipped", need);
+         goto out;
+      }
+
+      if (need > ctx->compute_private_bo_size) {
+         if (ctx->compute_private_bo)
+            etna_bo_del(ctx->compute_private_bo);
+         ctx->compute_private_bo_size = align(need, 64 * 1024);
+         ctx->compute_private_bo = etna_bo_new(ctx->screen->dev, ctx->compute_private_bo_size,
+                                               DRM_ETNA_GEM_CACHE_WC);
+         if (!ctx->compute_private_bo) {
+            ctx->compute_private_bo_size = 0;
+            BUG("no memory for private memory");
             goto out;
          }
       }
@@ -611,6 +635,8 @@ etna_compute_fini(struct pipe_context *pctx)
       etna_bo_del(ctx->compute_shared_bo);
    if (ctx->compute_scratch_bo)
       etna_bo_del(ctx->compute_scratch_bo);
+   if (ctx->compute_private_bo)
+      etna_bo_del(ctx->compute_private_bo);
 
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
       pipe_sampler_view_reference(&ctx->cs_sampler_view[i], NULL);

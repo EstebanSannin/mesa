@@ -144,6 +144,8 @@ struct etna_shader_variant {
     * invocation that this needs */
    uint32_t cs_fold;
    uint32_t cs_scratch_slots;
+   /* OpenCL private memory per invocation, bytes (scratch) */
+   uint32_t cs_private_size;
 
    /* shader is larger than GPU instruction limit, thus needs icache */
    bool needs_icache;

@@ -1388,7 +1388,9 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
                value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_SIZE, nir_src_as_uint(intr->src[0]));
                break;
             case nir_intrinsic_load_scratch_base_ptr:
-               value[0] = CONST_VAL(ETNA_UNIFORM_SCRATCH_ADDR, 0);
+               /* BASE 1: OpenCL private memory, BASE 0: workgroup folding */
+               value[0] = CONST_VAL(nir_intrinsic_base(intr) ? ETNA_UNIFORM_PRIVATE_ADDR :
+                                                               ETNA_UNIFORM_SCRATCH_ADDR, 0);
                break;
             case nir_intrinsic_load_shared_slice_etna:
                value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_SLICE, 0);
@@ -1685,6 +1687,57 @@ lower_cs_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    nir_def_replace(&intr->def, nir_u2uN(b, val, intr->def.bit_size));
+   return true;
+}
+
+/* OpenCL private memory that stays memory (dynamically indexed arrays) comes
+ * as scratch access: each invocation of the dispatch has a slot of
+ * scratch_size bytes in the private buffer, addressed as global memory. */
+static bool
+lower_private_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned size = *(unsigned *)data;
+   const bool load = intr->intrinsic == nir_intrinsic_load_scratch;
+
+   if (!load && intr->intrinsic != nir_intrinsic_store_scratch)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *wid = nir_load_workgroup_id(b);
+   nir_def *num = nir_load_num_workgroups(b);
+   nir_def *group = nir_iadd(b, nir_channel(b, wid, 0),
+                             nir_imul(b, nir_channel(b, num, 0),
+                                      nir_iadd(b, nir_channel(b, wid, 1),
+                                               nir_imul(b, nir_channel(b, num, 1),
+                                                        nir_channel(b, wid, 2)))));
+   nir_def *block;
+   if (b->shader->info.workgroup_size_variable) {
+      block = nir_load_workgroup_size(b);
+   } else {
+      const uint16_t *s = b->shader->info.workgroup_size;
+      block = nir_imm_ivec3(b, s[0], s[1], s[2]);
+   }
+   nir_def *threads = nir_imul(b, nir_channel(b, block, 0),
+                               nir_imul(b, nir_channel(b, block, 1), nir_channel(b, block, 2)));
+   nir_def *slot = nir_iadd(b, nir_imul(b, group, threads), nir_load_local_invocation_index(b));
+   nir_def *offset = intr->src[load ? 0 : 1].ssa;
+   nir_def *addr = nir_iadd(b, nir_load_scratch_base_ptr(b, 1, 32, .base = 1),
+                            nir_iadd(b, nir_imul_imm(b, slot, size), offset));
+   /* slots are 16-byte aligned */
+   const unsigned align_mul = MIN2(nir_intrinsic_align_mul(intr), 16);
+   const unsigned align_offset = nir_intrinsic_align_offset(intr) % align_mul;
+
+   if (load) {
+      nir_def *repl = nir_load_global(b, intr->def.num_components, intr->def.bit_size, addr,
+                                      .align_mul = align_mul, .align_offset = align_offset);
+      nir_def_replace(&intr->def, repl);
+   } else {
+      nir_store_global(b, intr->src[0].ssa, addr, .write_mask = nir_intrinsic_write_mask(intr),
+                       .align_mul = align_mul, .align_offset = align_offset);
+      nir_instr_remove(&intr->instr);
+   }
+
    return true;
 }
 
@@ -2264,6 +2317,11 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
                   nir_var_mem_shared | nir_var_mem_ssbo,
          .may_lower_unaligned_stores_to_atomics = true,
       };
+      v->cs_private_size = align(s->scratch_size, 16);
+      if (v->cs_private_size)
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_private_access,
+                  nir_metadata_control_flow, &v->cs_private_size);
+
       bool narrow = false;
       NIR_PASS(narrow, s, nir_lower_mem_access_bit_sizes, &mem_opts);
       NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
