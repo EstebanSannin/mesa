@@ -371,6 +371,11 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          if (ctx->cs_shader_linear & BITFIELD_BIT(i))
             key.tex_shader_linear |= BITFIELD_BIT(i);
 
+         /* OpenCL rounds the array layer half to even */
+         if (ctx->compute_only && (sv->target == PIPE_TEXTURE_1D_ARRAY ||
+                                   sv->target == PIPE_TEXTURE_2D_ARRAY))
+            key.tex_layer_rint |= BITFIELD_BIT(i);
+
          const struct util_format_description *desc = util_format_description(sv->format);
          if (desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB)
             continue;

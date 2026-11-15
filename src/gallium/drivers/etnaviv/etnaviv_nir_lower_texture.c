@@ -572,6 +572,37 @@ is_int_coord(nir_def *coord, unsigned c)
    return op == nir_op_i2f32 || op == nir_op_u2f32;
 }
 
+/* OpenCL picks the layer of an array with rint(), which rounds half to even,
+ * and the texture unit rounds half up, as GL wants: layer 0.5 read layer 1.
+ * For OpenCL (key tex_layer_rint) the shader rounds the layer itself. Runs
+ * before lower_shader_linear(), whose taps take the layer as it is. */
+static bool
+lower_layer_rint(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+   const unsigned i = tex->texture_index;
+
+   if (i >= 16 || !(key->tex_layer_rint & BITFIELD_BIT(i)) || !tex->is_array)
+      return false;
+
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txd && tex->op != nir_texop_tg4)
+      return false;
+
+   const int idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *coord = tex->src[idx].src.ssa;
+   const unsigned l = tex->coord_components - 1;
+
+   nir_src_rewrite(&tex->src[idx].src,
+                   nir_vector_insert_imm(b, coord, nir_fround_even(b, nir_channel(b, coord, l)), l));
+   return true;
+}
+
 /* Samplers with unnormalized coordinates (OpenCL) are in the key: the texture
  * unit takes normalized ones only, so divide by the base level size. With
  * nearest filtering the shader picks the texel, floor(x), and samples its
@@ -1018,6 +1049,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
    }
 
    NIR_PASS(progress, s, nir_lower_tex, &lower_tex_options);
+
+   if (key->tex_layer_rint)
+      NIR_PASS(progress, s, nir_shader_tex_pass, lower_layer_rint,
+               nir_metadata_control_flow, key);
 
    if (key->tex_unnormalized)
       NIR_PASS(progress, s, nir_shader_tex_pass, lower_unnormalized_coords,
