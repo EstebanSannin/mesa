@@ -267,7 +267,8 @@ etna_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
    MESA_TRACE_FUNC();
    struct etna_context *ctx = etna_context(pctx);
 
-   if (src->target != PIPE_BUFFER && dst->target != PIPE_BUFFER &&
+   /* compute-only contexts (OpenCL image copies) have no blitter */
+   if (ctx->blitter && src->target != PIPE_BUFFER && dst->target != PIPE_BUFFER &&
        util_blitter_is_copy_supported(ctx->blitter, dst, src)) {
       etna_blit_save_state(ctx, false);
       util_blitter_copy_texture(ctx->blitter, dst, dst_level, dstx, dsty, dstz,
