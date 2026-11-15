@@ -58,6 +58,20 @@ etnaviv_ioctl_noop(int fd, unsigned long request, void *arg)
    return 0;
 }
 
+/* Nothing runs, so there is nothing to wait for: no fence fd for
+ * ETNA_SUBMIT_FENCE_FD_OUT, or the driver would take whatever the request
+ * held (0, stdin) for one. */
+static int
+etnaviv_ioctl_gem_submit(int fd, unsigned long request, void *arg)
+{
+   struct drm_etnaviv_gem_submit *submit = arg;
+
+   if (submit->flags & ETNA_SUBMIT_FENCE_FD_OUT)
+      submit->fence_fd = -1;
+
+   return 0;
+}
+
 static int
 etnaviv_ioctl_pm_query_dom(int fd, unsigned long request, void *arg)
 {
@@ -147,7 +161,7 @@ static ioctl_fn_t driver_ioctls[] = {
    [DRM_ETNAVIV_GEM_INFO] = etnaviv_ioctl_gem_info,
    [DRM_ETNAVIV_GEM_CPU_PREP] = etnaviv_ioctl_noop,
    [DRM_ETNAVIV_GEM_CPU_FINI] = etnaviv_ioctl_noop,
-   [DRM_ETNAVIV_GEM_SUBMIT] = etnaviv_ioctl_noop,
+   [DRM_ETNAVIV_GEM_SUBMIT] = etnaviv_ioctl_gem_submit,
    [DRM_ETNAVIV_WAIT_FENCE] = etnaviv_ioctl_noop,
    [DRM_ETNAVIV_GEM_USERPTR] = etnaviv_ioctl_noop,
    [DRM_ETNAVIV_GEM_WAIT] = etnaviv_ioctl_noop,
