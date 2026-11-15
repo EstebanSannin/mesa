@@ -330,11 +330,12 @@ struct etna_context {
    void *cs_sampler[PIPE_MAX_SAMPLERS];
    /* for textures read without a sampler (OpenCL), created on first use */
    void *cs_fetch_sampler;
-   /* RGBA16 UNORM textures with a linear sampler: a nearest copy of it per slot
-    * (integers don't filter, the shader does), and the slots */
+   /* textures the shader filters (RGBA16 UNORM, and in compute-only contexts
+    * every linear sampler): a nearest copy of the sampler per slot, and the
+    * slots */
    void *cs_nearest_sampler[PIPE_MAX_SAMPLERS / 2];
    struct pipe_sampler_state cs_nearest_state[PIPE_MAX_SAMPLERS / 2];
-   uint16_t cs_unorm16_linear;
+   uint16_t cs_shader_linear;
    /* compute textures that are buffers, read as images 8 + slot */
    uint16_t cs_texbuf_mask;
    struct pipe_sampler_view *cs_sampler_view[PIPE_MAX_SAMPLERS];

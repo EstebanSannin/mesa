@@ -243,13 +243,17 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
          }
       }
 
-      /* RGBA16 UNORM samples as integers, which don't filter: bind a nearest
-       * copy of a linear sampler, the shader filters (lower_unorm16) */
-      ctx->cs_unorm16_linear = 0;
+      /* The shader filters linear samplers (lower_shader_linear), bound as a
+       * nearest copy: RGBA16 UNORM samples as integers, which don't filter, and
+       * OpenCL (compute-only contexts) needs more precise weights than the
+       * texture unit's (an 8-bit UNORM sample at a weight of 0.6 was 1.6 steps
+       * off, the CTS allows half a step). */
+      ctx->cs_shader_linear = 0;
       for (unsigned t = 0; t < n; t++) {
          const struct pipe_sampler_state *ss = samplers[t];
 
-         if (!views[t] || views[t]->format != PIPE_FORMAT_R16G16B16A16_UNORM || !ss ||
+         if (!views[t] || !ss ||
+             (views[t]->format != PIPE_FORMAT_R16G16B16A16_UNORM && !ctx->compute_only) ||
              (ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
               ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST))
             continue;
@@ -268,7 +272,7 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
          }
 
          samplers[t] = ctx->cs_nearest_sampler[t];
-         ctx->cs_unorm16_linear |= BITFIELD_BIT(t);
+         ctx->cs_shader_linear |= BITFIELD_BIT(t);
       }
    } else {
       memcpy(samplers, saved->sampler, sizeof(void *) * n);
@@ -320,7 +324,7 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
    /* set by etna_compute_swap_textures() for this dispatch */
    ctx->cs_texbuf_mask = 0;
-   ctx->cs_unorm16_linear = 0;
+   ctx->cs_shader_linear = 0;
 
    if (textures) {
       etna_compute_swap_textures(ctx, &saved, true, shader);
@@ -338,11 +342,13 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          if (!sv)
             continue;
 
-         /* filters nearest (not a nearest copy of a linear sampler, RGBA16 UNORM) */
+         /* filters nearest (not a nearest copy of a linear sampler) */
          if (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
              ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
-             !(ctx->cs_unorm16_linear & BITFIELD_BIT(i)))
+             !(ctx->cs_shader_linear & BITFIELD_BIT(i)))
             key.tex_nearest |= BITFIELD_BIT(i);
+         if (ctx->cs_shader_linear & BITFIELD_BIT(i))
+            key.tex_shader_linear |= BITFIELD_BIT(i);
 
          const struct util_format_description *desc = util_format_description(sv->format);
          if (desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB)
@@ -353,11 +359,8 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          else if (util_format_is_snorm8(sv->format))
             key.tex_snorm8 |= BITFIELD_BIT(i);
 
-         if (sv->format == PIPE_FORMAT_R16G16B16A16_UNORM) {
+         if (sv->format == PIPE_FORMAT_R16G16B16A16_UNORM)
             key.tex_unorm16 |= BITFIELD_BIT(i);
-            if (ctx->cs_unorm16_linear & BITFIELD_BIT(i))
-               key.tex_unorm16_linear |= BITFIELD_BIT(i);
-         }
       }
    }
 

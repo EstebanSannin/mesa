@@ -592,6 +592,11 @@ lower_unnormalized_coords(nir_builder *b, nir_tex_instr *tex, void *data)
        tex->op != nir_texop_txd && tex->op != nir_texop_tg4)
       return false;
 
+   /* lower_shader_linear() takes them as they are: dividing here and
+    * multiplying back there moved 2.0 to 1.9999999, a row off */
+   if ((key->tex_shader_linear & BITFIELD_BIT(i)) && tex->op != nir_texop_tg4)
+      return false;
+
    const int idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    if (idx < 0)
       return false;
@@ -679,27 +684,108 @@ lower_1d_coords(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
    return true;
 }
 
-/* one nearest tap of an RGBA16 UNORM texture: the texel as 16-bit unsigned
- * integers, converted to float. coord NULL keeps the instruction's. */
+/* one nearest tap: a copy of the instruction, at coord (NULL keeps the
+ * instruction's). RGBA16 UNORM texels come as 16-bit unsigned integers and
+ * convert; 8-bit UNORM and SNORM texels snap to the exact value (snap_norm8). */
 static nir_def *
-unorm16_tap(nir_builder *b, nir_tex_instr *tex, nir_def *coord)
+nearest_tap(nir_builder *b, nir_tex_instr *tex, nir_def *coord, const struct etna_shader_key *key)
 {
+   const unsigned i = tex->texture_index;
+   const bool unorm16 = key->tex_unorm16 & BITFIELD_BIT(i);
    nir_tex_instr *t = nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
 
-   t->dest_type = nir_type_uint32;
+   if (unorm16)
+      t->dest_type = nir_type_uint32;
    /* the clone joins the use lists of its sources on insertion */
    nir_builder_instr_insert(b, &t->instr);
    if (coord)
       nir_src_rewrite(&t->src[nir_tex_instr_src_index(t, nir_tex_src_coord)].src, coord);
 
-   return nir_fmul_imm(b, nir_u2f32(b, &t->def), 1.0f / 65535.0f);
+   if (unorm16)
+      return nir_fmul_imm(b, nir_u2f32(b, &t->def), 1.0f / 65535.0f);
+
+   if ((key->tex_unorm8 | key->tex_snorm8) & BITFIELD_BIT(i)) {
+      const float steps = (key->tex_unorm8 & BITFIELD_BIT(i)) ? 255.0f : 127.0f;
+      nir_def *v = nir_fmul_imm(b, nir_fround_even(b, nir_fmul_imm(b, &t->def, steps)), 1.0f / steps);
+      return (key->tex_snorm8 & BITFIELD_BIT(i)) ? nir_fmax_imm(b, v, -1.0f) : v;
+   }
+
+   return &t->def;
+}
+
+/* Linear samplers that the shader filters (key tex_shader_linear: RGBA16
+ * UNORM, and every linear sampler of OpenCL): bound as a nearest copy
+ * (etna_compute_swap_textures), the shader takes the nearest taps around the
+ * coordinate, which the texture unit wraps or clamps as the sampler says,
+ * and weights them in float, as OpenCL does. Runs after
+ * lower_unnormalized_coords(). */
+static bool
+lower_shader_linear(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+   const unsigned i = tex->texture_index;
+
+   if (i >= 16 || !(key->tex_shader_linear & BITFIELD_BIT(i)) ||
+       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float)
+      return false;
+
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txd)
+      return false;
+
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (ci < 0)
+      return false;
+
+   /* the taps go before the instruction: the pass doesn't visit them */
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *coord = tex->src[ci].src.ssa;
+   const unsigned n = tex->coord_components - tex->is_array;
+   nir_def *size = nir_i2f32(b, nir_trim_vector(b, nir_load_texture_size_etna(b, 32, nir_imm_int(b, i)), n));
+   nir_def *lo[3], *hi[3], *frac[3];
+   nir_def *v = NULL;
+
+   /* unnormalized coordinates (lower_unnormalized_coords() leaves them) are
+    * texel positions already */
+   const bool unnormalized = key->tex_unnormalized & BITFIELD_BIT(i);
+
+   for (unsigned c = 0; c < n; c++) {
+      nir_def *s = nir_channel(b, size, c);
+      nir_def *x = nir_fadd_imm(b, unnormalized ? nir_channel(b, coord, c)
+                                                : nir_fmul(b, nir_channel(b, coord, c), s), -0.5f);
+      nir_def *x0 = nir_ffloor(b, x);
+
+      frac[c] = nir_fsub(b, x, x0);
+      lo[c] = nir_fdiv(b, nir_fadd_imm(b, x0, 0.5f), s);
+      hi[c] = nir_fdiv(b, nir_fadd_imm(b, x0, 1.5f), s);
+   }
+
+   for (unsigned m = 0; m < (1u << n); m++) {
+      nir_def *comps[4];
+      nir_def *w = nir_imm_float(b, 1.0f);
+
+      for (unsigned c = 0; c < tex->coord_components; c++) {
+         if (c >= n) {
+            comps[c] = nir_channel(b, coord, c);
+            continue;
+         }
+         const bool up = m & BITFIELD_BIT(c);
+         comps[c] = up ? hi[c] : lo[c];
+         w = nir_fmul(b, w, up ? frac[c] : nir_fsub_imm(b, 1.0f, frac[c]));
+      }
+
+      nir_def *tap = nir_fmul(b, nearest_tap(b, tex, nir_vec(b, comps, tex->coord_components), key), w);
+      v = v ? nir_fadd(b, v, tap) : tap;
+   }
+
+   nir_def_replace(&tex->def, v);
+   return true;
 }
 
 /* RGBA16 UNORM (OpenCL) has no texture format: the texture unit samples it as
- * 16-bit unsigned integers with a nearest sampler (etna_compute_swap_textures)
- * and the shader converts. A linear sampler filters here, from the nearest
- * taps around the coordinate, which the texture unit wraps or clamps as the
- * sampler says. Runs after lower_unnormalized_coords(). */
+ * 16-bit unsigned integers and the shader converts. Linear samplers are
+ * lower_shader_linear()'s. */
 static bool
 lower_unorm16(nir_builder *b, nir_tex_instr *tex, void *data)
 {
@@ -714,47 +800,13 @@ lower_unorm16(nir_builder *b, nir_tex_instr *tex, void *data)
        tex->op != nir_texop_txd && tex->op != nir_texop_txf)
       return false;
 
+   /* linear samplers are lower_shader_linear()'s */
+   if (tex->op != nir_texop_txf && (key->tex_shader_linear & BITFIELD_BIT(i)))
+      return false;
+
    b->cursor = nir_after_instr(&tex->instr);
 
-   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   nir_def *v = NULL;
-
-   if (tex->op == nir_texop_txf || ci < 0 || !(key->tex_unorm16_linear & BITFIELD_BIT(i))) {
-      v = unorm16_tap(b, tex, NULL);
-   } else {
-      nir_def *coord = tex->src[ci].src.ssa;
-      const unsigned n = tex->coord_components - tex->is_array;
-      nir_def *size = nir_i2f32(b, nir_trim_vector(b, nir_load_texture_size_etna(b, 32, nir_imm_int(b, i)), n));
-      nir_def *lo[3], *hi[3], *frac[3];
-
-      for (unsigned c = 0; c < n; c++) {
-         nir_def *s = nir_channel(b, size, c);
-         nir_def *x = nir_fadd_imm(b, nir_fmul(b, nir_channel(b, coord, c), s), -0.5f);
-         nir_def *x0 = nir_ffloor(b, x);
-
-         frac[c] = nir_fsub(b, x, x0);
-         lo[c] = nir_fdiv(b, nir_fadd_imm(b, x0, 0.5f), s);
-         hi[c] = nir_fdiv(b, nir_fadd_imm(b, x0, 1.5f), s);
-      }
-
-      for (unsigned m = 0; m < (1u << n); m++) {
-         nir_def *comps[4];
-         nir_def *w = nir_imm_float(b, 1.0f);
-
-         for (unsigned c = 0; c < tex->coord_components; c++) {
-            if (c >= n) {
-               comps[c] = nir_channel(b, coord, c);
-               continue;
-            }
-            const bool up = m & BITFIELD_BIT(c);
-            comps[c] = up ? hi[c] : lo[c];
-            w = nir_fmul(b, w, up ? frac[c] : nir_fsub_imm(b, 1.0f, frac[c]));
-         }
-
-         nir_def *tap = nir_fmul(b, unorm16_tap(b, tex, nir_vec(b, comps, tex->coord_components)), w);
-         v = v ? nir_fadd(b, v, tap) : tap;
-      }
-   }
+   nir_def *v = nearest_tap(b, tex, NULL, key);
 
    nir_def_replace(&tex->def, v);
    return true;
@@ -919,6 +971,10 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
 
    if (key->tex_unnormalized)
       NIR_PASS(progress, s, nir_shader_tex_pass, lower_unnormalized_coords,
+               nir_metadata_control_flow, key);
+
+   if (key->tex_shader_linear)
+      NIR_PASS(progress, s, nir_shader_tex_pass, lower_shader_linear,
                nir_metadata_control_flow, key);
 
    if (key->tex_unorm8 | key->tex_snorm8)
