@@ -105,6 +105,10 @@ struct etna_shader_key
    /* compute-only contexts (OpenCL): array textures, whose layer the shader
     * rounds half to even (lower_layer_rint) */
    unsigned tex_layer_rint : 16;
+   /* compute: the workgroup size of the dispatch, for a kernel of variable
+    * workgroup size (OpenCL) with barriers that doesn't fit it unfolded: the
+    * variant is compiled for that size, and folded (etna_compile_shader()) */
+   uint16_t cs_block[3];
    unsigned sampler_companion[16];
 
    unsigned rt_is_128bit : ETNA_MAX_128BIT_RTS;
@@ -126,6 +130,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
        unlikely(a->tex_unorm16 || b->tex_unorm16) ||
        unlikely(a->tex_shader_linear || b->tex_shader_linear) ||
        unlikely(a->tex_layer_rint || b->tex_layer_rint) ||
+       unlikely(a->cs_block[0] || b->cs_block[0]) ||
        unlikely(a->rt_is_128bit || b->rt_is_128bit))
       return memcmp(a, b, sizeof(struct etna_shader_key)) == 0;
    else

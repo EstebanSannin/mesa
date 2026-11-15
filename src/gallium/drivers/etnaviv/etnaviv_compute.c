@@ -138,6 +138,18 @@ etna_delete_compute_state(struct pipe_context *pctx, void *cso)
    pctx->delete_fs_state(pctx, cso);
 }
 
+/* does a workgroup of n invocations fit with barrier(): invocations (per
+ * thread of a folded variant) x temporaries (in pairs) within
+ * etna_cs_barrier_capacity(), as etna_launch_grid() checks */
+static bool
+etna_cs_workgroup_fits(struct etna_context *ctx, const struct etna_shader_variant *v, unsigned n)
+{
+   const unsigned temps = align(MAX3(v->num_temps, MAX2(v->cs_input_count, 1),
+                                     ctx->compute_min_temps), 2);
+
+   return DIV_ROUND_UP(n, MAX2(v->cs_fold, 1)) * temps <= etna_cs_barrier_capacity(ctx->screen->info);
+}
+
 static void
 etna_get_compute_state_info(struct pipe_context *pctx, void *cso,
                             struct pipe_compute_state_object_info *info)
@@ -158,6 +170,25 @@ etna_get_compute_state_info(struct pipe_context *pctx, void *cso,
       const unsigned fit = etna_cs_barrier_capacity(screen->info) / temps;
 
       info->max_threads = MIN2(info->max_threads, MAX2(fit & ~3u, 4));
+
+      /* A kernel of variable workgroup size (OpenCL) gets a folded variant
+       * for a workgroup that doesn't fit (etna_launch_grid()): offer the
+       * largest power of two whose folded variant fits, as a row. A smaller
+       * workgroup takes a smaller fold factor, which needn't divide it. */
+      struct etna_shader *shader = cso;
+      if (shader->nir->info.workgroup_size_variable) {
+         for (unsigned n = screen->base.compute_caps.max_threads_per_block;
+              n > info->max_threads; n /= 2) {
+            struct etna_shader_key fkey = { .cs_block = { n, 1, 1 } };
+            struct etna_shader_variant *fv =
+               etna_shader_variant(cso, &fkey, &pctx->debug, true);
+
+            if (fv && fv->cs_fold > 1 && etna_cs_workgroup_fits(etna_context(pctx), fv, n)) {
+               info->max_threads = n;
+               break;
+            }
+         }
+      }
    }
 
    info->private_memory = v ? v->cs_private_size : 0;
@@ -411,6 +442,17 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    if (!v)
       goto out;
 
+   /* a kernel of variable workgroup size with barriers that doesn't fit this
+    * workgroup unfolded: a variant compiled for it, folded */
+   if (v->cs_uses_barrier && v->cs_fold <= 1 && shader->nir->info.workgroup_size_variable &&
+       !etna_cs_workgroup_fits(ctx, v, info->block[0] * info->block[1] * info->block[2])) {
+      for (unsigned i = 0; i < 3; i++)
+         key.cs_block[i] = info->block[i];
+      v = etna_shader_variant(shader, &key, &ctx->base.debug, true);
+      if (!v)
+         goto out;
+   }
+
    ctx->shader.cs = v;
 
    if (!etna_shader_upload_code(ctx, v) ||
@@ -511,10 +553,11 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    }
 
    const unsigned input_count = MAX2(v->cs_input_count, 1);
-   /* a folded variant runs the workgroup as a row of block / fold threads */
+   /* a folded variant runs the workgroup as a row of ceil(block / fold)
+    * threads */
    const unsigned fold = MAX2(v->cs_fold, 1);
    const unsigned hw_block[3] = {
-      fold > 1 ? info->block[0] * info->block[1] * info->block[2] / fold : info->block[0],
+      fold > 1 ? DIV_ROUND_UP(info->block[0] * info->block[1] * info->block[2], fold) : info->block[0],
       fold > 1 ? 1 : info->block[1],
       fold > 1 ? 1 : info->block[2],
    };

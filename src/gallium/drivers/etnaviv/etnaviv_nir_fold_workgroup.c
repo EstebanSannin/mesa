@@ -11,8 +11,8 @@
  * groups by running several invocations in one hardware thread (with its
  * #sh_swWorkGroupIndex / #sh_hwWorkGroupIndex / #sh_threadMemAddr uniforms).
  * This pass does the same: with a fold factor F, a workgroup of N invocations
- * is dispatched as N / F hardware threads, and every hardware thread h runs
- * the invocations h + k * N / F, k = 0..F-1.
+ * is dispatched as H = ceil(N / F) hardware threads, and every hardware thread
+ * h runs the invocations h + k * H, k = 0..F-1, that are below N.
  *
  * In OpenGL ES 3.1, barrier() only appears in main(), outside control flow.
  * The shader is then a sequence of segments separated by barriers. Each
@@ -338,7 +338,7 @@ etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
    st.n = st.size[0] * st.size[1] * st.size[2];
    *scratch_slots = 0;
 
-   if (s->info.workgroup_size_variable || fold < 2 || st.n % fold)
+   if (s->info.workgroup_size_variable || fold < 2 || fold > st.n)
       return false;
 
    NIR_PASS(_, s, nir_lower_returns);
@@ -418,8 +418,9 @@ etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
       retag_segments(&st);
    }
 
-   /* unroll every segment, one copy per invocation of the thread */
-   const unsigned hw = st.n / fold;
+   /* unroll every segment, one copy per invocation of the thread; when F
+    * doesn't divide N, the copies past the end of the workgroup are skipped */
+   const unsigned hw = DIV_ROUND_UP(st.n, fold);
 
    for (unsigned j = 0; j < st.num_segs; j++) {
       struct fold_seg *seg = &st.seg[j];
@@ -443,7 +444,13 @@ etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
          _mesa_hash_table_insert(remap, seg->lidx, nir_u2uN(&b, l, seg->lidx->bit_size));
          _mesa_hash_table_insert(remap, seg->gid, gid);
 
-         nir_cf_list_clone_and_reinsert(&list, &st.impl->cf_node, b.cursor, remap);
+         if ((k + 1) * hw > st.n) {
+            nir_if *nif = nir_push_if(&b, nir_ult_imm(&b, l, st.n));
+            nir_cf_list_clone_and_reinsert(&list, &nif->cf_node, b.cursor, remap);
+            nir_pop_if(&b, nif);
+         } else {
+            nir_cf_list_clone_and_reinsert(&list, &st.impl->cf_node, b.cursor, remap);
+         }
       }
 
       nir_cf_delete(&list);

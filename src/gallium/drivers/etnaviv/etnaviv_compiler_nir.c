@@ -2401,6 +2401,13 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    nir_shader *s = c->nir;
    const struct etna_specs *specs = c->specs;
 
+   /* a variant for the workgroup size of the dispatch (key cs_block) */
+   if (s->info.stage == MESA_SHADER_COMPUTE && v->key.cs_block[0]) {
+      for (unsigned i = 0; i < 3; i++)
+         s->info.workgroup_size[i] = v->key.cs_block[i];
+      s->info.workgroup_size_variable = false;
+   }
+
    v->stage = s->info.stage;
    v->uses_discard = s->info.fs.uses_discard;
    v->vs_id_in_reg = -1;
@@ -2708,7 +2715,7 @@ fits(const struct etna_shader_variant *v, unsigned invocations)
 {
    const unsigned temps = align(MAX2(v->num_temps, v->cs_input_count), 2);
 
-   return invocations / v->cs_fold * temps <= etna_cs_barrier_capacity(v->shader->info);
+   return DIV_ROUND_UP(invocations, v->cs_fold) * temps <= etna_cs_barrier_capacity(v->shader->info);
 }
 
 bool
@@ -2718,11 +2725,14 @@ etna_compile_shader(struct etna_shader_variant *v)
       return false;
 
    const struct shader_info *info = &v->shader->nir->info;
-   const unsigned n = info->workgroup_size[0] * info->workgroup_size[1] * info->workgroup_size[2];
+   /* a kernel of variable workgroup size is folded in a variant for the
+    * dispatch's size (key cs_block) */
+   const uint16_t *wg = v->key.cs_block[0] ? v->key.cs_block : info->workgroup_size;
+   const unsigned n = wg[0] * wg[1] * wg[2];
    const unsigned min_fold = info->stage == MESA_SHADER_COMPUTE ? debug_get_num_option("ETNA_CS_FOLD", 1) : 1;
 
    const bool foldable = info->stage == MESA_SHADER_COMPUTE && info->uses_control_barrier &&
-                         !info->workgroup_size_variable;
+                         (!info->workgroup_size_variable || v->key.cs_block[0]);
 
    if (!foldable || min_fold <= 1) {
       if (!compile_shader_spill(v, 1))
@@ -2731,14 +2741,37 @@ etna_compile_shader(struct etna_shader_variant *v)
          return true;
    }
 
-   /* at least 32 threads: the folded code grows with the fold factor, in
+   /* At least 32 threads: the folded code grows with the fold factor, in
     * size and in temporaries, and a 16-thread variant of 2600 instructions
-    * still hung under load */
-   for (unsigned fold = MAX2(min_fold, 2); fold <= n / 32; fold *= 2) {
-      if (n % fold)
+    * still hung under load. A fixed workgroup size (OpenGL ES) takes the
+    * powers of two that divide it.
+    * A variant for the workgroup size of a dispatch (key cs_block) has to
+    * run any size up to the one etna_get_compute_state_info() reports:
+    * any fold factor, from the estimate of the temporaries of the last
+    * compile, and down to 16 threads (a workgroup just above what fits
+    * unfolded folds by 2). */
+   const bool any_fold = v->key.cs_block[0] != 0;
+   const unsigned capacity = etna_cs_barrier_capacity(v->shader->info);
+   const unsigned min_threads = any_fold ? 16 : 32;
+   unsigned fold = MAX2(min_fold, 2);
+
+   if (any_fold && v->num_temps)
+      fold = MAX2(fold, DIV_ROUND_UP(n * align(MAX2(v->num_temps, v->cs_input_count), 2), capacity));
+
+   while (fold <= n / min_threads) {
+      if (!any_fold && n % fold)
          break;
-      if (compile_shader_spill(v, fold) && fits(v, n))
+
+      const bool compiled = compile_shader_spill(v, fold);
+      if (compiled && fits(v, n))
          return true;
+
+      if (!any_fold)
+         fold *= 2;
+      else if (!compiled)
+         break; /* more copies only make it larger */
+      else
+         fold = MAX2(fold + 1, DIV_ROUND_UP(n * align(MAX2(v->num_temps, v->cs_input_count), 2), capacity));
    }
 
    /* nothing fits: the dispatch refuses it, see etna_launch_grid() */
