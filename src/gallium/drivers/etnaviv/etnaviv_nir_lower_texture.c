@@ -573,10 +573,12 @@ is_int_coord(nir_def *coord, unsigned c)
 }
 
 /* Samplers with unnormalized coordinates (OpenCL) are in the key: the texture
- * unit takes normalized ones only, so divide by the base level size. An
- * integer coordinate (read_image*(image, sampler, int2)) names a texel: move
- * it to the texel centre first, so that nearest filtering cannot round it
- * down to the previous texel after the division. The array layer stays. */
+ * unit takes normalized ones only, so divide by the base level size. With
+ * nearest filtering the shader picks the texel, floor(x), and samples its
+ * centre: after the division the texture unit can round a coordinate on a
+ * texel edge (3.0 of 7) down to the previous texel, or -2^-30 up to texel 0
+ * instead of the border. An integer coordinate (read_image*(image, sampler,
+ * int2)) also moves to the texel centre. The array layer stays. */
 static bool
 lower_unnormalized_coords(nir_builder *b, nir_tex_instr *tex, void *data)
 {
@@ -601,11 +603,15 @@ lower_unnormalized_coords(nir_builder *b, nir_tex_instr *tex, void *data)
    nir_def *size = nir_i2f32(b, nir_trim_vector(b, nir_load_texture_size_etna(b, 32, nir_imm_int(b, i)), n));
    nir_def *comps[NIR_MAX_VEC_COMPONENTS];
 
+   const bool nearest = key->tex_nearest & BITFIELD_BIT(i);
+
    for (unsigned c = 0; c < tex->coord_components; c++) {
       comps[c] = nir_channel(b, coord, c);
       if (c >= n)
          continue;
-      if (is_int_coord(coord, c))
+      if (nearest)
+         comps[c] = nir_fadd_imm(b, nir_ffloor(b, comps[c]), 0.5f);
+      else if (is_int_coord(coord, c))
          comps[c] = nir_fadd_imm(b, comps[c], 0.5f);
       comps[c] = nir_fdiv(b, comps[c], nir_channel(b, size, c));
    }

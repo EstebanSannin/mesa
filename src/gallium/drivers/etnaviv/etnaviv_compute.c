@@ -338,6 +338,12 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          if (!sv)
             continue;
 
+         /* filters nearest (not a nearest copy of a linear sampler, RGBA16 UNORM) */
+         if (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
+             ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
+             !(ctx->cs_unorm16_linear & BITFIELD_BIT(i)))
+            key.tex_nearest |= BITFIELD_BIT(i);
+
          const struct util_format_description *desc = util_format_description(sv->format);
          if (desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB)
             continue;
@@ -346,10 +352,6 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
             key.tex_unorm8 |= BITFIELD_BIT(i);
          else if (util_format_is_snorm8(sv->format))
             key.tex_snorm8 |= BITFIELD_BIT(i);
-
-         if (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
-             ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST)
-            key.tex_nearest |= BITFIELD_BIT(i);
 
          if (sv->format == PIPE_FORMAT_R16G16B16A16_UNORM) {
             key.tex_unorm16 |= BITFIELD_BIT(i);
