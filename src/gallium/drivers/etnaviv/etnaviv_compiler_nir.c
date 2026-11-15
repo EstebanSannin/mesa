@@ -2209,12 +2209,34 @@ fold_narrow_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+/* the two operands of a global access for an OpenCL address: LOAD and STORE
+ * add them, so base + offset needs no add of its own (and no register for an
+ * offset of 0) */
+static void
+split_global_address(nir_builder *b, nir_def *addr, nir_def **base, nir_def **offset)
+{
+   nir_instr *instr = nir_def_instr(addr);
+   nir_alu_instr *alu = instr->type == nir_instr_type_alu ? nir_instr_as_alu(instr) : NULL;
+
+   if (alu && alu->op == nir_op_iadd && alu->def.num_components == 1) {
+      const bool const0 = nir_src_is_const(alu->src[0].src);
+      *base = nir_ssa_for_alu_src(b, alu, const0 ? 1 : 0);
+      *offset = nir_ssa_for_alu_src(b, alu, const0 ? 0 : 1);
+      return;
+   }
+
+   *base = addr;
+   *offset = nir_imm_int(b, 0);
+}
+
 /* SSBO access becomes address + offset: the address is a uniform the driver
  * fills with the GPU address of the bound buffer. OpenCL global access
- * (32-bit addresses) is the same with offset 0. */
+ * (32-bit addresses) is the same, the address split in two. */
 static bool
 lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 {
+   nir_def *base, *offset;
+
    nir_def *repl = NULL;
 
    b->cursor = nir_before_instr(&intr->instr);
@@ -2222,11 +2244,12 @@ lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    switch (intr->intrinsic) {
    case nir_intrinsic_load_global:
    case nir_intrinsic_load_global_constant:
-      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size,
-                                  intr->src[0].ssa, nir_imm_int(b, 0));
+      split_global_address(b, intr->src[0].ssa, &base, &offset);
+      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size, base, offset);
       break;
    case nir_intrinsic_store_global:
-      nir_store_global_etna(b, store_value32(b, intr->src[0].ssa), intr->src[1].ssa, nir_imm_int(b, 0),
+      split_global_address(b, intr->src[1].ssa, &base, &offset);
+      nir_store_global_etna(b, store_value32(b, intr->src[0].ssa), base, offset,
                             .write_mask = nir_intrinsic_write_mask(intr),
                             .src_type = store_type(intr->src[0].ssa));
       break;
