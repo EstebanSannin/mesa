@@ -159,6 +159,7 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_SSBO_SIZE,
    ETNA_UNIFORM_NUM_WORKGROUPS,
    ETNA_UNIFORM_WORKGROUP_SIZE,
+   ETNA_UNIFORM_BASE_WORKGROUP_ID,
    ETNA_UNIFORM_SHARED_ADDR,
    ETNA_UNIFORM_SHARED_SLICE,
    /* image parameters, in the order of the BASE of load_image_param_etna */

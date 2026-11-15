@@ -138,6 +138,9 @@ struct etna_shader_variant {
 
    /* compute: barrier() synchronizes the workgroup */
    bool cs_uses_barrier;
+   /* the code branches back: the cost estimate of a dispatch, see
+    * etna_compute_parts() */
+   bool cs_has_loops;
 
    /* compute: invocations run by each hardware thread (1, or the fold factor
     * of etna_nir_fold_workgroup()), and the scratch slots of 16 bytes per

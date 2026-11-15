@@ -356,6 +356,63 @@ etna_get_grid(struct etna_context *ctx, const struct pipe_grid_info *info,
    return grid[0] && grid[1] && grid[2];
 }
 
+/* The kernel's hang check kills a job when the GPU's front-end hasn't moved
+ * for a period of 500 ms (the first check of a job usually extends it once).
+ * A dispatch keeps the front-end waiting until it is done, so a dispatch of
+ * more than about a second is killed, with its results incomplete. The
+ * front-end moves on after each dispatch (the FE->PE stall in
+ * etna_launch_grid()), so a long grid goes out in parts of an estimated
+ * ETNA_CS_PART_MS each: whole Z slices, Y rows, or runs of X.
+ * The estimate: one instruction per cycle per shader core at ETNA_CS_MHZ,
+ * every instruction of the shader once per thread, 64 times when the shader
+ * has loops. ETNA_CS_PART sets the workgroups per part, for testing. */
+#define ETNA_CS_PART_MS 50
+#define ETNA_CS_MHZ 800
+/* at most this many parts, so that a dispatch fits into a command stream */
+#define ETNA_CS_MAX_PARTS 256
+/* command stream space a part takes at most: base workgroup uniforms, offset,
+ * counts, kick, flushes and stall */
+#define ETNA_CS_PART_DWORDS 48
+
+static unsigned
+etna_compute_parts(const struct etna_context *ctx, const struct etna_shader_variant *v,
+                   const struct pipe_grid_info *info, const uint32_t grid[3], uint32_t part[3])
+{
+   const unsigned fold = MAX2(v->cs_fold, 1);
+   const uint64_t threads = DIV_ROUND_UP(info->block[0] * info->block[1] * info->block[2], fold);
+   const uint64_t group_cost = threads * (v->code_size / 4) * (v->cs_has_loops ? 64 : 1);
+   const uint64_t budget = (uint64_t)ETNA_CS_PART_MS * ETNA_CS_MHZ * 1000 *
+                           ctx->screen->info->gpu.shader_core_count;
+   const uint64_t row = grid[0], slice = (uint64_t)grid[0] * grid[1];
+   uint64_t max = debug_get_num_option("ETNA_CS_PART", 0);
+   unsigned parts;
+
+   if (!max)
+      max = MAX2(budget / MAX2(group_cost, 1), 1);
+
+   for (;;) {
+      if (max >= slice) {
+         part[0] = grid[0];
+         part[1] = grid[1];
+         part[2] = MIN2(grid[2], max / slice);
+      } else if (max >= row) {
+         part[0] = grid[0];
+         part[1] = max / row;
+         part[2] = 1;
+      } else {
+         part[0] = max;
+         part[1] = 1;
+         part[2] = 1;
+      }
+
+      parts = DIV_ROUND_UP(grid[0], part[0]) * DIV_ROUND_UP(grid[1], part[1]) *
+              DIV_ROUND_UP(grid[2], part[2]);
+      if (parts <= ETNA_CS_MAX_PARTS)
+         return parts;
+      max *= 2;
+   }
+}
+
 static void
 etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 {
@@ -454,6 +511,15 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    }
 
    ctx->shader.cs = v;
+
+   uint32_t part[3];
+   const unsigned parts = etna_compute_parts(ctx, v, info, grid, part);
+
+   /* A forced flush of a full command stream must not cut the dispatch: make
+    * room for it now, before any of its state and resources. The stream holds
+    * 0x4000 dwords at most. */
+   if (stream->offset + 1024 + v->uniforms.count + parts * ETNA_CS_PART_DWORDS > 0x4000 - 2)
+      etna_cmd_stream_force_flush(stream);
 
    if (!etna_shader_upload_code(ctx, v) ||
        !etna_shader_upload_constant_data(ctx, v)) {
@@ -669,16 +735,34 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
                   VIVS_CL_CONFIG_DIMENSIONS(3) | VIVS_CL_CONFIG_VALUE_ORDER(3));
    etna_set_state(stream, VIVS_CL_UNK00924, ctx->compute_unk924);
    etna_set_state(stream, VIVS_CL_THREAD_ALLOCATION, thread_alloc);
-   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_X, 0);
-   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_Y, 0);
-   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_Z, 0);
    etna_set_state(stream, VIVS_CL_GLOBAL_SCALE_X, 1);
    etna_set_state(stream, VIVS_CL_GLOBAL_SCALE_Y, 1);
    etna_set_state(stream, VIVS_CL_GLOBAL_SCALE_Z, 1);
 
+   /* the uniforms of the first workgroup of a part (etna_compute_parts()) */
+   const uint32_t uniform_base = ctx->screen->specs.ps_uniforms_offset;
+
+   for (uint32_t z0 = 0; z0 < grid[2]; z0 += part[2]) {
+   for (uint32_t y0 = 0; y0 < grid[1]; y0 += part[1]) {
+   for (uint32_t x0 = 0; x0 < grid[0]; x0 += part[0]) {
+   const uint32_t first[3] = { x0, y0, z0 };
+
+   /* the hardware offsets the global ID, the shader the workgroup ID */
+   if (parts > 1) {
+      for (unsigned i = 0; i < v->uniforms.count; i++) {
+         if (v->uniforms.contents[i] == ETNA_UNIFORM_BASE_WORKGROUP_ID)
+            etna_set_state(stream, uniform_base + i * 4, first[v->uniforms.data[i]]);
+      }
+   }
+   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_X, x0 * hw_block[0]);
+   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_Y, y0 * hw_block[1]);
+   etna_set_state(stream, VIVS_CL_GLOBAL_WORK_OFFSET_Z, z0 * hw_block[2]);
+
    /* CL_WORKGROUP_COUNT_{X,Y,Z} and CL_WORKGROUP_SIZE_{X,Y,Z}, minus one */
    const uint32_t groups[6] = {
-      grid[0] - 1, grid[1] - 1, grid[2] - 1,
+      MIN2(part[0], grid[0] - x0) - 1,
+      MIN2(part[1], grid[1] - y0) - 1,
+      MIN2(part[2], grid[2] - z0) - 1,
       (hw_block[0] - 1) & 0x3ff,
       (hw_block[1] - 1) & 0x3ff,
       (hw_block[2] - 1) & 0x3ff,
@@ -698,6 +782,9 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    if (!VIV_FEATURE(ctx->screen, ETNA_FEATURE_BLT_ENGINE))
       etna_set_state(stream, VIVS_TS_FLUSH_CACHE, VIVS_TS_FLUSH_CACHE_FLUSH);
    etna_stall(stream, SYNC_RECIPIENT_FE, SYNC_RECIPIENT_PE);
+   }
+   }
+   }
 
    /* the linear base is now the newest copy of written images */
    u_foreach_bit(i, images->enabled_mask) {

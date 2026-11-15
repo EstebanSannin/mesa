@@ -1385,6 +1385,10 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
                for (unsigned i = 0; i < intr->def.num_components; i++)
                   value[i] = CONST_VAL(ETNA_UNIFORM_NUM_WORKGROUPS, i);
                break;
+            case nir_intrinsic_load_base_workgroup_id:
+               for (unsigned i = 0; i < intr->def.num_components; i++)
+                  value[i] = CONST_VAL(ETNA_UNIFORM_BASE_WORKGROUP_ID, i);
+               break;
             case nir_intrinsic_get_ssbo_size:
                value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_SIZE, nir_src_as_uint(intr->src[0]));
                break;
@@ -1663,7 +1667,10 @@ lower_cs_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       val = load_cs_input(b, 1, input_count);
       break;
    case nir_intrinsic_load_workgroup_id:
-      val = load_cs_input(b, 2, input_count);
+      /* the hardware counts the workgroups of each dispatch from 0, and
+       * etna_launch_grid() may dispatch a grid in parts: the first workgroup
+       * of the part is a uniform */
+      val = nir_iadd(b, load_cs_input(b, 2, input_count), nir_load_base_workgroup_id(b, 32));
       break;
    case nir_intrinsic_load_local_invocation_index: {
       nir_def *id = load_cs_input(b, 1, input_count);
@@ -2653,10 +2660,13 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    /* assemble instructions, fixing up labels */
    const bool has_no_oneconst_limit = etna_core_has_feature(c->info, ETNA_FEATURE_SH_NO_ONECONST_LIMIT);
    uint32_t *code = MALLOC(c->inst_ptr * 16);
+   v->cs_has_loops = false;
    for (unsigned i = 0; i < c->inst_ptr; i++) {
       struct etna_inst *inst = &c->code[i];
-      if (inst->opcode == ISA_OPC_BRANCH || inst->opcode == ISA_OPC_BRANCH_UNARY || inst->opcode == ISA_OPC_BRANCH_BINARY)
+      if (inst->opcode == ISA_OPC_BRANCH || inst->opcode == ISA_OPC_BRANCH_UNARY || inst->opcode == ISA_OPC_BRANCH_BINARY) {
          inst->imm = block_ptr[inst->imm];
+         v->cs_has_loops |= inst->imm <= i;
+      }
 
       etna_assemble(&code[i * 4], inst, has_no_oneconst_limit);
    }

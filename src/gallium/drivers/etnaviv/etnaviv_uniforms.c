@@ -327,6 +327,12 @@ etna_uniforms_write(const struct etna_context *ctx,
          etna_cmd_stream_emit(stream, ctx->compute_block[val]);
          break;
 
+      case ETNA_UNIFORM_BASE_WORKGROUP_ID:
+         /* the first part of a dispatch; etna_launch_grid() writes the
+          * others' */
+         etna_cmd_stream_emit(stream, 0);
+         break;
+
       case ETNA_UNIFORM_SHARED_SLICE:
          etna_cmd_stream_emit(stream, ctx->compute_shared_slice);
          break;
