@@ -307,6 +307,24 @@ tag_segments(struct fold_state *st)
    return true;
 }
 
+/* tag every instruction with the segment of its position: value_in() and
+ * save_value() add instructions that are not tagged yet (0), and a later
+ * segment must not take one of them for a value of segment 0 */
+static void
+retag_segments(struct fold_state *st)
+{
+   unsigned seg = 0;
+
+   nir_foreach_block(block, st->impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->pass_flags != SEG_NONE)
+            instr->pass_flags = seg;
+         else if (is_cs_barrier(instr))
+            seg++;
+      }
+   }
+}
+
 bool
 etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
 {
@@ -396,6 +414,8 @@ etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
             break;
          instr = nir_block_first_instr(blk);
       }
+
+      retag_segments(&st);
    }
 
    /* unroll every segment, one copy per invocation of the thread */
