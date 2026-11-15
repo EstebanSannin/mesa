@@ -1948,6 +1948,10 @@ etna_lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
    const nir_alu_instr *alu = nir_instr_as_alu(instr);
    unsigned size = alu->def.bit_size;
 
+   /* conversions have sized types: fold_narrow_conversion() handles them */
+   if (nir_op_infos[alu->op].is_conversion)
+      return 0;
+
    for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
       if (alu->src[i].src.ssa->bit_size != 1)
          size = MIN2(size == 1 ? 32 : size, alu->src[i].src.ssa->bit_size);
@@ -1962,6 +1966,50 @@ static bool
 fold_narrow_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
 {
    bool sign, to_float;
+
+   /* f2u8(x) of a 32-bit float is u2u8(f2u32(x)), b2i8(x) is u2u8(b2i32(x)),
+    * u2u16(x) of an 8-bit x is u2u16(u2u32(x)): split them, so that only the
+    * narrowing of a 32-bit integer is left, folded below into its widening
+    * user */
+   if (alu->def.bit_size == 8 || alu->def.bit_size == 16) {
+      const unsigned src_size = alu->src[0].src.ssa->bit_size;
+      nir_def *wide = NULL;
+
+      b->cursor = nir_before_instr(&alu->instr);
+      switch (alu->op) {
+      case nir_op_f2u8:
+      case nir_op_f2u16:
+         if (src_size == 32)
+            wide = nir_f2u32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_f2i8:
+      case nir_op_f2i16:
+         if (src_size == 32)
+            wide = nir_f2i32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_b2i8:
+      case nir_op_b2i16:
+         wide = nir_b2i32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_u2u8:
+      case nir_op_u2u16:
+         if (src_size == 8 || src_size == 16)
+            wide = nir_u2u32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_i2i8:
+      case nir_op_i2i16:
+         if (src_size == 8 || src_size == 16)
+            wide = nir_i2i32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      default:
+         break;
+      }
+
+      if (wide) {
+         nir_def_replace(&alu->def, nir_u2uN(b, wide, alu->def.bit_size));
+         return true;
+      }
+   }
 
    switch (alu->op) {
    case nir_op_u2u32: sign = false; to_float = false; break;
@@ -2216,10 +2264,12 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
                   nir_var_mem_shared | nir_var_mem_ssbo,
          .may_lower_unaligned_stores_to_atomics = true,
       };
-      if (OPT(s, nir_lower_mem_access_bit_sizes, &mem_opts)) {
-         NIR_PASS(_, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
-         NIR_PASS(_, s, nir_shader_alu_pass, fold_narrow_conversion,
-                  nir_metadata_control_flow, NULL);
+      bool narrow = false;
+      NIR_PASS(narrow, s, nir_lower_mem_access_bit_sizes, &mem_opts);
+      NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
+      NIR_PASS(narrow, s, nir_shader_alu_pass, fold_narrow_conversion,
+               nir_metadata_control_flow, NULL);
+      if (narrow) {
          NIR_PASS(_, s, nir_opt_constant_folding);
          NIR_PASS(_, s, nir_opt_algebraic);
          NIR_PASS(_, s, nir_opt_dce);
@@ -2329,7 +2379,19 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, s, nir_opt_algebraic_late);
-   NIR_PASS(_, s, nir_shader_alu_pass, fold_narrow_conversion, nir_metadata_control_flow, NULL);
+
+   /* private arrays of 8- and 16-bit values (OpenCL) only reach SSA in the
+    * optimization loop: lower the narrow values left, as in compile_shader() */
+   for (unsigned i = 0; i < 8; i++) {
+      bool narrow = false;
+      NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
+      NIR_PASS(narrow, s, nir_shader_alu_pass, fold_narrow_conversion, nir_metadata_control_flow, NULL);
+      if (!narrow)
+         break;
+      NIR_PASS(_, s, nir_opt_constant_folding);
+      NIR_PASS(_, s, nir_opt_copy_prop);
+      NIR_PASS(_, s, nir_opt_dce);
+   }
 
    NIR_PASS(_, s, nir_move_vec_src_uses_to_dest, false);
    NIR_PASS(_, s, nir_opt_copy_prop);
