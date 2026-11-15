@@ -2288,6 +2288,10 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
     */
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_shader_in, NULL);
 
+   /* lower_flrp32 only tells the frontend to run nir_lower_flrp(), which
+    * rusticl doesn't (OpenCL mix()): the backend has no flrp */
+   NIR_PASS(_, s, nir_lower_flrp, 16 | 32 | 64, false);
+
    if (s->info.stage == MESA_SHADER_COMPUTE) {
       v->uses_discard = false;
       v->cs_fold = 1;
