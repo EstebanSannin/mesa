@@ -1883,6 +1883,9 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       };
       if (dim == GLSL_SAMPLER_DIM_CUBE && array)
          size[2] = nir_udiv_imm(b, size[2], 6);
+      /* a 1D array has its layers second */
+      if (dim == GLSL_SAMPLER_DIM_1D && array)
+         size[1] = size[2];
       nir_def_replace(&intr->def, nir_vec(b, size, intr->def.num_components));
       return true;
    }

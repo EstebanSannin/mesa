@@ -17,7 +17,11 @@ lower_txs(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
    nir_def *idx = nir_imm_int(b, tex->texture_index);
    nir_def *sizes = nir_load_texture_size_etna(b, 32, idx);
 
-   nir_def_rewrite_uses(&tex->def, sizes);
+   /* width, height, depth or layers: a 1D array has its layers second */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_1D && tex->is_array)
+      sizes = nir_vec2(b, nir_channel(b, sizes, 0), nir_channel(b, sizes, 2));
+
+   nir_def_rewrite_uses(&tex->def, nir_trim_vector(b, sizes, tex->def.num_components));
 
    return true;
 }
@@ -643,6 +647,32 @@ snap_norm8(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/* A 1D texture is a 2D texture of one row (etna_create_sampler_view_desc(),
+ * with the V wrap mode REPEAT), but the coordinate has x only: a fetch took an
+ * undefined y. Give 1D (not array) texture instructions y = 0. */
+static bool
+lower_1d_coords(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+{
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_1D || tex->is_array || tex->op == nir_texop_txs ||
+       tex->op == nir_texop_query_levels || tex->op == nir_texop_lod)
+      return false;
+
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (ci < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *coord = tex->src[ci].src.ssa;
+   nir_def *zero = tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms ?
+                   nir_imm_int(b, 0) : nir_imm_float(b, 0.0f);
+
+   nir_src_rewrite(&tex->src[ci].src, nir_vec2(b, nir_channel(b, coord, 0), zero));
+   tex->coord_components = 2;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   return true;
+}
+
 /* one nearest tap of an RGBA16 UNORM texture: the texel as 16-bit unsigned
  * integers, converted to float. coord NULL keeps the instruction's. */
 static nir_def *
@@ -892,6 +922,9 @@ etna_nir_lower_texture(nir_shader *s, struct etna_shader_key *key, const struct 
    if (key->tex_unorm16)
       NIR_PASS(progress, s, nir_shader_tex_pass, lower_unorm16,
                nir_metadata_control_flow, key);
+
+   NIR_PASS(progress, s, nir_shader_tex_pass, lower_1d_coords,
+            nir_metadata_control_flow, NULL);
 
    if (key->tex_float_border_s | key->tex_float_border_t)
       NIR_PASS(progress, s, nir_shader_tex_pass, lower_float_border_tex,
