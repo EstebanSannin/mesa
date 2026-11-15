@@ -177,7 +177,7 @@ etna_buffer_image_texel(enum pipe_format format)
 }
 
 static uint32_t
-etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout)
+etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout, bool read_only)
 {
    unsigned log2_bpp, cls, type, comps;
 
@@ -200,6 +200,11 @@ etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout)
    default:
       return 0;
    }
+
+   /* NXP's OpenCL reads normalized images with class 3 (exact conversion,
+    * where class 1 gave UNORM8 values slightly off), and writes with 0 */
+   if (read_only && (type == 12 || type == 14 || type == 15))
+      cls = 3;
 
    static const uint32_t swizzle[] = { 0, 0x5440, 0x5410, 0x5210, 0x3210 };
 
@@ -406,7 +411,8 @@ etna_uniforms_write(const struct etna_context *ctx,
             } else {
                const uint32_t v[4] = {
                   0, width * bpp, 1 << 16 | width,
-                  etna_image_format_word(img->format, ETNA_LAYOUT_LINEAR),
+                  etna_image_format_word(img->format, ETNA_LAYOUT_LINEAR,
+                                         !(img->access & PIPE_IMAGE_ACCESS_WRITE)),
                };
                etna_cmd_stream_emit(stream, v[word & 3]);
             }
@@ -430,7 +436,7 @@ etna_uniforms_write(const struct etna_context *ctx,
             0,
             lev->stride,
             lev->height << 16 | lev->width,
-            etna_image_format_word(img->format, rsc->layout),
+            etna_image_format_word(img->format, rsc->layout, !(img->access & PIPE_IMAGE_ACCESS_WRITE)),
          };
 
          etna_cmd_stream_emit(stream, v[word & 3]);
