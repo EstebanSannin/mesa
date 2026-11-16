@@ -903,12 +903,15 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
       break;
    case nir_intrinsic_load_global_etna: {
       unsigned dst_swiz;
+      const unsigned shift = nir_intrinsic_offset_shift(intr);
+      /* LEFT_SHIFT applies to the second operand: the base goes first then */
       emit_inst(c, &(struct etna_inst) {
          .opcode = ISA_OPC_LOAD,
          .type = ISA_TYPE_U32,
+         .left_shift = shift,
          .dst = ra_def(c, &intr->def, &dst_swiz),
-         .src[0] = get_src(c, &intr->src[1]),
-         .src[1] = get_src(c, &intr->src[0]),
+         .src[0] = get_src(c, &intr->src[shift ? 0 : 1]),
+         .src[1] = get_src(c, &intr->src[shift ? 1 : 0]),
       });
    } break;
    case nir_intrinsic_store_global_etna:
@@ -917,6 +920,7 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
          .type = nir_intrinsic_src_type(intr) == nir_type_uint8 ? ISA_TYPE_U8 :
                  nir_intrinsic_src_type(intr) == nir_type_uint16 ? ISA_TYPE_U16 : ISA_TYPE_U32,
          .denorm = 1,
+         .left_shift = nir_intrinsic_offset_shift(intr),
          .dst = {
             .write_mask = nir_intrinsic_write_mask(intr),
          },
@@ -2263,6 +2267,63 @@ split_global_address(nir_builder *b, nir_def *addr, nir_def **base, nir_def **of
    *offset = nir_imm_int(b, 0);
 }
 
+/* LOAD and STORE shift their second address operand left by up to 7 bits
+ * (LEFT_SHIFT) before they add it to the first, so an offset that is an index
+ * scaled by a power of two needs no shift or multiply of its own: the index
+ * goes in as the offset, the scale as OFFSET_SHIFT. One instruction less for
+ * every indexed access (NXP's compiler emits load.ls2, store.ls6, ...). */
+static bool
+fold_offset_shift(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   unsigned off;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global_etna:
+      off = 1;
+      break;
+   case nir_intrinsic_store_global_etna:
+      off = 2;
+      break;
+   default:
+      return false;
+   }
+
+   if (nir_intrinsic_offset_shift(intr))
+      return false;
+
+   nir_scalar s = nir_scalar_resolved(intr->src[off].ssa, 0);
+   if (!nir_scalar_is_alu(s))
+      return false;
+
+   nir_op op = nir_scalar_alu_op(s);
+   nir_scalar src0 = nir_scalar_chase_alu_src(s, 0);
+   nir_scalar src1 = nir_scalar_chase_alu_src(s, 1);
+   nir_scalar index;
+   uint64_t shift;
+
+   if (op == nir_op_ishl && nir_scalar_is_const(src1)) {
+      index = src0;
+      shift = nir_scalar_as_uint(src1) & 31;
+   } else if (op == nir_op_imul && (nir_scalar_is_const(src0) || nir_scalar_is_const(src1))) {
+      const bool c0 = nir_scalar_is_const(src0);
+      const uint64_t scale = nir_scalar_as_uint(c0 ? src0 : src1);
+      if (!util_is_power_of_two_nonzero64(scale))
+         return false;
+      index = c0 ? src1 : src0;
+      shift = util_logbase2_64(scale);
+   } else {
+      return false;
+   }
+
+   if (shift == 0 || shift > 7)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[off], nir_channel(b, index.def, index.comp));
+   nir_intrinsic_set_offset_shift(intr, shift);
+   return true;
+}
+
 /* SSBO access becomes address + offset: the address is a uniform the driver
  * fills with the GPU address of the bound buffer. OpenCL global access
  * (32-bit addresses) is the same, the address split in two. */
@@ -2636,6 +2697,11 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    /* the late rules fuse iadd(imul) into an imad as wide as the iadd, and
     * IMADLO0 is scalar: split it again */
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
+
+   bool folded = false;
+   NIR_PASS(folded, s, nir_shader_intrinsics_pass, fold_offset_shift, nir_metadata_control_flow, NULL);
+   if (folded)
+      NIR_PASS(_, s, nir_opt_dce);
 
    /* private arrays of 8- and 16-bit values (OpenCL) only reach SSA in the
     * optimization loop: lower the narrow values left, as in compile_shader() */

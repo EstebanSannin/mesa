@@ -1694,9 +1694,9 @@ load("shared_ir3", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 # src[] = { value, address, 32-bit offset }.
 # src_type: the type stored, nir_type_uint8/16 for a narrow store of a 32-bit
 # value (0: 32 bits).
-store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET, SRC_TYPE])
+store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET, SRC_TYPE, OFFSET_SHIFT])
 # src[] = { address, 32-bit offset }.
-load("global_etna", [1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+load("global_etna", [1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET, OFFSET_SHIFT], [CAN_ELIMINATE])
 # Atomics on the same address + offset form. src[] = { address, 32-bit offset, data }.
 intrinsic("global_atomic_etna", src_comp=[1, 1, 1], dest_comp=1, indices=[ATOMIC_OP])
 # Compare-and-swap takes the new and the compared value as one vec2.
