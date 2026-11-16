@@ -47,6 +47,8 @@ etna_compiler_create(const struct etna_core_info *info)
       .float_mul_add32 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
       .float_mul_add64 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
       .lower_mul_high = true,
+      /* IMADLO0: a * b + c in one instruction, where IMULLO0 and ADD take two */
+      .has_imad32 = true,
       .lower_hadd = true,
       .lower_uadd_sat = true,
       .lower_usub_sat = true,

@@ -68,6 +68,7 @@ etna_alu_to_scalar_filter_cb(const nir_instr *instr, const void *data)
    case nir_op_fsin:
    case nir_op_fdiv:
    case nir_op_imul:
+   case nir_op_imad:
       return true;
    /* TODO: can do better than alu_to_scalar for vector compares */
    case nir_op_b32all_fequal2:
@@ -2632,6 +2633,9 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, s, nir_opt_algebraic_late);
+   /* the late rules fuse iadd(imul) into an imad as wide as the iadd, and
+    * IMADLO0 is scalar: split it again */
+   NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
 
    /* private arrays of 8- and 16-bit values (OpenCL) only reach SSA in the
     * optimization loop: lower the narrow values left, as in compile_shader() */
