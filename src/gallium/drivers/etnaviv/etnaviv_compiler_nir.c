@@ -2488,6 +2488,26 @@ alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
    return 4;
 }
 
+/* An intrinsic takes a scalar operand as a whole value, so a vector op that
+ * only computes addresses (loads and stores of single components) needs a mov
+ * per component back out of the vector: keep those scalar */
+static uint8_t
+etna_vectorize_cb(const nir_instr *instr, UNUSED const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return 4;
+
+   const nir_def *def = &nir_instr_as_alu((nir_instr *)instr)->def;
+   bool any = false;
+
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_intrinsic)
+         return 4;
+      any = true;
+   }
+   return any ? 1 : 4;
+}
+
 /* registers have four components: a wider phi (an OpenCL float8 carried
  * around a loop that isn't unrolled) is split into phis of four */
 static uint8_t
@@ -2756,7 +2776,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       NIR_PASS(_, s, nir_lower_bool_to_int32);
    }
 
-   while( OPT(s, nir_opt_vectorize, NULL, NULL) );
+   while( OPT(s, nir_opt_vectorize, etna_vectorize_cb, NULL) );
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
 
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
