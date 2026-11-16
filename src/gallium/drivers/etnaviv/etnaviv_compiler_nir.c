@@ -903,15 +903,16 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
       break;
    case nir_intrinsic_load_global_etna: {
       unsigned dst_swiz;
-      const unsigned shift = nir_intrinsic_offset_shift(intr);
-      /* LEFT_SHIFT applies to the second operand: the base goes first then */
+      const nir_alu_type type = nir_intrinsic_dest_type(intr);
+      /* the base first, as NXP's compiler: LEFT_SHIFT applies to the second
+       * operand, which can also be an immediate */
       emit_inst(c, &(struct etna_inst) {
          .opcode = ISA_OPC_LOAD,
-         .type = ISA_TYPE_U32,
-         .left_shift = shift,
+         .type = type == nir_type_uint8 ? ISA_TYPE_U8 : type == nir_type_uint16 ? ISA_TYPE_U16 : ISA_TYPE_U32,
+         .left_shift = nir_intrinsic_offset_shift(intr),
          .dst = ra_def(c, &intr->def, &dst_swiz),
-         .src[0] = get_src(c, &intr->src[shift ? 0 : 1]),
-         .src[1] = get_src(c, &intr->src[shift ? 1 : 0]),
+         .src[0] = get_src(c, &intr->src[0]),
+         .src[1] = get_src(c, &intr->src[1]),
       });
    } break;
    case nir_intrinsic_store_global_etna:
@@ -2117,6 +2118,18 @@ etna_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_s
    /* STORE.u8 / STORE.u16 write one narrow value: no atomics for a store
     * that isn't whole 32-bit words */
    const uint32_t align = nir_combined_align(align_mul, align_offset);
+
+   /* LOAD.u8 / LOAD.u16 read one narrow value, zero-extended: no word
+    * load and extraction for one that isn't whole 32-bit words */
+   if ((intrin == nir_intrinsic_load_global || intrin == nir_intrinsic_load_global_constant) &&
+       bit_size < 32 && align >= bit_size / 8 && (align < 4 || bytes % 4)) {
+      return (nir_mem_access_size_align){
+         .num_components = 1,
+         .bit_size = bit_size,
+         .align = bit_size / 8,
+         .shift = nir_mem_access_shift_method_scalar,
+      };
+   }
    if ((intrin == nir_intrinsic_store_global || intrin == nir_intrinsic_store_shared) &&
        bit_size < 32 && align >= bit_size / 8 && (align < 4 || bytes % 4)) {
       return (nir_mem_access_size_align){
@@ -2234,6 +2247,18 @@ fold_narrow_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    const unsigned bits = narrow->def.bit_size;
    b->cursor = nir_before_instr(&alu->instr);
 
+   /* a value LOAD.u8/u16 zero-extended is its own unsigned widening */
+   nir_def *src32 = narrow->src[0].src.ssa;
+   if (!sign && !to_float && nir_def_is_intrinsic(src32)) {
+      nir_intrinsic_instr *ld = nir_def_as_intrinsic(src32);
+      if (ld->intrinsic == nir_intrinsic_load_global_etna &&
+          nir_alu_type_get_type_size(nir_intrinsic_dest_type(ld)) == bits &&
+          (narrow->op == nir_op_u2u8 || narrow->op == nir_op_u2u16)) {
+         nir_def_replace(&alu->def, src32);
+         return true;
+      }
+   }
+
    unsigned swiz[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < alu->def.num_components; i++)
       swiz[i] = alu->src[0].swizzle[i];
@@ -2340,7 +2365,16 @@ lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    case nir_intrinsic_load_global:
    case nir_intrinsic_load_global_constant:
       split_global_address(b, intr->src[0].ssa, &base, &offset);
-      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size, base, offset);
+      if (intr->def.bit_size == 8 || intr->def.bit_size == 16) {
+         /* LOAD.u8/u16 zero-extends into the 32-bit register */
+         assert(intr->def.num_components == 1);
+         repl = nir_u2uN(b, nir_load_global_etna(b, 1, 32, base, offset,
+                                                 .dest_type = intr->def.bit_size == 8 ? nir_type_uint8
+                                                                                      : nir_type_uint16),
+                         intr->def.bit_size);
+      } else {
+         repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size, base, offset);
+      }
       break;
    case nir_intrinsic_store_global:
       split_global_address(b, intr->src[1].ssa, &base, &offset);
