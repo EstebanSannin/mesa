@@ -2349,6 +2349,38 @@ fold_offset_shift(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    return true;
 }
 
+/* STORE.u8/u16 writes the low byte or half of its value: a mask of the
+ * value that keeps those bits (the widening of an 8- or 16-bit value) is
+ * not needed */
+static bool
+drop_narrow_store_mask(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_global_etna)
+      return false;
+
+   const unsigned bits = nir_alu_type_get_type_size(nir_intrinsic_src_type(intr));
+   if ((bits != 8 && bits != 16) || intr->src[0].ssa->num_components != 1)
+      return false;
+
+   nir_scalar v = nir_scalar_resolved(intr->src[0].ssa, 0);
+   if (!nir_scalar_is_alu(v) || nir_scalar_alu_op(v) != nir_op_iand)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar m = nir_scalar_chase_alu_src(v, i);
+      if (!nir_scalar_is_const(m))
+         continue;
+      const uint32_t keep = BITFIELD_MASK(bits);
+      if ((nir_scalar_as_uint(m) & keep) != keep)
+         continue;
+      nir_scalar x = nir_scalar_chase_alu_src(v, 1 - i);
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_src_rewrite(&intr->src[0], nir_channel(b, x.def, x.comp));
+      return true;
+   }
+   return false;
+}
+
 /* SSBO access becomes address + offset: the address is a uniform the driver
  * fills with the GPU address of the bound buffer. OpenCL global access
  * (32-bit addresses) is the same, the address split in two. */
@@ -2735,6 +2767,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    bool folded = false;
    NIR_PASS(folded, s, nir_shader_intrinsics_pass, fold_offset_shift, nir_metadata_control_flow, NULL);
+   NIR_PASS(folded, s, nir_shader_intrinsics_pass, drop_narrow_store_mask, nir_metadata_control_flow, NULL);
    if (folded)
       NIR_PASS(_, s, nir_opt_dce);
 
