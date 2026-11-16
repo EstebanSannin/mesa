@@ -40,6 +40,8 @@ etna_compiler_create(const struct etna_core_info *info)
       .has_texture_scaling = true,
       .lower_fpow = true,
       .lower_fround_even = true,
+      /* no instruction for it (OpenCL isnormal()) */
+      .lower_fisnormal = true,
       .lower_ftrunc = true,
       .float_mul_add16 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
       .float_mul_add32 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
