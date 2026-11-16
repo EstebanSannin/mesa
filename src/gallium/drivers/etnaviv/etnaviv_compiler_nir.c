@@ -2156,6 +2156,18 @@ etna_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_s
    };
 }
 
+/* adjacent 32-bit accesses become one access of up to four components: LOAD
+ * and STORE take any 4-byte aligned address */
+static bool
+etna_vectorize_mem_cb(unsigned align_mul, unsigned align_offset, unsigned bit_size,
+                      unsigned num_components, int64_t hole_size,
+                      nir_intrinsic_instr *low, nir_intrinsic_instr *high, void *data)
+{
+   if (hole_size > 0 || bit_size != 32 || num_components > 4)
+      return false;
+   return nir_combined_align(align_mul, align_offset) >= 4;
+}
+
 /* no 8- or 16-bit arithmetic: do it in 32 bits */
 static unsigned
 etna_lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
@@ -2665,6 +2677,19 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       if (v->cs_private_size)
          NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_private_access,
                   nir_metadata_control_flow, &v->cs_private_size);
+
+      {
+         const nir_load_store_vectorize_options lsv_opts = {
+            .callback = etna_vectorize_mem_cb,
+            .modes = nir_var_mem_global | nir_var_mem_shared,
+         };
+         bool vec = false;
+         NIR_PASS(vec, s, nir_opt_load_store_vectorize, &lsv_opts);
+         if (vec) {
+            NIR_PASS(_, s, nir_opt_copy_prop);
+            NIR_PASS(_, s, nir_opt_dce);
+         }
+      }
 
       bool narrow = false;
       NIR_PASS(narrow, s, nir_lower_mem_access_bit_sizes, &mem_opts);
