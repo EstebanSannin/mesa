@@ -1643,6 +1643,32 @@ fill_vs_mystery(struct etna_shader_variant *v)
                              VIVS_VS_LOAD_BALANCING_D(0x0f);
 }
 
+/* NIR's fmin and fmax return the other operand for a NaN one (minNum and
+ * maxNum) when they preserve NaNs, as OpenCL's do. A SELECT with a
+ * comparison, as they are emitted, does that for a NaN second operand but
+ * returns a NaN first one: test the first one before. */
+static bool
+lower_fminmax_nan(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if ((alu->op != nir_op_fmin && alu->op != nir_op_fmax) ||
+       !nir_alu_instr_is_nan_preserve(alu) || alu->def.bit_size != 32)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
+
+   const unsigned save_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl = 0;
+   nir_def *sel = alu->op == nir_op_fmax ? nir_fmax(b, x, y) : nir_fmin(b, x, y);
+   b->fp_math_ctrl = save_math_ctrl;
+
+   /* the bits, not a comparison: x is NaN when |x| is above infinity */
+   nir_def *x_nan = nir_ult(b, nir_imm_int(b, 0x7f800000), nir_iand_imm(b, x, 0x7fffffff));
+   nir_def_replace(&alu->def, nir_bcsel(b, x_nan, y, sel));
+   return true;
+}
+
 /* CL_CONFIG value order 3: t0 = global ID, t1 = local ID, t2 = workgroup ID */
 static nir_def *
 load_cs_input(nir_builder *b, unsigned reg, unsigned *input_count)
@@ -2570,6 +2596,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       NIR_PASS(_, s, nir_lower_idiv, &idiv_options);
    }
    NIR_PASS(_, s, nir_lower_alu);
+   if (!s->options->no_integers)
+      NIR_PASS(_, s, nir_shader_alu_pass, lower_fminmax_nan, nir_metadata_control_flow, NULL);
 
    etna_optimize_loop(s);
 
