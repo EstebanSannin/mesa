@@ -147,6 +147,8 @@ struct etna_shader_variant {
     * invocation that this needs */
    uint32_t cs_fold;
    uint32_t cs_scratch_slots;
+   /* the fold runs the copies in a loop, not unrolled */
+   bool cs_fold_loop;
    /* OpenCL private memory per invocation, bytes (scratch) */
    uint32_t cs_private_size;
 

@@ -2476,7 +2476,7 @@ lower_helper_invocation(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *
 }
 
 static bool
-compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold)
+compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop)
 {
    if (unlikely(!v))
       return false;
@@ -2487,6 +2487,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    /* a retry starts from a clean variant */
    memset(VARIANT_CACHE_PTR(v), 0, VARIANT_CACHE_SIZE);
+   v->cs_fold_loop = fold > 1 && fold_loop;
 
    c->variant = v;
    c->info = v->shader->info;
@@ -2536,7 +2537,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       v->cs_fold = 1;
 
       if (fold > 1) {
-         if (!etna_nir_fold_workgroup(s, fold, &v->cs_scratch_slots)) {
+         if (!etna_nir_fold_workgroup(s, fold, fold_loop, &v->cs_scratch_slots)) {
             ralloc_free(c->nir);
             free(c->code);
             FREE(c);
@@ -2796,16 +2797,16 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 }
 
 static bool
-compile_shader_spill(struct etna_shader_variant *v, unsigned fold)
+compile_shader_spill(struct etna_shader_variant *v, unsigned fold, bool fold_loop)
 {
-   if (compile_shader(v, false, fold))
+   if (compile_shader(v, false, fold, fold_loop))
       return true;
 
    /* the spilled constants are read with LOAD, which needs halti2 */
    if (!v || v->shader->info->halti < 2)
       return false;
 
-   return compile_shader(v, true, fold);
+   return compile_shader(v, true, fold, fold_loop);
 }
 
 /* A compute workgroup with barrier() must be resident in full: invocations x
@@ -2842,11 +2843,14 @@ etna_compile_shader(struct etna_shader_variant *v)
    const bool foldable = info->stage == MESA_SHADER_COMPUTE && info->uses_control_barrier &&
                          (!info->workgroup_size_variable || v->key.cs_block[0]);
 
+   unsigned unfolded_size = 0;
+
    if (!foldable || min_fold <= 1) {
-      if (!compile_shader_spill(v, 1))
+      if (!compile_shader_spill(v, 1, false))
          return false;
       if (!foldable || fits(v, n))
          return true;
+      unfolded_size = v->code_size / 4;
    }
 
    /* At least 32 threads: the folded code grows with the fold factor, in
@@ -2870,7 +2874,16 @@ etna_compile_shader(struct etna_shader_variant *v)
       if (!any_fold && n % fold)
          break;
 
-      const bool compiled = compile_shader_spill(v, fold);
+      /* Unrolled, the copies make the code F times as large, and
+       * past the instruction cache (512 instructions on GC7000 r6204) every
+       * thread streams it from memory: run them in a loop instead when the
+       * unrolled code would be over twice that. Below, the unrolled copies
+       * are faster, as they share the work that doesn't depend on the
+       * invocation (OpenCV's GaussianBlur row filter, 184 instructions folded
+       * by 3: 431 ms unrolled, 459 ms in a loop; Canny's stage1_with_sobel,
+       * 438 instructions folded by 8: 810 ms unrolled, 618 ms in a loop,
+       * folded by 4). */
+      const bool compiled = compile_shader_spill(v, fold, fold * unfolded_size > 1024);
       if (compiled && fits(v, n))
          return true;
 
@@ -2883,7 +2896,7 @@ etna_compile_shader(struct etna_shader_variant *v)
    }
 
    /* nothing fits: the dispatch refuses it, see etna_launch_grid() */
-   return compile_shader_spill(v, 1);
+   return compile_shader_spill(v, 1, false);
 }
 
 static const struct etna_shader_inout *

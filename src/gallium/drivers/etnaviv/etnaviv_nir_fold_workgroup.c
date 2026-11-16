@@ -16,9 +16,11 @@
  *
  * In OpenGL ES 3.1, barrier() only appears in main(), outside control flow.
  * The shader is then a sequence of segments separated by barriers. Each
- * segment is unrolled F times, one copy per invocation of the thread, with the
- * invocation IDs of that copy. The barrier between two segments waits for all
- * the hardware threads, so for all the invocations of the group.
+ * segment runs F times, once per invocation of the thread, with the
+ * invocation IDs of that copy: unrolled, or in a loop over the copies when
+ * the unrolled code would be large (the caller decides). The barrier between
+ * two segments waits for all the hardware threads, so for all the invocations
+ * of the group.
  *
  * Values that a segment takes from an earlier one are recomputed when that is
  * cheap (constants, uniforms, IDs and ALU or deref chains of those), or saved
@@ -36,6 +38,9 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_control_flow.h"
 #include "util/hash_table.h"
+#include "util/u_debug.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(fold_unroll, "ETNA_FOLD_UNROLL", false)
 
 #define SEG_NONE 0xff
 
@@ -326,7 +331,7 @@ retag_segments(struct fold_state *st)
 }
 
 bool
-etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
+etna_nir_fold_workgroup(nir_shader *s, unsigned fold, bool loop_copies, unsigned *scratch_slots)
 {
    struct fold_state st = {
       .s = s,
@@ -418,9 +423,11 @@ etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
       retag_segments(&st);
    }
 
-   /* unroll every segment, one copy per invocation of the thread; when F
+   /* run every segment once per invocation of the thread: unrolled, or in a
+    * loop over the copies (ETNA_FOLD_UNROLL=1 always unrolls); when F
     * doesn't divide N, the copies past the end of the workgroup are skipped */
    const unsigned hw = DIV_ROUND_UP(st.n, fold);
+   const bool loop_fold = loop_copies && !debug_get_option_fold_unroll();
 
    for (unsigned j = 0; j < st.num_segs; j++) {
       struct fold_seg *seg = &st.seg[j];
@@ -428,6 +435,45 @@ etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
 
       nir_cf_extract(&list, nir_after_instr(seg->last_placeholder),
                      seg->barrier ? nir_before_instr(seg->barrier) : nir_after_impl(st.impl));
+
+      if (loop_fold) {
+         nir_builder b = nir_builder_at(nir_after_instr(seg->last_placeholder));
+         nir_variable *kv = nir_local_variable_create(st.impl, glsl_uint_type(), "fold_copy");
+
+         nir_store_var(&b, kv, nir_imm_int(&b, 0), 1);
+         nir_loop *loop = nir_push_loop(&b);
+         /* nir_opt_loop_unroll would make the unrolled copies again */
+         loop->control = nir_loop_control_dont_unroll;
+         {
+            nir_def *k = nir_load_var(&b, kv);
+            nir_break_if(&b, nir_uge_imm(&b, k, fold));
+            nir_store_var(&b, kv, nir_iadd_imm(&b, k, 1), 1);
+
+            nir_def *l = nir_iadd(&b, nir_channel(&b, seg->hwid, 0), nir_imul_imm(&b, k, hw));
+            nir_def *lid = nir_vec3(&b, nir_umod_imm(&b, l, st.size[0]),
+                                    nir_umod_imm(&b, nir_udiv_imm(&b, l, st.size[0]), st.size[1]),
+                                    nir_udiv_imm(&b, l, st.size[0] * st.size[1]));
+            nir_def *gid = nir_iadd(&b, nir_imul(&b, seg->wid,
+                                                 nir_imm_ivec3(&b, st.size[0], st.size[1], st.size[2])),
+                                    lid);
+            struct hash_table *remap = _mesa_pointer_hash_table_create(mem_ctx);
+
+            _mesa_hash_table_insert(remap, seg->lid, nir_u2uN(&b, lid, seg->lid->bit_size));
+            _mesa_hash_table_insert(remap, seg->lidx, nir_u2uN(&b, l, seg->lidx->bit_size));
+            _mesa_hash_table_insert(remap, seg->gid, gid);
+
+            if (hw * fold > st.n) {
+               nir_if *nif = nir_push_if(&b, nir_ult_imm(&b, l, st.n));
+               nir_cf_list_clone_and_reinsert(&list, &nif->cf_node, b.cursor, remap);
+               nir_pop_if(&b, nif);
+            } else {
+               nir_cf_list_clone_and_reinsert(&list, &loop->cf_node, b.cursor, remap);
+            }
+         }
+         nir_pop_loop(&b, loop);
+         nir_cf_delete(&list);
+         continue;
+      }
 
       for (int k = fold - 1; k >= 0; k--) {
          nir_builder b = nir_builder_at(nir_after_instr(seg->last_placeholder));
@@ -466,5 +512,8 @@ etna_nir_fold_workgroup(nir_shader *s, unsigned fold, unsigned *scratch_slots)
    ralloc_free(mem_ctx);
 
    nir_progress(true, st.impl, nir_metadata_none);
+   /* the loop counters */
+   if (loop_fold)
+      NIR_PASS(_, s, nir_lower_vars_to_ssa);
    return true;
 }
