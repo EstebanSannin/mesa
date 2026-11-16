@@ -42,20 +42,28 @@
 #include "util/u_math.h"
 #include "util/u_memory.h"
 
+/* Shader variants are shared by the contexts of a screen, which can run in
+ * several threads (the queues of an OpenCL application): a bo another context
+ * can see must be filled already, or that context may submit a dispatch with
+ * code that isn't there yet. */
 static inline bool
 upload_bo(struct etna_context *ctx, struct etna_bo **bo, const void *data, uint32_t size)
 {
-   if (*bo)
+   if (p_atomic_read(bo))
       return true;
 
-   *bo = etna_bo_new(ctx->screen->dev, size, DRM_ETNA_GEM_CACHE_WC);
-   if (!*bo)
+   struct etna_bo *new_bo = etna_bo_new(ctx->screen->dev, size, DRM_ETNA_GEM_CACHE_WC);
+   if (!new_bo)
       return false;
 
-   void *buf = etna_bo_map(*bo);
-   etna_bo_cpu_prep(*bo, DRM_ETNA_PREP_WRITE);
+   void *buf = etna_bo_map(new_bo);
+   etna_bo_cpu_prep(new_bo, DRM_ETNA_PREP_WRITE);
    memcpy(buf, data, size);
-   etna_bo_cpu_fini(*bo);
+   etna_bo_cpu_fini(new_bo);
+
+   /* another context may have uploaded it meanwhile: keep that one */
+   if (p_atomic_cmpxchg(bo, NULL, new_bo) != NULL)
+      etna_bo_del(new_bo);
 
    return true;
 }
