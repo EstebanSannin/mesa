@@ -38,6 +38,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_control_flow.h"
 #include "util/hash_table.h"
+#include "util/set.h"
 #include "util/u_debug.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(fold_unroll, "ETNA_FOLD_UNROLL", false)
@@ -170,6 +171,74 @@ save_value(struct fold_state *st, nir_def *def)
 static nir_def *value_in(struct fold_state *st, unsigned j, nir_def *def, unsigned depth,
                          nir_builder *b);
 
+struct scratch_leaves_state {
+   struct fold_state *st;
+   unsigned j, depth;
+   struct set *seen, *leaves;
+};
+
+static bool scratch_leaves_src(nir_src *src, void *data);
+
+/* the values that value_in() would load from scratch to recompute def in
+ * segment j (collected in l->leaves, stopping at two) */
+static void
+scratch_leaves(struct scratch_leaves_state *l, nir_def *def)
+{
+   struct fold_seg *seg = &l->st->seg[l->j];
+   nir_instr *instr = nir_def_instr(def);
+   nir_intrinsic_op op;
+
+   if (l->leaves->entries > 1 || _mesa_set_search(l->seen, def))
+      return;
+   _mesa_set_add(l->seen, def);
+
+   if (_mesa_hash_table_search(seg->remap, def) || is_id(def, &op) || instr->pass_flags == l->j ||
+       (instr->type == nir_instr_type_intrinsic &&
+        nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_opaque_copy_etna))
+      return;
+
+   if (is_cloneable(instr) && l->depth < 64) {
+      l->depth++;
+      nir_foreach_src(instr, scratch_leaves_src, l);
+      l->depth--;
+      return;
+   }
+
+   _mesa_set_add(l->leaves, def);
+}
+
+static bool
+scratch_leaves_src(nir_src *src, void *data)
+{
+   scratch_leaves(data, src->ssa);
+   return true;
+}
+
+/* An ALU value that would be recomputed from two or more values in scratch
+ * gets a slot of its own: one store and one load instead of one of each per
+ * source. Canny's stage1 (folded by 4) takes two values across its second
+ * barrier that it computes from eight loads of the shared tile: 2 slots
+ * instead of 8. */
+static bool
+save_whole(struct fold_state *st, unsigned j, nir_def *def, unsigned depth)
+{
+   if (nir_def_instr(def)->type != nir_instr_type_alu)
+      return false;
+
+   struct scratch_leaves_state l = {
+      .st = st,
+      .j = j,
+      .depth = depth,
+      .seen = _mesa_pointer_set_create(NULL),
+      .leaves = _mesa_pointer_set_create(NULL),
+   };
+   scratch_leaves(&l, def);
+   const bool whole = l.leaves->entries > 1;
+   _mesa_set_destroy(l.seen, NULL);
+   _mesa_set_destroy(l.leaves, NULL);
+   return whole;
+}
+
 struct map_src_state {
    struct fold_state *st;
    unsigned j, depth;
@@ -220,7 +289,7 @@ value_in(struct fold_state *st, unsigned j, nir_def *def, unsigned depth, nir_bu
       v = nir_u2uN(b, v, def->bit_size);
    } else if (instr->pass_flags == j) {
       return def;
-   } else if (is_cloneable(instr) && depth < 64) {
+   } else if (is_cloneable(instr) && depth < 64 && !save_whole(st, j, def, depth)) {
       struct map_src_state m = { st, j, depth, b };
       nir_foreach_src(instr, map_src, &m);
       nir_instr *clone = nir_instr_clone_deep(st->s, instr, seg->remap);
