@@ -2777,6 +2777,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       nir_lower_idiv_options idiv_options = {
          .allow_fp16 = true,
       };
+      /* by a constant: a multiply-high and shifts, before the general case */
+      NIR_PASS(_, s, nir_opt_idiv_const, 32);
       NIR_PASS(_, s, nir_lower_idiv, &idiv_options);
    }
    NIR_PASS(_, s, nir_lower_alu);
