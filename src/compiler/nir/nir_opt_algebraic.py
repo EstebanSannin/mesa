@@ -3953,6 +3953,11 @@ late_optimizations.extend([
    # is_integral() can remove the roundEven first.
    # The sign of a goes into the result: a zero result keeps it (rint(-0.5) is
    # -0.0), and a nonzero one has it already.
+   # With a rounding conversion to integer, below 2^23 (above, a float is an
+   # integer already, and NaN and infinities stay as they are).
+   (('fround_even', 'a@32'), ('bcsel', ('flt', ('fabs', a), 8388608.0),
+                              ('ior', ('i2f32', ('f2i32_rtne', a)), ('iand', a, 0x80000000)),
+                              a), 'options->lower_fround_even && options->has_f2i32_rtne'),
    (('fround_even', 'a@32'), ('ior', ('fadd', ('ffloor', a),
                                      ('bcsel', ('flt', 0.5, ('ffract', a)),
                                       1.0,
