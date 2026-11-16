@@ -437,10 +437,22 @@ etna_layout_multiple(const struct etna_screen *screen,
    }
 }
 
+/* OpenCL buffers are read back by the CPU, and a Cortex-A53 reads
+ * write-combined memory at about 0.2 GB/s: on arm64 they are cached, with the
+ * cache maintenance of CPU_PREP and CPU_FINI around a synchronized map, and
+ * on the mapped range around an unsynchronized one (etna_buffer_map()). Not
+ * for persistent or coherent mappings, which have no such points. */
+bool
+etna_buffer_is_cached(const struct pipe_resource *prsc)
+{
+   return DETECT_ARCH_AARCH64 && (prsc->bind & PIPE_BIND_GLOBAL) &&
+          !(prsc->flags & (PIPE_RESOURCE_FLAG_MAP_PERSISTENT | PIPE_RESOURCE_FLAG_MAP_COHERENT));
+}
+
 static struct etna_bo *
 etna_buffer_bo_new(struct etna_screen *screen, const struct pipe_resource *prsc)
 {
-   uint32_t flags = DRM_ETNA_GEM_CACHE_WC;
+   uint32_t flags = etna_buffer_is_cached(prsc) ? DRM_ETNA_GEM_CACHE_CACHED : DRM_ETNA_GEM_CACHE_WC;
 
    if (prsc->bind & PIPE_BIND_VERTEX_BUFFER)
       flags |= DRM_ETNA_GEM_FORCE_MMU;

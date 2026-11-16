@@ -40,6 +40,7 @@
 #include "util/format/u_format.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_inlines.h"
+#include "util/cache_ops.h"
 #include "util/u_memory.h"
 #include "util/u_surface.h"
 #include "util/u_transfer.h"
@@ -118,6 +119,11 @@ etna_buffer_map(struct pipe_context *pctx, struct pipe_resource *prsc,
 
       if (etna_bo_cpu_prep(rsc->bo, prep_flags))
          goto free_trans;
+   } else if ((usage & PIPE_MAP_READ) && etna_buffer_is_cached(prsc)) {
+      /* the caller synchronized with the GPU already: drop the CPU's stale
+       * cache lines of the range before it reads. Not with CPU_PREP, which
+       * doesn't nest (rusticl keeps several maps of a buffer). */
+      util_flush_inval_range(trans->mapped + box->x, box->width);
    }
 
    *out_transfer = &trans->base;
@@ -157,6 +163,9 @@ etna_buffer_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
 
    if (!(ptrans->usage & PIPE_MAP_UNSYNCHRONIZED))
       etna_bo_cpu_fini(rsc->bo);
+   else if ((ptrans->usage & PIPE_MAP_WRITE) && etna_buffer_is_cached(ptrans->resource))
+      /* write the CPU's data out for the GPU */
+      util_flush_range(trans->mapped + ptrans->box.x, ptrans->box.width);
 
    if ((ptrans->usage & PIPE_MAP_WRITE) &&
        !(ptrans->usage & PIPE_MAP_FLUSH_EXPLICIT))

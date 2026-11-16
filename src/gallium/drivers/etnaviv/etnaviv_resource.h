@@ -367,6 +367,9 @@ etna_resource_used(struct etna_context *ctx, struct pipe_resource *prsc,
                    enum etna_resource_status status);
 
 bool
+etna_buffer_is_cached(const struct pipe_resource *prsc);
+
+bool
 etna_buffer_resource_realloc(struct etna_context *ctx,
                              struct etna_buffer_resource *rsc);
 
