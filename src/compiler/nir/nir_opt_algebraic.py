@@ -3951,6 +3951,15 @@ late_optimizations.extend([
    # Round to the nearest integer using ffloor and ffract, and on a half break
    # the tie towards the even neighbour. Kept in late_optimizations so that
    # is_integral() can remove the roundEven first.
+   # The sign of a goes into the result: a zero result keeps it (rint(-0.5) is
+   # -0.0), and a nonzero one has it already.
+   (('fround_even', 'a@32'), ('ior', ('fadd', ('ffloor', a),
+                                     ('bcsel', ('flt', 0.5, ('ffract', a)),
+                                      1.0,
+                                      ('bcsel', ('feq', ('ffract', a), 0.5),
+                                       ('fmul', ('ffract', ('fmul', ('ffloor', a), 0.5)), 2.0),
+                                       0.0))),
+                             ('iand', a, 0x80000000)), 'options->lower_fround_even'),
    (('fround_even', a), ('fadd', ('ffloor', a),
                          ('bcsel', ('flt', 0.5, ('ffract', a)),
                           1.0,
