@@ -74,6 +74,7 @@ static const struct etna_op_info etna_ops[] = {
    UOP(u2u16, I2I),
    UOP(u2u8,  I2I),
    IOP(f2i32, F2I),
+   IOP(f2i32_rtne, F2IRND),
    OPCT(f2i16, F2I, TRUE, S16),
    OPCT(f2i8,  F2I, TRUE, S8),
    UOP(f2u32, F2I),
@@ -193,6 +194,10 @@ etna_emit_alu(struct etna_compile *c, nir_alu_instr *alu, struct etna_inst_dst d
       /* scalar instructions we want src to be in x component */
       inst.src[0] = etna_src_swizzle(src[0], swiz_scalar);
       inst.src[1] = etna_src_swizzle(src[1], swiz_scalar);
+      break;
+   case nir_op_f2i32_rtne:
+      /* round to nearest even, as NXP's compiler emits it */
+      inst.rounding = ISA_ROUNDING_RTNE;
       break;
    case nir_op_imad:
       /* a scalar instruction, as IMULLO0 */

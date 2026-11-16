@@ -40,6 +40,8 @@ etna_compiler_create(const struct etna_core_info *info)
       .has_texture_scaling = true,
       .lower_fpow = true,
       .lower_fround_even = true,
+      /* F2IRND converts with round to nearest even (.rtne) */
+      .has_f2i32_rtne = info->halti >= 2,
       /* no instruction for it (OpenCL isnormal()) */
       .lower_fisnormal = true,
       .lower_ftrunc = true,
