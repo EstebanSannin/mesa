@@ -1482,13 +1482,21 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
          case nir_intrinsic_store_global_etna:
          case nir_intrinsic_global_atomic_etna:
          case nir_intrinsic_global_atomic_swap_etna: {
-            /* the address is a uniform: offset and data go through registers */
+            /* the address is a uniform: offset and data that would be
+             * another uniform go through registers (one distinct uniform per
+             * instruction). An inline immediate is not a uniform, and LOAD
+             * takes one as its offset (NXP's code has load u0.x, 0:s20);
+             * STORE with an immediate offset or value faulted (MMU, OpenCV's
+             * Canny), so its constants stay in registers */
             const bool store = intr->intrinsic == nir_intrinsic_store_global_etna;
             const bool load = intr->intrinsic == nir_intrinsic_load_global_etna;
             nir_src *srcs[] = { store ? &intr->src[2] : &intr->src[1],
                                 store ? &intr->src[0] : load ? NULL : &intr->src[2] };
 
             for (unsigned i = 0; i < ARRAY_SIZE(srcs); i++) {
+               if (srcs[i] && nir_src_is_const(*srcs[i]) && load &&
+                   !needs_uniform_slot(nir_instr_as_load_const(nir_def_instr(srcs[i]->ssa))))
+                  continue;
                if (srcs[i] && nir_src_is_const(*srcs[i])) {
                   b.cursor = nir_before_instr(instr);
                   nir_src_rewrite(srcs[i], nir_mov(&b, srcs[i]->ssa));
