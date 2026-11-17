@@ -407,9 +407,11 @@ etna_uniforms_write(const struct etna_context *ctx,
          }
 
          if (img->resource->target == PIPE_BUFFER) {
-            /* a linear image of one row; the width field has 16 bits */
+            /* a linear image of one row, of up to 65536 texels
+             * (max_texel_buffer_elements): the width field has 16 bits,
+             * and the hardware reads 0 as 65536 */
             const uint32_t bpp = util_format_get_blocksize(img->format);
-            const uint32_t width = MIN2(img->u.buf.size / bpp, 0xffff);
+            const uint32_t width = MIN2(img->u.buf.size / bpp, 0x10000);
 
             if (word == 0) {
                etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
@@ -419,7 +421,7 @@ etna_uniforms_write(const struct etna_context *ctx,
                });
             } else {
                const uint32_t v[4] = {
-                  0, width * bpp, 1 << 16 | width,
+                  0, width * bpp, 1 << 16 | (width & 0xffff),
                   etna_image_format_word(img->format, ETNA_LAYOUT_LINEAR,
                                          !(img->access & PIPE_IMAGE_ACCESS_WRITE), true),
                };
