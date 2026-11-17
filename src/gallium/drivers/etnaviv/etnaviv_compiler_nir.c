@@ -1593,9 +1593,14 @@ etna_compile_check_limits(struct etna_shader_variant *v)
       return false;
    }
 
-   if (v->num_temps > info->gpu.max_registers) {
-      DBG("Number of registers (%d) exceeds maximum %d", v->num_temps,
-          info->gpu.max_registers);
+   /* The NUM_TEMPS fields of VS/PS_TEMP_REGISTER_CONTROL have 6 bits: a
+    * shader that takes all 64 temporaries would program 0 and run with
+    * garbage registers (MMU faults, GPU hangs). */
+   const unsigned max_temps = MIN2(info->gpu.max_registers,
+                                   VIVS_PS_TEMP_REGISTER_CONTROL_NUM_TEMPS__MASK);
+
+   if (v->num_temps > max_temps) {
+      DBG("Number of registers (%d) exceeds maximum %d", v->num_temps, max_temps);
       return false;
    }
 
