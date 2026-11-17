@@ -137,13 +137,7 @@ etna_screen_destroy(struct pipe_screen *pscreen)
 static const char *
 etna_screen_get_name(struct pipe_screen *pscreen)
 {
-   struct etna_screen *priv = etna_screen(pscreen);
-   static char buffer[128];
-
-   snprintf(buffer, sizeof(buffer), "Vivante GC%x rev %04x", priv->info->model,
-            priv->info->revision);
-
-   return buffer;
+   return etna_screen(pscreen)->name;
 }
 
 static const char *
@@ -1148,6 +1142,8 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    screen->npu = npu;
    screen->ro = ro;
    screen->info = etna_gpu_get_core_info(gpu);
+   snprintf(screen->name, sizeof(screen->name), "Vivante GC%x rev %04x",
+            screen->info->model, screen->info->revision);
 
    screen->drm_version = etnaviv_device_version(screen->dev);
    etna_mesa_debug = debug_get_option_etna_mesa_debug();
