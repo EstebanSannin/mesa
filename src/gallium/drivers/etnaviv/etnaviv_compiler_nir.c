@@ -779,8 +779,9 @@ emit_image(struct etna_compile *c, nir_intrinsic_instr *intr)
       inst.dst.write_mask = ISA_WRMASK_XYZW;
       inst.src[2] = get_src(c, &intr->src[2]);
    } else {
-      /* components of the format; 128-bit formats load two per plane */
-      const unsigned comps = util_format_get_blocksize(format) == 16
+      /* components of the format; 128-bit formats load two per plane,
+       * except from buffers */
+      const unsigned comps = util_format_get_blocksize(format) == 16 && dim != GLSL_SAMPLER_DIM_BUF
                                 ? 2 : util_format_get_nr_components(format);
       unsigned dst_swiz;
 
@@ -2005,7 +2006,8 @@ lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
 /* Images are linear or 4x4 tiled (see etna_resource_create()). Loads and
  * stores use img_load/img_store, which address and convert texels through
  * the image descriptor. 128-bit formats are two stacked planes of 64-bit
- * texels (xy, then zw), see etna_resource_level_second_plane_offset().
+ * texels (xy, then zw), see etna_resource_level_second_plane_offset(),
+ * except in buffers, which hold them as 16-byte texels.
  * Atomics (r32ui, r32i) address the texel in the shader and use the atomic
  * instructions: linear base + layer * layer stride + y * stride + x * 4,
  * tiled in tiles of 4x4 texels in rows of stride * 4 bytes. */
@@ -2062,17 +2064,18 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    const enum pipe_format format = nir_intrinsic_format(intr);
    const unsigned bpp = util_format_get_blocksize(format);
    /* without a format (OpenCL), the key says which images are 128-bit */
-   const bool planes = bpp == 16 ||
-                       (format == PIPE_FORMAT_NONE && nir_src_is_const(intr->src[0]) &&
-                        nir_src_as_uint(intr->src[0]) < 16 &&
-                        (key->img_128bit & BITFIELD_BIT(nir_src_as_uint(intr->src[0]))));
+   const bool is_128bit = bpp == 16 ||
+                          (format == PIPE_FORMAT_NONE && nir_src_is_const(intr->src[0]) &&
+                           nir_src_as_uint(intr->src[0]) < 16 &&
+                           (key->img_128bit & BITFIELD_BIT(nir_src_as_uint(intr->src[0]))));
+   const bool planes = is_128bit && dim != GLSL_SAMPLER_DIM_BUF;
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
 
    /* Without a format in the shader (OpenCL) the descriptor converts, but the
     * instruction still takes the register type and the components from the
     * format (emit_image()): give it a stand-in of the access's type, with one
-    * component, four, or two per plane of a 128-bit format. */
+    * component, four, or a 128-bit format (two per plane). */
    enum pipe_format emit_format = format;
    if (format == PIPE_FORMAT_NONE &&
        (intr->intrinsic == nir_intrinsic_image_load || intr->intrinsic == nir_intrinsic_image_store)) {
@@ -2089,7 +2092,7 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       };
       const unsigned t = base == nir_type_uint ? 1 : base == nir_type_int ? 2 : 0;
 
-      emit_format = stand_in[planes ? 2 : one ? 0 : 1][t];
+      emit_format = stand_in[is_128bit ? 2 : one ? 0 : 1][t];
    }
 
    if (one_row) {
@@ -2112,10 +2115,6 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
             nir_def *layer = nir_iadd(b, base, nir_imul(b, nir_channel(b, coord, 2),
                                                         image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
             hcoord[p] = nir_vec3(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1), layer);
-         } else if (planes && dim == GLSL_SAMPLER_DIM_BUF) {
-            /* a buffer of 128-bit texels: 64-bit texels 2x and 2x + 1 */
-            hcoord[p] = nir_vec2(b, nir_iadd_imm(b, nir_ishl_imm(b, nir_channel(b, coord, 0), 1), p),
-                                 nir_imm_int(b, 0));
          } else {
             hcoord[p] = nir_trim_vector(b, coord, 2);
          }

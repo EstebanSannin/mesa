@@ -142,7 +142,8 @@ get_sampler_lod(const struct etna_context *ctx, bool frag,
  *   bit 12     set; bits 14-15 number of components (4 as 0)
  *   bits 16-31 swizzle: 4 bits per channel, 0-3 source, 4 zero, 5 one
  * 128-bit formats are two planes of 64-bit texels, each with its own
- * descriptor. Returns 0 for formats without a hardware image path. */
+ * descriptor, except in buffers (whole), which hold them as 16-byte texels.
+ * Returns 0 for formats without a hardware image path. */
 /* Image descriptors 0-7 are the shader images, 8-15 the compute textures 0-7
  * read with the image instructions: buffers (OpenCL 1D image buffers) and the
  * OpenCL 2D textures of etna_compute_swap_textures(). */
@@ -172,18 +173,9 @@ etna_uniform_image(const struct etna_context *ctx, mesa_shader_stage stage, unsi
    return tmp;
 }
 
-/* texel bytes of a buffer image: 128-bit formats are addressed as 64-bit
- * texels, two per texel (see lower_image_access()) */
 static uint32_t
-etna_buffer_image_texel(enum pipe_format format)
-{
-   const uint32_t bpp = util_format_get_blocksize(format);
-
-   return bpp == 16 ? 8 : bpp;
-}
-
-static uint32_t
-etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout, bool read_only)
+etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout, bool read_only,
+                       bool whole)
 {
    unsigned log2_bpp, cls, type, comps;
 
@@ -211,6 +203,11 @@ etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout,
     * where class 1 gave UNORM8 values slightly off), and writes with 0 */
    if (read_only && (type == 12 || type == 14 || type == 15))
       cls = 3;
+
+   if (whole && util_format_get_blocksize(format) == 16) {
+      log2_bpp = 4;
+      comps = 4;
+   }
 
    static const uint32_t swizzle[] = { 0, 0x5440, 0x5410, 0x5210, 0x3210 };
 
@@ -411,7 +408,7 @@ etna_uniforms_write(const struct etna_context *ctx,
 
          if (img->resource->target == PIPE_BUFFER) {
             /* a linear image of one row; the width field has 16 bits */
-            const uint32_t bpp = etna_buffer_image_texel(img->format);
+            const uint32_t bpp = util_format_get_blocksize(img->format);
             const uint32_t width = MIN2(img->u.buf.size / bpp, 0xffff);
 
             if (word == 0) {
@@ -424,7 +421,7 @@ etna_uniforms_write(const struct etna_context *ctx,
                const uint32_t v[4] = {
                   0, width * bpp, 1 << 16 | width,
                   etna_image_format_word(img->format, ETNA_LAYOUT_LINEAR,
-                                         !(img->access & PIPE_IMAGE_ACCESS_WRITE)),
+                                         !(img->access & PIPE_IMAGE_ACCESS_WRITE), true),
                };
                etna_cmd_stream_emit(stream, v[word & 3]);
             }
@@ -448,7 +445,8 @@ etna_uniforms_write(const struct etna_context *ctx,
             0,
             lev->stride,
             lev->height << 16 | lev->width,
-            etna_image_format_word(img->format, rsc->layout, !(img->access & PIPE_IMAGE_ACCESS_WRITE)),
+            etna_image_format_word(img->format, rsc->layout, !(img->access & PIPE_IMAGE_ACCESS_WRITE),
+                                   false),
          };
 
          etna_cmd_stream_emit(stream, v[word & 3]);
