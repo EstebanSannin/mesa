@@ -362,11 +362,19 @@ etna_reset_gpu_state(struct etna_context *ctx)
       /* The split of the unified shader cache that
        * etna_core_usc_attrib_size() assumes, with UNK16 = 2, as the Vivante
        * kernel sets it. At the reset value, global loads of 16 bytes or more
-       * run at two thirds of the speed. */
-      if (screen->info->gpu.usc_size)
+       * run at two thirds of the speed.
+       *
+       * A compute-only context (OpenCL) has no vertex attributes, and its
+       * shared memory is a buffer: like the Vivante kernel on a compute-only
+       * core, give the whole cache to the L1. */
+      if (screen->info->gpu.usc_size) {
+         const unsigned l1_ratio =
+            ctx->compute_only ? 0 : etna_core_usc_l1_cache_ratio(screen->info);
+
          etna_set_state(stream, VIVS_GL_USC_CONTROL,
-                        VIVS_GL_USC_CONTROL_L1_CACHE_RATIO(etna_core_usc_l1_cache_ratio(screen->info)) |
+                        VIVS_GL_USC_CONTROL_L1_CACHE_RATIO(l1_ratio) |
                         VIVS_GL_USC_CONTROL_UNK16(2));
+      }
    }
 
    if (VIV_FEATURE(screen, ETNA_FEATURE_BUG_FIXES18))
