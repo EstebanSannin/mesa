@@ -97,6 +97,13 @@ struct etna_shader_key
    /* compute: images (and buffer textures, 8 + slot) with a one-component
     * format, for image loads without a format in the shader (OpenCL) */
    unsigned img_1comp : 16;
+   /* compute-only contexts (OpenCL): the 2D textures 0-7 that the shader
+    * reads with img_load where it can (images 8 + slot, see
+    * etna_compute_swap_textures()), and of those, the ones whose sampler
+    * takes the texel at the coordinates (nearest, unnormalized, clamped to
+    * the edge), so that samples are read that way too */
+   unsigned tex_img_read : 8;
+   unsigned tex_img_sampled : 8;
    /* compute: RGBA16 UNORM textures, sampled as integers and converted, and
     * the textures with a linear sampler that the shader filters
     * (lower_shader_linear) */
@@ -127,6 +134,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
        unlikely(a->tex_unnormalized || b->tex_unnormalized) ||
        unlikely(a->tex_unorm8 || b->tex_unorm8 || a->tex_snorm8 || b->tex_snorm8) ||
        unlikely(a->img_128bit || b->img_128bit || a->img_1comp || b->img_1comp) ||
+       unlikely(a->tex_img_read || b->tex_img_read) ||
        unlikely(a->tex_unorm16 || b->tex_unorm16) ||
        unlikely(a->tex_shader_linear || b->tex_shader_linear) ||
        unlikely(a->tex_layer_rint || b->tex_layer_rint) ||

@@ -18,6 +18,7 @@
 #include "etnaviv_context.h"
 #include "etnaviv_debug.h"
 #include "etnaviv_emit.h"
+#include "etnaviv_format.h"
 #include "etnaviv_resource.h"
 #include "etnaviv_screen.h"
 #include "etnaviv_shader.h"
@@ -237,6 +238,31 @@ etna_compute_fetch_sampler(struct etna_context *ctx)
    return ctx->cs_fetch_sampler;
 }
 
+/* An OpenCL 2D texture that the image instructions can read: a format of up
+ * to 64 bits with an image format word, linear or 4x4 tiled, and no swizzle
+ * other than the format's own (the descriptor gives the format's channels,
+ * a missing one as 0, and alpha as 1). */
+static bool
+etna_compute_view_reads_as_image(const struct pipe_sampler_view *sv)
+{
+   const struct etna_resource *rsc = etna_resource(sv->texture);
+   const unsigned comps = util_format_get_nr_components(sv->format);
+   const unsigned char swizzle[4] = { sv->swizzle_r, sv->swizzle_g, sv->swizzle_b, sv->swizzle_a };
+
+   if (sv->target != PIPE_TEXTURE_2D || !etna_format_is_image_format(sv->format) ||
+       util_format_get_blocksize(sv->format) > 8 ||
+       (rsc->layout != ETNA_LAYOUT_LINEAR && rsc->layout != ETNA_LAYOUT_TILED))
+      return false;
+
+   for (unsigned c = 0; c < 4; c++) {
+      if (swizzle[c] != PIPE_SWIZZLE_X + c &&
+          !(c >= comps && swizzle[c] == (c == 3 ? PIPE_SWIZZLE_1 : PIPE_SWIZZLE_0)))
+         return false;
+   }
+
+   return true;
+}
+
 static void
 etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures *saved,
                            bool compute, const struct etna_shader *shader)
@@ -271,6 +297,21 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
          if (views[t] && views[t]->target == PIPE_BUFFER) {
             ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
             views[t] = NULL;
+         }
+      }
+
+      /* OpenCL 2D textures of formats up to 64 bits are read with img_load
+       * as well, as NXP's OpenCL does. GC7000 r6204's texture unit fetches
+       * about 165 M texels a second (95 M RGBA8), from its cache as from
+       * memory; img_load reads RGBA8 twice as fast. 128-bit formats stay with
+       * the texture unit: their two planes take two img_loads, which is
+       * slower. The views stay bound for the reads that keep the texture unit
+       * (lower_texbuf_to_image()). */
+      ctx->cs_teximg_mask = 0;
+      for (unsigned t = 0; t < MIN2(n, 8); t++) {
+         if (ctx->compute_only && views[t] && etna_compute_view_reads_as_image(views[t])) {
+            ctx->cs_teximg_mask |= BITFIELD_BIT(t);
+            ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
          }
       }
 
@@ -433,6 +474,7 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
    /* set by etna_compute_swap_textures() for this dispatch */
    ctx->cs_texbuf_mask = 0;
+   ctx->cs_teximg_mask = 0;
    ctx->cs_shader_linear = 0;
 
    if (textures) {
@@ -475,6 +517,18 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 
          if (sv->format == PIPE_FORMAT_R16G16B16A16_UNORM)
             key.tex_unorm16 |= BITFIELD_BIT(i);
+      }
+
+      /* textures read with img_load, and the samplers whose samples can be */
+      key.tex_img_read = ctx->cs_teximg_mask;
+      u_foreach_bit(t, ctx->cs_teximg_mask) {
+         const struct pipe_sampler_state *ss = ctx->sampler[t];
+
+         if (ss && ss->unnormalized_coords && !(ctx->cs_shader_linear & BITFIELD_BIT(t)) &&
+             ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
+             ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
+             ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE && ss->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
+            key.tex_img_sampled |= BITFIELD_BIT(t);
       }
    }
 
@@ -664,6 +718,22 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          resource_written(ctx, images->img[i].resource);
       else
          resource_read(ctx, images->img[i].resource);
+   }
+
+   /* textures read with img_load: up to date in memory (no render copy or
+    * tile status left), as the shader images */
+   u_foreach_bit(t, ctx->cs_teximg_mask) {
+      const struct pipe_sampler_view *sv = ctx->cs_sampler_view[t];
+      const struct pipe_image_view img = {
+         .resource = sv->texture,
+         .format = sv->format,
+         .access = PIPE_IMAGE_ACCESS_READ,
+         .u.tex.first_layer = sv->u.tex.first_layer,
+         .u.tex.last_layer = sv->u.tex.last_layer,
+         .u.tex.level = sv->u.tex.first_level,
+      };
+
+      etna_compute_prepare_image(ctx, &img);
    }
 
    u_foreach_bit(t, ctx->cs_texbuf_mask)

@@ -144,8 +144,8 @@ get_sampler_lod(const struct etna_context *ctx, bool frag,
  * 128-bit formats are two planes of 64-bit texels, each with its own
  * descriptor. Returns 0 for formats without a hardware image path. */
 /* Image descriptors 0-7 are the shader images, 8-15 the compute textures 0-7
- * that are buffers (OpenCL 1D image buffers, read with the image
- * instructions). */
+ * read with the image instructions: buffers (OpenCL 1D image buffers) and the
+ * OpenCL 2D textures of etna_compute_swap_textures(). */
 static const struct pipe_image_view *
 etna_uniform_image(const struct etna_context *ctx, mesa_shader_stage stage, unsigned index,
                    struct pipe_image_view *tmp)
@@ -160,8 +160,14 @@ etna_uniform_image(const struct etna_context *ctx, mesa_shader_stage stage, unsi
       tmp->resource = sv->texture;
       tmp->format = sv->format;
       tmp->access = PIPE_IMAGE_ACCESS_READ;
-      tmp->u.buf.offset = sv->u.buf.offset;
-      tmp->u.buf.size = sv->u.buf.size;
+      if (sv->target == PIPE_BUFFER) {
+         tmp->u.buf.offset = sv->u.buf.offset;
+         tmp->u.buf.size = sv->u.buf.size;
+      } else {
+         tmp->u.tex.level = sv->u.tex.first_level;
+         tmp->u.tex.first_layer = sv->u.tex.first_layer;
+         tmp->u.tex.last_layer = sv->u.tex.last_layer;
+      }
    }
    return tmp;
 }

@@ -1898,12 +1898,83 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
    *align = s;
 }
 
-/* OpenCL 1D image buffers that are read only come as buffer textures, which
- * the texture unit can't sample: read them with the image instructions, as
- * images 8 + texture index (see etna_uniform_image()). */
+/* An OpenCL 2D texture read with img_load (key tex_img_read): fetches at
+ * level 0, and, with a nearest, unnormalized sampler clamped to the edge
+ * (key tex_img_sampled), samples at level 0, whose texel is the floor of the
+ * coordinates clamped to the texture. Other reads keep the texture unit. */
 static bool
-lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
 {
+   const bool sampled = key->tex_img_sampled & BITFIELD_BIT(tex->texture_index);
+
+   if ((tex->op != nir_texop_txf &&
+        !(sampled && (tex->op == nir_texop_tex || tex->op == nir_texop_txl))) ||
+       tex->is_shadow || tex->is_sparse || tex->def.bit_size != 32)
+      return false;
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      switch (tex->src[i].src_type) {
+      case nir_tex_src_coord:
+         break;
+      case nir_tex_src_lod:
+         /* 0 or 0.0 */
+         if (!nir_src_is_const(tex->src[i].src) || nir_src_as_uint(tex->src[i].src) != 0)
+            return false;
+         break;
+      default:
+         return false;
+      }
+   }
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *index = nir_imm_int(b, 8 + tex->texture_index);
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *xy = nir_trim_vector(b, nir_get_tex_src(tex, nir_tex_src_coord), 2);
+
+   if (tex->op != nir_texop_txf) {
+      /* the floor of each coordinate; integer coordinates converted to
+       * float (read_imagef() with int2) are taken as they are */
+      nir_def *texel[2];
+      for (unsigned c = 0; c < 2; c++) {
+         nir_scalar f = nir_scalar_resolved(xy, c);
+
+         if (nir_scalar_is_alu(f) && nir_scalar_alu_op(f) == nir_op_i2f32 &&
+             nir_scalar_chase_alu_src(f, 0).def->bit_size == 32)
+            texel[c] = nir_mov_scalar(b, nir_scalar_chase_alu_src(f, 0));
+         else
+            texel[c] = nir_f2i32(b, nir_ffloor(b, nir_channel(b, xy, c)));
+      }
+
+      nir_def *size = nir_image_size(b, 2, 32, index, zero, .image_dim = GLSL_SAMPLER_DIM_2D,
+                                     .image_array = false);
+      xy = nir_imin(b, nir_imax(b, nir_vec2(b, texel[0], texel[1]), nir_imm_ivec2(b, 0, 0)),
+                    nir_iadd_imm(b, size, -1));
+   }
+
+   nir_def *repl = nir_image_load(b, tex->def.num_components, 32, index,
+                                  nir_vec4(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1), zero, zero),
+                                  zero, zero, .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+                                  .format = PIPE_FORMAT_NONE, .access = ACCESS_NON_WRITEABLE,
+                                  .dest_type = tex->dest_type);
+
+   nir_def_replace(&tex->def, repl);
+   return true;
+}
+
+/* OpenCL 1D image buffers that are read only come as buffer textures, which
+ * the texture unit can't sample, and OpenCL 2D textures up to 64 bits are read
+ * faster by the image instructions (lower_tex2d_to_image()): read them with
+ * those, as images 8 + texture index (see etna_uniform_image()). */
+static bool
+lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < 8 &&
+       (key->tex_img_read & BITFIELD_BIT(tex->texture_index)))
+      return lower_tex2d_to_image(b, tex, key);
+
    if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF || tex->texture_index >= 8 ||
        (tex->op != nir_texop_txf && tex->op != nir_texop_txs))
       return false;
@@ -2713,7 +2784,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
                nir_metadata_control_flow, &v->cs_input_count);
    }
 
-   NIR_PASS(_, s, nir_shader_tex_pass, lower_texbuf_to_image, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, s, nir_shader_tex_pass, lower_texbuf_to_image, nir_metadata_control_flow, &v->key);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_image_access,
             nir_metadata_control_flow, &v->key);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,
