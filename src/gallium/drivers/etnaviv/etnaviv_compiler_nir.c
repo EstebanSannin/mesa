@@ -2192,6 +2192,23 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* an ALU instruction with a 64-bit source or result */
+static bool
+is_64bit_alu(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->def.bit_size == 64)
+      return true;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      if (nir_src_bit_size(alu->src[i].src) == 64)
+         return true;
+   }
+   return false;
+}
+
 /* Memory is accessed in aligned 32-bit words: narrower or unaligned loads
  * become word loads plus extraction, narrower stores atomic and/or on the
  * word (OpenCL char and short data, 8-bit kernel arguments). */
@@ -2715,6 +2732,14 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
     * rusticl doesn't (OpenCL mix()): the backend has no flrp */
    NIR_PASS(_, s, nir_lower_flrp, 16 | 32 | 64, false);
 
+   /* rusticl lowers 64-bit integers before nir_lower_convert_alu_types(),
+    * whose saturating and rounding conversions of OpenCL long make new 64-bit
+    * compares, selects and conversions: lower those too. One component at a
+    * time, so the unpacks of loaded values meet the packs of
+    * nir_lower_mem_access_bit_sizes() per component, and cancel. */
+   NIR_PASS(_, s, nir_lower_alu_to_scalar, is_64bit_alu, NULL);
+   NIR_PASS(_, s, nir_lower_int64);
+
    if (s->info.stage == MESA_SHADER_COMPUTE) {
       v->uses_discard = false;
       v->cs_fold = 1;
@@ -2844,6 +2869,9 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
     * packs (OpenCL: libclc's software fma() in a loop): split them, and the
     * optimizations cancel the packs */
    NIR_PASS(_, s, nir_lower_64bit_phis);
+   /* its unpacks of 64-bit vectors (OpenCL long3 lanes merged at an if) one
+    * component at a time too */
+   NIR_PASS(_, s, nir_lower_alu_to_scalar, is_64bit_alu, NULL);
    NIR_PASS(_, s, nir_lower_alu_width, alu_width_cb, NULL);
    NIR_PASS(_, s, nir_lower_phis_to_scalar, phi_width_cb, NULL);
 

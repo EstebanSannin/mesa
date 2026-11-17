@@ -354,6 +354,11 @@ etna_init_screen_caps(struct etna_screen *screen)
       caps->shader_buffer_offset_alignment = 16;
       caps->max_shader_buffer_size = 1 << 27;
 
+      /* The ISA has no 64-bit integer operations: nir_lower_int64() splits
+       * them all into 32-bit halves (lower_int64_options). OpenCL long and
+       * ulong, cles_khr_int64 on the embedded profile. */
+      caps->int64 = true;
+
       /* timestamps from the fence of a flush at the query point
        * (etnaviv_query_time.c): OpenCL profiling, and in GL
        * EXT_disjoint_timer_query. The fences signal from the interrupt, so
