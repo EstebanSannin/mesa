@@ -358,6 +358,15 @@ etna_reset_gpu_state(struct etna_context *ctx)
          etna_set_state(stream, VIVS_VS_SAMPLER_BASE, 0x00000020);
 
       etna_set_state(stream, VIVS_SH_CONFIG, VIVS_SH_CONFIG_RTNE_ROUNDING);
+
+      /* The split of the unified shader cache that
+       * etna_core_usc_attrib_size() assumes, with UNK16 = 2, as the Vivante
+       * kernel sets it. At the reset value, global loads of 16 bytes or more
+       * run at two thirds of the speed. */
+      if (screen->info->gpu.usc_size)
+         etna_set_state(stream, VIVS_GL_USC_CONTROL,
+                        VIVS_GL_USC_CONTROL_L1_CACHE_RATIO(etna_core_usc_l1_cache_ratio(screen->info)) |
+                        VIVS_GL_USC_CONTROL_UNK16(2));
    }
 
    if (VIV_FEATURE(screen, ETNA_FEATURE_BUG_FIXES18))

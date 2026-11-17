@@ -84,6 +84,7 @@ enum etna_feature {
    ETNA_FEATURE_TX_BORDER_CLAMP_FIX,
    ETNA_FEATURE_TESSELLATION_SHADERS,
    ETNA_FEATURE_PE_ADVANCE_BLEND_PART0,
+   ETNA_FEATURE_SEPARATE_LS,
    ETNA_FEATURE_NUM,
 };
 
@@ -151,11 +152,12 @@ etna_core_enable_feature(struct etna_core_info *info, enum etna_feature feature)
  * nominal L1 size and tessellation feature, with the L1 using one of a fixed
  * set of shares.
  *
- * Mirror gcmCONFIGUSC2 from the Vivante kernel driver to determine how much
- * cache is left for vertex attributes.
+ * Mirror gcmCONFIGUSC2 from the Vivante kernel driver to determine the L1
+ * share, and from it how much cache is left for vertex attributes.
+ * etna_reset_gpu_state() programs the same split.
  */
 static inline unsigned
-etna_core_usc_attrib_size(const struct etna_core_info *info)
+etna_core_usc_l1_share(const struct etna_core_info *info)
 {
    static const unsigned share[] = { 32, 24, 16, 8, 4, 2, 1, 0 };
    const unsigned usc_size = info->gpu.usc_size;
@@ -171,7 +173,36 @@ etna_core_usc_attrib_size(const struct etna_core_info *info)
       }
    }
 
-   return usc_size - l1 * best / 32;
+   return best; /* in 32nds of the nominal L1 size */
+}
+
+static inline unsigned
+etna_core_usc_attrib_size(const struct etna_core_info *info)
+{
+   return info->gpu.usc_size - info->gpu.l1_cache_size * etna_core_usc_l1_share(info) / 32;
+}
+
+/* The L1 share as the L1_CACHE_RATIO field of GL_USC_CONTROL takes it: an
+ * index into the kernel's table of shares 1, 1/2, 1/4, 1/8, 1/16, 1/32, 3/4
+ * and 0. Cores with a separate local storage and compute-only cores keep the
+ * whole L1. */
+static inline unsigned
+etna_core_usc_l1_cache_ratio(const struct etna_core_info *info)
+{
+   if (etna_core_has_feature(info, ETNA_FEATURE_SEPARATE_LS) ||
+       etna_core_has_feature(info, ETNA_FEATURE_COMPUTE_ONLY))
+      return 0;
+
+   switch (etna_core_usc_l1_share(info)) {
+   case 32: return 0;
+   case 16: return 1;
+   case 8:  return 2;
+   case 4:  return 3;
+   case 2:  return 4;
+   case 1:  return 5;
+   case 24: return 6;
+   default: return 7;
+   }
 }
 
 /* The vertex shader gets what is left of the attribute buffer, in KB. */
