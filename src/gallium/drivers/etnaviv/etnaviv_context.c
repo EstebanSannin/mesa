@@ -750,6 +750,31 @@ etna_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       pipe_resource_reference(&indexbuf, NULL);
 }
 
+/* Close the fence fds of the compute-only context's jobs that completed, and
+ * remember one that the hang check killed. Done at every flush with a fence
+ * fd, so that only the jobs in flight keep one: rusticl asks only its queue
+ * contexts for their reset status, never the helper context of its uploads
+ * and maps. */
+static void
+etna_prune_job_fences(struct etna_context *ctx)
+{
+   unsigned pending = 0;
+
+   util_dynarray_foreach(&ctx->job_fence_fds, int, fd) {
+      const int s = etna_fence_fd_status(*fd);
+
+      if (s == 0) {
+         *util_dynarray_element(&ctx->job_fence_fds, int, pending++) = *fd;
+         continue;
+      }
+
+      if (s < 0)
+         ctx->job_reset = true;
+      close(*fd);
+   }
+   util_dynarray_resize(&ctx->job_fence_fds, int, pending);
+}
+
 void
 etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
            enum pipe_flush_flags flags, bool internal)
@@ -806,8 +831,10 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
 
    /* a copy of the job's fence fd for etna_get_device_reset_status() */
    if (ctx->compute_only && out_fence_fd >= 0) {
-      int fd = os_dupfd_cloexec(out_fence_fd);
+      int fd;
 
+      etna_prune_job_fences(ctx);
+      fd = os_dupfd_cloexec(out_fence_fd);
       if (fd >= 0)
          util_dynarray_append_typed(&ctx->job_fence_fds, int, fd);
    }
@@ -839,22 +866,11 @@ static enum pipe_reset_status
 etna_get_device_reset_status(struct pipe_context *pctx)
 {
    struct etna_context *ctx = etna_context(pctx);
-   enum pipe_reset_status status = PIPE_NO_RESET;
-   unsigned pending = 0;
+   enum pipe_reset_status status;
 
-   util_dynarray_foreach(&ctx->job_fence_fds, int, fd) {
-      const int s = etna_fence_fd_status(*fd);
-
-      if (s == 0) {
-         *util_dynarray_element(&ctx->job_fence_fds, int, pending++) = *fd;
-         continue;
-      }
-
-      if (s < 0)
-         status = PIPE_GUILTY_CONTEXT_RESET;
-      close(*fd);
-   }
-   util_dynarray_resize(&ctx->job_fence_fds, int, pending);
+   etna_prune_job_fences(ctx);
+   status = ctx->job_reset ? PIPE_GUILTY_CONTEXT_RESET : PIPE_NO_RESET;
+   ctx->job_reset = false;
 
    return status;
 }
