@@ -1964,7 +1964,7 @@ lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shade
 }
 
 /* OpenCL 1D image buffers that are read only come as buffer textures, which
- * the texture unit can't sample, and OpenCL 2D textures up to 64 bits are read
+ * the texture unit can't sample, and OpenCL 2D textures are read
  * faster by the image instructions (lower_tex2d_to_image()): read them with
  * those, as images 8 + texture index (see etna_uniform_image()). */
 static bool

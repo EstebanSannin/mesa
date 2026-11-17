@@ -238,10 +238,10 @@ etna_compute_fetch_sampler(struct etna_context *ctx)
    return ctx->cs_fetch_sampler;
 }
 
-/* An OpenCL 2D texture that the image instructions can read: a format of up
- * to 64 bits with an image format word, linear or 4x4 tiled, and no swizzle
- * other than the format's own (the descriptor gives the format's channels,
- * a missing one as 0, and alpha as 1). */
+/* An OpenCL 2D texture that the image instructions can read: a format with
+ * an image format word, linear or 4x4 tiled, and no swizzle other than the
+ * format's own (the descriptor gives the format's channels, a missing one as
+ * 0, and alpha as 1). */
 static bool
 etna_compute_view_reads_as_image(const struct pipe_sampler_view *sv)
 {
@@ -250,7 +250,6 @@ etna_compute_view_reads_as_image(const struct pipe_sampler_view *sv)
    const unsigned char swizzle[4] = { sv->swizzle_r, sv->swizzle_g, sv->swizzle_b, sv->swizzle_a };
 
    if (sv->target != PIPE_TEXTURE_2D || !etna_format_is_image_format(sv->format) ||
-       util_format_get_blocksize(sv->format) > 8 ||
        (rsc->layout != ETNA_LAYOUT_LINEAR && rsc->layout != ETNA_LAYOUT_TILED))
       return false;
 
@@ -300,13 +299,13 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
          }
       }
 
-      /* OpenCL 2D textures of formats up to 64 bits are read with img_load
-       * as well, as NXP's OpenCL does. GC7000 r6204's texture unit fetches
-       * about 165 M texels a second (95 M RGBA8), from its cache as from
-       * memory; img_load reads RGBA8 twice as fast. 128-bit formats stay with
-       * the texture unit: their two planes take two img_loads, which is
-       * slower. The views stay bound for the reads that keep the texture unit
-       * (lower_texbuf_to_image()). */
+      /* OpenCL 2D textures are read with img_load as well, as NXP's OpenCL
+       * does. GC7000 r6204's texture unit fetches about 165 M texels a
+       * second (95 M RGBA8), from its cache as from memory; img_load reads
+       * RGBA8 twice as fast. A 128-bit format takes two img_loads, one per
+       * plane: 2.5 times as fast as the texture unit's two fetches on images
+       * of up to 8 MB, as fast on 64 MB. The views stay bound for the reads
+       * that keep the texture unit (lower_texbuf_to_image()). */
       ctx->cs_teximg_mask = 0;
       for (unsigned t = 0; t < MIN2(n, 8); t++) {
          if (ctx->compute_only && views[t] && etna_compute_view_reads_as_image(views[t])) {
