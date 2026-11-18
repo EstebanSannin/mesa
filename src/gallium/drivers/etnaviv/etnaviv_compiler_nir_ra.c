@@ -258,9 +258,53 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
 
    ralloc_free(defs);
 
-   /* Allocate registers. There is no spilling: a shader that doesn't fit
+   /* Spill costs (compute, when compile_shader_spill() asks): an ALU,
+    * texture or load result may go to private memory at the cost of its
+    * uses, ten times as much in each loop around one. Not the inputs, the
+    * registers of phi webs, nor what spilling itself made. */
+   c->num_spill_defs = 0;
+   if (c->spill && c->spill->enabled) {
+      for (unsigned i = 0; i < num_nodes; i++) {
+         nir_def *def = defs[i].def;
+         nir_instr *instr = nir_def_instr(def);
+         bool spillable = instr->type == nir_instr_type_alu || instr->type == nir_instr_type_tex;
+
+         if (instr->type == nir_instr_type_intrinsic) {
+            const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            spillable = op != nir_intrinsic_load_input && op != nir_intrinsic_decl_reg &&
+                        op != nir_intrinsic_load_instance_id && op != nir_intrinsic_load_vertex_id;
+         }
+         if (!spillable || _mesa_set_search(c->no_spill, instr))
+            continue;
+
+         float cost = 1.0f;
+         nir_foreach_use_including_if(src, def) {
+            float weight = 1.0f;
+            if (!nir_src_is_if(src)) {
+               for (nir_cf_node *n = nir_src_use_instr(src)->block->cf_node.parent; n; n = n->parent) {
+                  if (n->type == nir_cf_node_loop)
+                     weight *= 10.0f;
+               }
+            }
+            cost += weight;
+         }
+         ra_set_node_spill_cost(g, i, cost);
+      }
+   }
+
+   /* Allocate registers. Without spilling, a shader that doesn't fit
     * fails to compile. */
    bool ok = ra_allocate(g);
+
+   if (!ok && c->spill && c->spill->enabled) {
+      while (c->num_spill_defs < ETNA_SPILL_BATCH) {
+         const int n = ra_get_best_spill_node(g);
+         if (n < 0)
+            break;
+         c->spill_defs[c->num_spill_defs++] = defs[n].def;
+         ra_set_node_spill_cost(g, n, 0.0f);
+      }
+   }
 
    c->g = g;
    c->live_map = live_map;

@@ -35,6 +35,22 @@
 #include "util/log.h"
 #include "util/macros.h"
 
+/* Register spilling (compute): what compile_shader_spill() asks for and
+ * what emit_shader() did */
+struct etna_spill {
+   bool no_vectorize; /* keep the ALU scalar: vectorizing merges independent
+                       * chains and keeps their values live together */
+   bool enabled;
+   unsigned start;    /* first byte of the spill slots in an invocation's private memory */
+   unsigned reserve;  /* bytes reserved there */
+   unsigned used;     /* bytes the spills wanted */
+   bool ra_failed;    /* the register allocator failed */
+};
+
+#define ETNA_SPILL_BATCH 4
+/* spill slots per invocation: private memory for every invocation of a grid */
+#define ETNA_SPILL_MAX_BYTES 1024
+
 struct etna_compile {
    nir_shader *nir;
    nir_function_impl *impl;
@@ -60,6 +76,15 @@ struct etna_compile {
    struct ra_graph *g;
    unsigned *live_map;
    unsigned num_nodes;
+
+   /* register spilling: the address of this invocation's spill slots, what
+    * mustn't be spilled (that address, reloads, stores), and the values the
+    * allocator picked */
+   struct etna_spill *spill;
+   nir_def *spill_base;
+   struct set *no_spill;
+   nir_def *spill_defs[ETNA_SPILL_BATCH];
+   unsigned num_spill_defs;
 
    /* There was an error during compilation */
    bool error;

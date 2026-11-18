@@ -1307,6 +1307,99 @@ lower_alu(struct etna_compile *c, nir_alu_instr *alu)
    }
 }
 
+/* The address of this invocation's spill slots, as lower_private_access()
+ * addresses its private memory, at the start of the shader. Made before
+ * emit_shader() turns the system values into uniforms; the inputs are the
+ * fixed registers of the global, local and workgroup ids. */
+static void
+build_spill_base(struct etna_compile *c, nir_builder *b)
+{
+   struct etna_shader_variant *v = c->variant;
+
+   b->cursor = nir_before_impl(c->impl);
+   v->cs_input_count = MAX2(v->cs_input_count, 3);
+
+   nir_def *lid = nir_load_input(b, 3, 32, nir_imm_int(b, 0), .base = 1);
+   nir_def *wid = nir_iadd(b, nir_load_input(b, 3, 32, nir_imm_int(b, 0), .base = 2),
+                           nir_load_base_workgroup_id(b, 32));
+   nir_def *num = nir_load_num_workgroups(b);
+   nir_def *size;
+   if (c->nir->info.workgroup_size_variable) {
+      size = nir_load_workgroup_size(b);
+   } else {
+      const uint16_t *s = c->nir->info.workgroup_size;
+      size = nir_imm_ivec3(b, s[0], s[1], s[2]);
+   }
+
+   nir_def *group = nir_iadd(b, nir_channel(b, wid, 0),
+                             nir_imul(b, nir_channel(b, num, 0),
+                                      nir_iadd(b, nir_channel(b, wid, 1),
+                                               nir_imul(b, nir_channel(b, num, 1),
+                                                        nir_channel(b, wid, 2)))));
+   nir_def *threads = nir_imul(b, nir_channel(b, size, 0),
+                               nir_imul(b, nir_channel(b, size, 1), nir_channel(b, size, 2)));
+   nir_def *index = nir_iadd(b, nir_channel(b, lid, 0),
+                             nir_imul(b, nir_iadd(b, nir_channel(b, lid, 1),
+                                                  nir_imul(b, nir_channel(b, lid, 2), nir_channel(b, size, 1))),
+                                      nir_channel(b, size, 0)));
+   nir_def *slot = nir_iadd(b, nir_imul(b, group, threads), index);
+
+   c->spill_base = nir_iadd(b, nir_load_scratch_base_ptr(b, 1, 32, .base = 1),
+                            nir_iadd_imm(b, nir_imul_imm(b, slot, v->cs_private_size), c->spill->start));
+   _mesa_set_add(c->no_spill, nir_def_instr(c->spill_base));
+}
+
+/* an immediate made after emit_shader() converted the others */
+static nir_def *
+spill_imm(struct etna_compile *c, nir_builder *b, uint32_t value)
+{
+   nir_def *imm = nir_imm_int(b, value);
+
+   nir_def_as_load_const(imm)->value[0] = CONST(value);
+   return imm;
+}
+
+/* Move the values the allocator picked to this invocation's spill slots:
+ * a store after the definition, a load before each use (16 bytes a value).
+ * False when the slots reserved are full. */
+static bool
+spill_values(struct etna_compile *c, nir_builder *b)
+{
+   struct etna_spill *spill = c->spill;
+
+   for (unsigned i = 0; i < c->num_spill_defs; i++) {
+      nir_def *def = c->spill_defs[i];
+      const unsigned offset = spill->used;
+
+      spill->used += 16;
+      if (spill->used > spill->reserve)
+         return false;
+
+      /* STORE takes its offset in a register (with an immediate it faulted) */
+      b->cursor = nir_after_instr(nir_def_instr(def));
+      nir_def *store_offset = nir_mov(b, spill_imm(c, b, offset));
+      _mesa_set_add(c->no_spill, nir_def_instr(store_offset));
+      nir_intrinsic_instr *store =
+         nir_store_global_etna(b, def, c->spill_base, store_offset,
+                               .write_mask = BITFIELD_MASK(def->num_components),
+                               .src_type = nir_type_invalid);
+
+      nir_foreach_use_including_if_safe(src, def) {
+         if (!nir_src_is_if(src) && nir_src_use_instr(src) == &store->instr)
+            continue;
+
+         b->cursor = nir_before_src(src);
+         nir_def *reload = nir_load_global_etna(b, def->num_components, 32, c->spill_base,
+                                                spill_imm(c, b, offset));
+         _mesa_set_add(c->no_spill, nir_def_instr(reload));
+         nir_src_rewrite(src, reload);
+      }
+   }
+
+   c->num_spill_defs = 0;
+   return true;
+}
+
 static bool
 emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
 {
@@ -1317,6 +1410,11 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
    unsigned indirect_max = 0;
 
    nir_builder b = nir_builder_create(c->impl);
+
+   if (c->spill && c->spill->enabled) {
+      c->no_spill = _mesa_pointer_set_create(NULL);
+      build_spill_base(c, &b);
+   }
 
    /* convert non-dynamic uniform loads to constants, etc */
    nir_foreach_block(block, c->impl) {
@@ -1558,12 +1656,21 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
    nir_convert_from_ssa(shader, true, false);
    nir_trivialize_registers(shader);
 
-   if (!etna_ra_assign(c, shader)) {
-      mesa_loge("etnaviv: register allocation failed (%u nodes)", c->num_nodes);
+   /* a failed allocation picks values to spill (compute, when asked) */
+   while (!etna_ra_assign(c, shader)) {
       ralloc_free(c->g);
       ralloc_free(c->live_map);
-      return false;
+      if (!c->num_spill_defs || !spill_values(c, &b)) {
+         mesa_loge("etnaviv: register allocation failed (%u nodes)", c->num_nodes);
+         if (c->spill)
+            c->spill->ra_failed = true;
+         ralloc_free(c->no_spill);
+         c->no_spill = NULL;
+         return false;
+      }
    }
+   ralloc_free(c->no_spill);
+   c->no_spill = NULL;
 
    emit_cf_list(c, &nir_shader_get_entrypoint(shader)->body);
 
@@ -2784,7 +2891,8 @@ lower_helper_invocation(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *
 }
 
 static bool
-compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop)
+compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop,
+               struct etna_spill *spill)
 {
    if (unlikely(!v))
       return false;
@@ -2798,6 +2906,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    v->cs_fold_loop = fold > 1 && fold_loop;
 
    c->variant = v;
+   c->spill = spill;
    c->info = v->shader->info;
    c->specs = v->shader->specs;
    c->nir = nir_shader_clone(NULL, v->shader->nir);
@@ -2883,7 +2992,9 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
                   nir_var_mem_shared | nir_var_mem_ssbo,
          .may_lower_unaligned_stores_to_atomics = true,
       };
-      v->cs_private_size = align(s->scratch_size, 16);
+      /* register spilling: room for the spill slots after the private memory */
+      spill->start = align(s->scratch_size, 16);
+      v->cs_private_size = spill->start + (spill->enabled ? align(spill->reserve, 16) : 0);
       if (v->cs_private_size)
          NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_private_access,
                   nir_metadata_control_flow, &v->cs_private_size);
@@ -3028,7 +3139,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       NIR_PASS(_, s, nir_lower_bool_to_int32);
    }
 
-   while( OPT(s, nir_opt_vectorize, etna_vectorize_cb, NULL) );
+   if (!c->spill->no_vectorize)
+      while (OPT(s, nir_opt_vectorize, etna_vectorize_cb, NULL));
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
 
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
@@ -3142,14 +3254,48 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 static bool
 compile_shader_spill(struct etna_shader_variant *v, unsigned fold, bool fold_loop)
 {
-   if (compile_shader(v, false, fold, fold_loop))
+   struct etna_spill spill = {};
+
+   if (compile_shader(v, false, fold, fold_loop, &spill))
       return true;
 
    /* the spilled constants are read with LOAD, which needs halti2 */
    if (!v || v->shader->info->halti < 2)
       return false;
 
-   return compile_shader(v, true, fold, fold_loop);
+   const bool ra_failed = spill.ra_failed;
+   spill = (struct etna_spill){};
+   if (compile_shader(v, true, fold, fold_loop, &spill))
+      return true;
+
+   if (v->stage != MESA_SHADER_COMPUTE || !(ra_failed || spill.ra_failed))
+      return false;
+
+   /* A compute shader that ran out of registers: first without vectorizing
+    * the ALU, which merges independent chains (the lanes of a long16
+    * division) and keeps four lanes' values live together. */
+   spill = (struct etna_spill){ .no_vectorize = true };
+   if (compile_shader(v, false, fold, fold_loop, &spill))
+      return true;
+
+   /* Then registers spilled to private memory, for an unfolded shader:
+    * compiled again with room for the spills, more room as long as they
+    * want more. A folded variant runs several invocations per thread,
+    * which the slots don't address. */
+   if (fold > 1 || !spill.ra_failed)
+      return false;
+
+   unsigned reserve = 64;
+   while (reserve <= ETNA_SPILL_MAX_BYTES) {
+      spill = (struct etna_spill){ .no_vectorize = true, .enabled = true, .reserve = reserve };
+      if (compile_shader(v, false, fold, fold_loop, &spill))
+         return true;
+      if (spill.used <= spill.reserve)
+         return false;
+      reserve *= 2;
+   }
+
+   return false;
 }
 
 /* A compute workgroup with barrier() must be resident in full: invocations x
