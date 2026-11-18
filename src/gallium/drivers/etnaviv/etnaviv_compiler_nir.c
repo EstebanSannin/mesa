@@ -67,8 +67,6 @@ etna_alu_to_scalar_filter_cb(const nir_instr *instr, const void *data)
    case nir_op_fcos:
    case nir_op_fsin:
    case nir_op_fdiv:
-   case nir_op_imul:
-   case nir_op_imad:
    case nir_op_imul_high:
    case nir_op_umul_high:
       return true;
@@ -105,6 +103,28 @@ etna_alu_to_scalar_filter_cb(const nir_instr *instr, const void *data)
    }
 
    return false;
+}
+
+/* IMULLO0 and IMADLO0 are scalar too, but a product is split only after
+ * nir_opt_algebraic_late(): it fuses iadd(imul) into an imad where it sees
+ * the imul, and a vector product split before it hides behind a vec. An
+ * OpenCL int4 multiply-add took four IMULLO0 and a vector ADD instead of
+ * four IMADLO0.
+ */
+static bool
+etna_alu_to_scalar_late_filter_cb(const nir_instr *instr, const void *data)
+{
+   if (instr->type == nir_instr_type_alu) {
+      switch (nir_instr_as_alu(instr)->op) {
+      case nir_op_imul:
+      case nir_op_imad:
+         return true;
+      default:
+         break;
+      }
+   }
+
+   return etna_alu_to_scalar_filter_cb(instr, data);
 }
 
 static void
@@ -3108,8 +3128,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, s, nir_opt_algebraic_late);
    /* the late rules fuse iadd(imul) into an imad as wide as the iadd, and
-    * IMADLO0 is scalar: split it again */
-   NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
+    * IMULLO0 and IMADLO0 are scalar: split the products now */
+   NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_late_filter_cb, c->info);
 
    bool folded = false;
    NIR_PASS(folded, s, nir_shader_intrinsics_pass, fold_offset_shift, nir_metadata_control_flow, NULL);
