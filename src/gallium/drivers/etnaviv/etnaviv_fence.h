@@ -54,6 +54,9 @@ bool
 etna_fence_failed(struct pipe_fence_handle *fence);
 
 void
+etna_fence_set_failed(struct pipe_fence_handle *fence);
+
+void
 etna_fence_screen_init(struct pipe_screen *pscreen);
 
 #endif

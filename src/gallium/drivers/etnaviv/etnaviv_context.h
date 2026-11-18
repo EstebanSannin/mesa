@@ -313,9 +313,13 @@ struct etna_context {
    bool compute_only;
    /* compute-only contexts (OpenCL): the fence fds of the jobs not known to
     * have completed, and whether one that completed was killed by the hang
-    * check since the last etna_get_device_reset_status() */
+    * check, or a dispatch was skipped (etna_launch_grid()), since the last
+    * etna_get_device_reset_status() */
    struct util_dynarray job_fence_fds;
    bool job_reset;
+   /* compute-only contexts (OpenCL): a dispatch was skipped since the last
+    * flush with a fence, which then fails (etna_flush()) */
+   bool cs_failed;
    /* the command stream goes to the NPU (machine learning jobs) */
    bool on_npu;
    bool in_atomic_emit;

@@ -622,6 +622,7 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    /* the fragment slots the dispatch samples */
    uint32_t slots = textures;
    bool swapped = false;
+   bool dispatched = false;
 
    /* set by etna_compute_swap_textures() for this dispatch */
    ctx->cs_texbuf_mask = 0;
@@ -1023,7 +1024,19 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    if (DBG_ENABLED(ETNA_DBG_FLUSH_ALL))
       pctx->flush(pctx, NULL, 0);
 
+   dispatched = true;
+
 out:
+   /* OpenCL: a dispatch skipped above fails the events of the next flush,
+    * and rusticl then fails the queue's later commands (a reset this context
+    * caused, etna_get_device_reset_status()), instead of reporting success
+    * with the results unwritten. OpenGL keeps its limits within what the
+    * hardware runs, and only skips. */
+   if (!dispatched && ctx->compute_only) {
+      ctx->cs_failed = true;
+      ctx->job_reset = true;
+   }
+
    if (swapped)
       etna_compute_swap_textures(ctx, &saved, false, shader, NULL, 0);
 }

@@ -44,6 +44,8 @@ struct pipe_fence_handle {
    /* a fence of a compute-only context (OpenCL): its fd tells a job the
     * kernel's hang check killed, see etna_screen_fence_finish() */
    bool check_error;
+   /* a compute dispatch before it was skipped (OpenCL, etna_launch_grid()) */
+   bool dispatch_failed;
 };
 
 static void
@@ -80,11 +82,19 @@ etna_fence_fd_status(int fd)
    return info.status;
 }
 
-/* a fence fd that signaled with an error: a job the kernel killed */
+/* a fence fd that signaled with an error: a job the kernel killed; or a
+ * fence after a compute dispatch the driver skipped */
 bool
 etna_fence_failed(struct pipe_fence_handle *fence)
 {
-   return fence->fence_fd >= 0 && etna_fence_fd_status(fence->fence_fd) < 0;
+   return fence->dispatch_failed ||
+          (fence->fence_fd >= 0 && etna_fence_fd_status(fence->fence_fd) < 0);
+}
+
+void
+etna_fence_set_failed(struct pipe_fence_handle *fence)
+{
+   fence->dispatch_failed = true;
 }
 
 static bool
@@ -96,16 +106,18 @@ etna_screen_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
       if (sync_wait(fence->fence_fd, timeout / 1000000))
          return false;
 
-      /* A killed OpenCL job did its work in part, or not at all: don't report
-       * it as finished. rusticl then fails its events (CL_OUT_OF_RESOURCES)
-       * instead of returning CL_SUCCESS with incomplete results. */
-      return !(fence->check_error && etna_fence_fd_status(fence->fence_fd) < 0);
+      /* A killed OpenCL job did its work in part, or not at all, and a
+       * skipped dispatch none: don't report it as finished. rusticl then
+       * fails its events (CL_OUT_OF_RESOURCES) instead of returning
+       * CL_SUCCESS with incomplete results. */
+      return !(fence->dispatch_failed ||
+               (fence->check_error && etna_fence_fd_status(fence->fence_fd) < 0));
    }
 
    if (etna_pipe_wait_ns(fence->screen->pipe, fence->timestamp, timeout))
       return false;
 
-   return true;
+   return !fence->dispatch_failed;
 }
 
 void

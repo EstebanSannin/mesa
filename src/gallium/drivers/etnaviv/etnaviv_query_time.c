@@ -63,7 +63,12 @@ etna_time_end_query(struct etna_context *ctx, struct etna_query *q)
    pctx->screen->fence_reference(pctx->screen, &tq->fence, NULL);
    tq->time = 0;
    tq->cpu = os_time_get_nano();
+
+   /* A dispatch skipped before this query fails this fence, and also the one
+    * of the flush that ends the commands (rusticl's): keep it for that. */
+   const bool cs_failed = ctx->cs_failed;
    pctx->flush(pctx, &tq->fence, PIPE_FLUSH_FENCE_FD);
+   ctx->cs_failed = cs_failed;
 }
 
 /* when the fence signaled, from its sync file */

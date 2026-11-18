@@ -856,8 +856,15 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
          util_dynarray_append_typed(&ctx->job_fence_fds, int, fd);
    }
 
-   if (fence)
+   if (fence) {
       *fence = etna_fence_create(pctx, out_fence_fd);
+
+      /* a dispatch since the last fence was skipped (OpenCL): this fence
+       * fails, and rusticl fails its events (etna_screen_fence_finish()) */
+      if (*fence && ctx->cs_failed)
+         etna_fence_set_failed(*fence);
+      ctx->cs_failed = false;
+   }
 
    util_dynarray_clear(&ctx->pending_status);
 
@@ -875,10 +882,10 @@ etna_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
 }
 
 /* OpenCL: a job of this context that the kernel's hang check killed (its fence
- * completed with an error) is a reset this context caused. The job's events
- * already failed (etna_screen_fence_finish()); rusticl then fails the events
- * of the queue from there on, so a later read doesn't return incomplete
- * results as if they were valid. */
+ * completed with an error), or a dispatch the driver skipped, is a reset this
+ * context caused. The job's events already failed (etna_screen_fence_finish());
+ * rusticl then fails the events of the queue from there on, so a later read
+ * doesn't return incomplete results as if they were valid. */
 static enum pipe_reset_status
 etna_get_device_reset_status(struct pipe_context *pctx)
 {
