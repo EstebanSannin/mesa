@@ -255,6 +255,11 @@ etna_init_compute_caps(struct etna_screen *screen)
    caps->max_clock_frequency = 1000;
    caps->subgroup_sizes = 4;
 
+   /* OpenCL half floats (cl_khr_fp16): no 16-bit float ALU, the compiler
+    * widens the arithmetic and converts in software (lower_fp16_conversion()).
+    * Not in the shader caps, where GLSL would move mediump onto that path. */
+   caps->fp16 = true;
+
    /* OpenCL wants allocations of at least a quarter of the global memory
     * (up to 1 GB) from a device that isn't CL_DEVICE_TYPE_CUSTOM: report four
     * times the largest allocation. NXP's OpenCL reports 256 MB, with 128 MB
