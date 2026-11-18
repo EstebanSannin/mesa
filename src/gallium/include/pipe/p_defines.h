@@ -857,6 +857,10 @@ struct pipe_compute_caps {
    unsigned max_variable_threads_per_block;
    uint64_t max_mem_alloc_size;
    uint64_t max_global_size;
+   /* 16-bit floats in the kernels of a compute-only frontend (OpenCL
+    * cl_khr_fp16), for a driver that doesn't claim them in the compute
+    * shader caps: GLSL would lower mediump to 16 bits with those */
+   bool fp16;
 };
 
 struct pipe_mesh_caps {
