@@ -2586,6 +2586,182 @@ fold_narrow_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+/* The low 8 or 16 bits of a sum, product or bitwise op depend only on
+ * the low 8 or 16 bits of its sources, and a product by 2^k (a left shift by
+ * k) needs k bits less of the other source than its users need of it: the
+ * sign extension of an 8-bit value is ishr(imul(x, 1 << 24), 24).
+ * narrow_use_bits() is the number of low bits of a value that one use needs,
+ * from need[], the bits the users of each def need (0: none known yet).
+ */
+static unsigned
+narrow_class(unsigned bits)
+{
+   return bits <= 8 ? 8 : bits <= 16 ? 16 : 32;
+}
+
+static unsigned
+narrow_shift(nir_alu_instr *alu, unsigned other, bool shift)
+{
+   if (!nir_src_is_const(alu->src[other].src))
+      return 0;
+
+   const uint32_t v = nir_src_comp_as_uint(alu->src[other].src, alu->src[other].swizzle[0]);
+   for (unsigned i = 1; i < alu->def.num_components; i++) {
+      if (nir_src_comp_as_uint(alu->src[other].src, alu->src[other].swizzle[i]) != v)
+         return 0;
+   }
+
+   if (shift)
+      return v & 31;
+   return util_is_power_of_two_nonzero(v) ? ffs(v) - 1 : 0;
+}
+
+static unsigned
+narrow_use_bits(nir_src *src, const uint8_t *need)
+{
+   if (nir_src_is_if(src))
+      return 32;
+
+   nir_instr *instr = nir_src_use_instr(src);
+   if (instr->type == nir_instr_type_phi)
+      return need[nir_instr_as_phi(instr)->def.index];
+
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      /* the value of a store that the emitter makes 8 or 16 bits wide */
+      if (intr->intrinsic == nir_intrinsic_store_global_etna && src == &intr->src[0]) {
+         const nir_alu_type type = nir_intrinsic_src_type(intr);
+         return type == nir_type_uint8 ? 8 : type == nir_type_uint16 ? 16 : 32;
+      }
+      return 32;
+   }
+
+   if (instr->type != nir_instr_type_alu)
+      return 32;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->def.bit_size != 32 && !nir_op_infos[alu->op].is_conversion)
+      return 32;
+
+   const unsigned idx = container_of(src, nir_alu_src, src) - alu->src;
+   const unsigned bits = need[alu->def.index];
+
+   switch (alu->op) {
+   case nir_op_u2u8:
+   case nir_op_i2i8:
+      return 8;
+   case nir_op_u2u16:
+   case nir_op_i2i16:
+      return 16;
+   case nir_op_iand: {
+      /* a mask */
+      const unsigned other = 1 - idx;
+      if (nir_src_is_const(alu->src[other].src)) {
+         uint32_t mask = 0;
+         for (unsigned i = 0; i < alu->def.num_components; i++)
+            mask |= nir_src_comp_as_uint(alu->src[other].src, alu->src[other].swizzle[i]);
+         return MIN2(bits, mask <= 0xff ? 8 : mask <= 0xffff ? 16 : 32);
+      }
+      return bits;
+   }
+   case nir_op_imul: {
+      const unsigned k = narrow_shift(alu, 1 - idx, false);
+      return narrow_class(bits > k ? bits - k : 1);
+   }
+   case nir_op_ishl: {
+      if (idx != 0)
+         return 32;
+      const unsigned k = narrow_shift(alu, 1, true);
+      return narrow_class(bits > k ? bits - k : 1);
+   }
+   case nir_op_iadd:
+   case nir_op_ineg:
+   case nir_op_imad:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_inot:
+   case nir_op_mov:
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+      return bits;
+   default:
+      return 32;
+   }
+}
+
+/* OpenCL char and short arithmetic is lowered to 32 bits. A product or
+ * multiply-add whose users need only its low 8 or 16 bits becomes a lane
+ * product (imul8x4_etna and the others): one IMULLO0 or IMADLO0 for every
+ * component of a vector, where a 32-bit one takes one per component.
+ */
+static bool
+etna_narrow_products(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      bool impl_progress = false;
+      nir_index_ssa_defs(impl);
+      uint8_t *need = calloc(impl->ssa_alloc, 1);
+      if (!need)
+         return progress;
+
+      /* users before defs, until the phis of loops settle: need[] only grows */
+      bool changed;
+      do {
+         changed = false;
+         nir_foreach_block_reverse(block, impl) {
+            nir_foreach_instr_reverse(instr, block) {
+               nir_def *def = nir_instr_def(instr);
+               if (!def)
+                  continue;
+
+               unsigned bits = 0;
+               nir_foreach_use_including_if(src, def) {
+                  bits = MAX2(bits, narrow_use_bits(src, need));
+                  if (bits == 32)
+                     break;
+               }
+               if (bits > need[def->index]) {
+                  need[def->index] = bits;
+                  changed = true;
+               }
+            }
+         }
+      } while (changed);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            const unsigned bits = need[alu->def.index];
+            if (alu->def.bit_size != 32 || !bits || bits == 32)
+               continue;
+
+            if (alu->op == nir_op_imul)
+               alu->op = bits == 8 ? nir_op_imul8x4_etna : nir_op_imul16x2_etna;
+            else if (alu->op == nir_op_imad)
+               alu->op = bits == 8 ? nir_op_imad8x4_etna : nir_op_imad16x2_etna;
+            else
+               continue;
+            /* the bits above the lane can wrap */
+            alu->no_signed_wrap = false;
+            alu->no_unsigned_wrap = false;
+            impl_progress = true;
+         }
+      }
+
+      free(need);
+      nir_progress(impl_progress, impl, nir_metadata_control_flow);
+      progress |= impl_progress;
+   }
+
+   return progress;
+}
+
 /* the two operands of a global access for an OpenCL address: LOAD and STORE
  * add them, so base + offset needs no add of its own (and no register for an
  * offset of 0) */
@@ -3127,8 +3303,11 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, s, nir_opt_algebraic_late);
+   if (mesa_shader_stage_is_compute(s->info.stage))
+      NIR_PASS(_, s, etna_narrow_products);
    /* the late rules fuse iadd(imul) into an imad as wide as the iadd, and
-    * IMULLO0 and IMADLO0 are scalar: split the products now */
+    * IMULLO0 and IMADLO0 are scalar: split the products now (lane products
+    * compute every component) */
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_late_filter_cb, c->info);
 
    bool folded = false;

@@ -92,6 +92,10 @@ static const struct etna_op_info etna_ops[] = {
    IOP(imul_high, IMULHI0),
    UOP(umul_high, IMULHI0),
    IOP(imad, IMADLO0),
+   OPCT(imul8x4_etna, IMULLO0, TRUE, U8),
+   OPCT(imul16x2_etna, IMULLO0, TRUE, U16),
+   OPCT(imad8x4_etna, IMADLO0, TRUE, U8),
+   OPCT(imad16x2_etna, IMADLO0, TRUE, U16),
    IOP(ineg, ADD), /* ADD 0, -x */
    IOP(iabs, IABS),
    IOP(isign, SIGN),

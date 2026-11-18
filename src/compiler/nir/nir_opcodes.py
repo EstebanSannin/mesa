@@ -1403,6 +1403,32 @@ unsigned mask = ((1ull << bits) - 1) << offset;
 dst = (base & ~mask) | ((insert << offset) & mask);
 """)
 
+# Etnaviv-specific lane products. IMULLO0 and IMADLO0 with an 8- or 16-bit
+# type multiply (and add) each byte or half of a 32-bit component on its own,
+# without carries between them, and do so in every component of a vector (with
+# a 32-bit type they compute one component). The low byte or half of the
+# result is the low byte or half of the 32-bit imul or imad.
+binop("imul8x4_etna", tuint32, _2src_commutative, """
+dst = 0;
+for (unsigned i = 0; i < 32; i += 8)
+   dst |= (((src0 >> i) * (src1 >> i)) & 0xffu) << i;
+""")
+binop("imul16x2_etna", tuint32, _2src_commutative, """
+dst = 0;
+for (unsigned i = 0; i < 32; i += 16)
+   dst |= (((src0 >> i) * (src1 >> i)) & 0xffffu) << i;
+""")
+triop("imad8x4_etna", tuint32, _2src_commutative, """
+dst = 0;
+for (unsigned i = 0; i < 32; i += 8)
+   dst |= (((src0 >> i) * (src1 >> i) + (src2 >> i)) & 0xffu) << i;
+""")
+triop("imad16x2_etna", tuint32, _2src_commutative, """
+dst = 0;
+for (unsigned i = 0; i < 32; i += 16)
+   dst |= (((src0 >> i) * (src1 >> i) + (src2 >> i)) & 0xffffu) << i;
+""")
+
 quadop_horiz("vec4", 4, 1, 1, 1, 1, """
 dst.x = src0.x;
 dst.y = src1.x;
