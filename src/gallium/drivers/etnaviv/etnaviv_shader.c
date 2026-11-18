@@ -724,7 +724,9 @@ gather_tg4_shadow_samplers(const nir_shader *nir)
 
 /* Sample each texture slot with that slot's sampler state: record which
  * sampler a texture is used with when it isn't its own (OpenCL). A texture
- * used with two different samplers keeps the first. */
+ * used with two different samplers keeps the first. The texture instruction
+ * addresses the slot by the sampler index, so an op without a sampler
+ * (OpenCL's texel fetches) gets its texture's: rusticl leaves it at 0. */
 static void
 remap_samplers(struct etna_shader *shader)
 {
@@ -737,8 +739,13 @@ remap_samplers(struct etna_shader *shader)
             nir_tex_instr *tex = nir_instr_as_tex(instr);
             const unsigned t = tex->texture_index, s = tex->sampler_index;
 
-            if (!nir_tex_instr_need_sampler(tex) || t == s || t >= 32)
+            if (t == s || t >= 32)
                continue;
+
+            if (!nir_tex_instr_need_sampler(tex)) {
+               tex->sampler_index = t;
+               continue;
+            }
 
             if (!(shader->sampler_remap & BITFIELD_BIT(t))) {
                shader->sampler_remap |= BITFIELD_BIT(t);
