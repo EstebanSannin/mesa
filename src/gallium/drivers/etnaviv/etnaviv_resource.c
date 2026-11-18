@@ -969,6 +969,42 @@ static void etna_resource_finish_ts_import(struct etna_screen *screen,
    rsc->base.next = NULL;
 }
 
+/* A buffer of another context or screen, such as an OpenGL buffer that
+ * OpenCL uses (cl_khr_gl_sharing). */
+static struct pipe_resource *
+etna_buffer_resource_from_handle(struct pipe_screen *pscreen,
+                                 const struct pipe_resource *tmpl,
+                                 struct winsys_handle *handle)
+{
+   struct etna_buffer_resource *rsc;
+
+   if (handle->offset)
+      return NULL;
+
+   rsc = CALLOC_STRUCT(etna_buffer_resource);
+   if (!rsc)
+      return NULL;
+
+   rsc->base = *tmpl;
+   rsc->base.screen = pscreen;
+   pipe_reference_init(&rsc->base.reference, 1);
+   util_range_init(&rsc->valid_buffer_range);
+
+   rsc->bo = etna_screen_bo_from_handle(pscreen, handle);
+   if (!rsc->bo || etna_bo_size(rsc->bo) < pipe_buffer_size(tmpl)) {
+      if (rsc->bo)
+         etna_bo_del(rsc->bo);
+      util_range_destroy(&rsc->valid_buffer_range);
+      FREE(rsc);
+      return NULL;
+   }
+
+   /* the contents come from the exporter */
+   util_range_add(&rsc->base, &rsc->valid_buffer_range, 0, pipe_buffer_size(tmpl));
+
+   return &rsc->base;
+}
+
 static struct pipe_resource *
 etna_resource_from_handle(struct pipe_screen *pscreen,
                           const struct pipe_resource *tmpl,
@@ -985,6 +1021,9 @@ etna_resource_from_handle(struct pipe_screen *pscreen,
        tmpl->target, util_format_name(tmpl->format), tmpl->width0,
        tmpl->height0, tmpl->depth0, tmpl->array_size, tmpl->last_level,
        tmpl->nr_samples, tmpl->usage, tmpl->bind, tmpl->flags);
+
+   if (tmpl->target == PIPE_BUFFER)
+      return etna_buffer_resource_from_handle(pscreen, tmpl, handle);
 
    rsc = CALLOC_STRUCT(etna_resource);
    if (!rsc)
@@ -1031,7 +1070,13 @@ etna_resource_from_handle(struct pipe_screen *pscreen,
 
    level->layer_stride = level->stride * util_format_get_nblocksy(prsc->format,
                                                                   level->padded_height);
-   level->size = level->layer_stride;
+   /* Level 0 as setup_miptree() lays it out: the layers of an array or cube
+    * texture, or the slices of a 3D texture, layer_stride apart, then the
+    * second plane of an emulated 128-bit format. OpenCL imports OpenGL
+    * textures of every target (cl_khr_gl_sharing). */
+   level->size = level->layer_stride * prsc->array_size;
+   if (eil_format_is_emulated_128bit(prsc->format))
+      level->size *= 2;
 
    rsc->render_compatible = etna_resource_is_render_compatible(pscreen, rsc);
 
@@ -1046,15 +1091,17 @@ etna_resource_from_handle(struct pipe_screen *pscreen,
    /* The DDX must give us a BO which conforms to our padding size.
     * The stride of the BO must be greater or equal to our padded
     * stride. The size of the BO must accomodate the padded height. */
-   if (level->stride < util_format_get_stride(tmpl->format, level->padded_width)) {
+   if (level->stride < util_format_get_stride(eil_format_emulated(tmpl->format),
+                                              level->padded_width)) {
       BUG("BO stride %u is too small for RS engine width padding (%u, format %s)",
-          level->stride, util_format_get_stride(tmpl->format, level->padded_width),
+          level->stride, util_format_get_stride(eil_format_emulated(tmpl->format),
+                                                level->padded_width),
           util_format_name(tmpl->format));
       goto fail;
    }
-   if (etna_bo_size(rsc->bo) < level->stride * level->padded_height) {
+   if (etna_bo_size(rsc->bo) < level->size * level->depth) {
       BUG("BO size %u is too small for RS engine height padding (%u, format %s)",
-          etna_bo_size(rsc->bo), level->stride * level->padded_height,
+          etna_bo_size(rsc->bo), level->size * level->depth,
           util_format_name(tmpl->format));
       goto fail;
    }
@@ -1070,11 +1117,32 @@ fail:
    return NULL;
 }
 
+/* Buffers are shared as dma-bufs only: OpenCL imports OpenGL buffers
+ * (cl_khr_gl_sharing). */
 static bool
-etna_resource_get_handle(struct pipe_screen *pscreen,
-                         struct pipe_context *pctx,
-                         struct pipe_resource *prsc,
-                         struct winsys_handle *handle, unsigned usage)
+etna_buffer_resource_get_handle(struct pipe_resource *prsc,
+                                struct winsys_handle *handle)
+{
+   if (handle->type != WINSYS_HANDLE_TYPE_FD)
+      return false;
+
+   int fd = etna_bo_dmabuf(etna_buffer_resource(prsc)->bo);
+   if (fd < 0)
+      return false;
+
+   handle->handle = fd;
+   handle->stride = 0;
+   handle->offset = 0;
+   handle->modifier = DRM_FORMAT_MOD_LINEAR;
+
+   return true;
+}
+
+static bool
+etna_texture_resource_get_handle(struct pipe_screen *pscreen,
+                                 struct pipe_context *pctx,
+                                 struct pipe_resource *prsc,
+                                 struct winsys_handle *handle, unsigned usage)
 {
    struct etna_screen *screen = etna_screen(pscreen);
    struct etna_resource *rsc = etna_resource(prsc);
@@ -1140,6 +1208,18 @@ etna_resource_get_handle(struct pipe_screen *pscreen,
    } else {
       return false;
    }
+}
+
+static bool
+etna_resource_get_handle(struct pipe_screen *pscreen,
+                         struct pipe_context *pctx,
+                         struct pipe_resource *prsc,
+                         struct winsys_handle *handle, unsigned usage)
+{
+   if (prsc->target == PIPE_BUFFER)
+      return etna_buffer_resource_get_handle(prsc, handle);
+
+   return etna_texture_resource_get_handle(pscreen, pctx, prsc, handle, usage);
 }
 
 static bool

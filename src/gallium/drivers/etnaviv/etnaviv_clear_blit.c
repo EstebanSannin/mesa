@@ -295,6 +295,12 @@ static void
 etna_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
 {
    MESA_TRACE_FUNC();
+
+   /* A buffer has no render copy and no tile status to resolve: OpenCL
+    * flushes the OpenGL buffers it uses (cl_khr_gl_sharing). */
+   if (prsc->target == PIPE_BUFFER)
+      return;
+
    struct etna_context *ctx = etna_context(pctx);
    struct etna_resource *rsc = etna_resource(prsc);
 

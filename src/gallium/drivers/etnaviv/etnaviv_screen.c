@@ -42,6 +42,7 @@
 #include "etnaviv_yuv.h"
 
 #include "util/hash_table.h"
+#include "util/mesa-blake3.h"
 #include "util/os_time.h"
 #include "util/u_debug.h"
 #include "util/u_math.h"
@@ -53,6 +54,8 @@
 #include "frontend/drm_driver.h"
 
 #include "drm-uapi/drm_fourcc.h"
+
+#include "git_sha1.h"
 
 #define ETNA_DRM_VERSION_FENCE_FD      ETNA_DRM_VERSION(1, 1)
 #define ETNA_DRM_VERSION_PERFMON       ETNA_DRM_VERSION(1, 2)
@@ -150,6 +153,45 @@ static const char *
 etna_screen_get_device_vendor(struct pipe_screen *pscreen)
 {
    return "Vivante";
+}
+
+/* The OpenGL and the OpenCL screens of one GPU core report the same device
+ * UUID: OpenCL shares objects only with the device of the OpenGL context
+ * (cl_khr_gl_sharing). There is one core of a kind per SoC, so the core's
+ * identity serves as the UUID, hashed. */
+static void
+etna_screen_get_device_uuid(struct pipe_screen *pscreen, char *uuid)
+{
+   const struct etna_core_info *info = etna_screen(pscreen)->info;
+   const uint32_t id[] = {
+      info->model, info->revision, info->product_id, info->eco_id, info->customer_id,
+   };
+   static const char name[] = "etnaviv";
+   uint8_t hash[BLAKE3_KEY_LEN];
+   blake3_hasher ctx;
+
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, name, strlen(name));
+   _mesa_blake3_update(&ctx, id, sizeof(id));
+   _mesa_blake3_final(&ctx, hash);
+
+   STATIC_ASSERT(BLAKE3_KEY_LEN >= PIPE_UUID_SIZE);
+   memcpy(uuid, hash, PIPE_UUID_SIZE);
+}
+
+/* Builds of the same Mesa version and commit lay out memory the same way. */
+static void
+etna_screen_get_driver_uuid(struct pipe_screen *pscreen, char *uuid)
+{
+   static const char driver_id[] = PACKAGE_VERSION MESA_GIT_SHA1;
+   uint8_t hash[BLAKE3_KEY_LEN];
+   blake3_hasher ctx;
+
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, driver_id, strlen(driver_id));
+   _mesa_blake3_final(&ctx, hash);
+
+   memcpy(uuid, hash, PIPE_UUID_SIZE);
 }
 
 static void
@@ -370,6 +412,11 @@ etna_init_screen_caps(struct etna_screen *screen)
        * claim a microsecond. */
       caps->query_timestamp = true;
       caps->timer_resolution = 1000;
+
+      /* OpenCL images and buffers of OpenGL objects: dma-buf export and
+       * import of buffers and of textures of every target, and a device
+       * UUID (etna_screen_get_device_uuid()). */
+      caps->cl_gl_sharing = true;
    }
 
    caps->glsl_feature_level =
@@ -1203,6 +1250,8 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    pscreen->get_name = etna_screen_get_name;
    pscreen->get_vendor = etna_screen_get_vendor;
    pscreen->get_device_vendor = etna_screen_get_device_vendor;
+   pscreen->get_device_uuid = etna_screen_get_device_uuid;
+   pscreen->get_driver_uuid = etna_screen_get_driver_uuid;
 
    pscreen->context_create = etna_context_create;
    pscreen->is_format_supported = etna_screen_is_format_supported;
