@@ -276,9 +276,13 @@ etna_init_compute_caps(struct etna_screen *screen)
 {
    struct pipe_compute_caps *caps =
       (struct pipe_compute_caps *)&screen->base.compute_caps;
-   /* With CL_THREAD_ALLOCATION sized for the whole workgroup, barrier() works up to
-    * 256 invocations; 512 hangs (measured on GC7000 r6204 with a 1-temp kernel). */
-   const unsigned max_threads = debug_get_num_option("ETNA_CL_MAX_THREADS", 256);
+   /* Workgroups of up to 512 invocations, as NXP's OpenCL. One that uses
+    * barrier() must be resident in full (etna_cs_barrier_capacity(): a 1-temp
+    * kernel unfolded hung at 512 on GC7000 r6204). Such a workgroup runs
+    * folded onto fewer threads (etna_compile_shader()), and a kernel that
+    * doesn't fit even folded reports a smaller CL_KERNEL_WORK_GROUP_SIZE
+    * (etna_get_compute_state_info()). */
+   const unsigned max_threads = debug_get_num_option("ETNA_CL_MAX_THREADS", 512);
 
    if (!etna_compute_supported(screen))
       return;
