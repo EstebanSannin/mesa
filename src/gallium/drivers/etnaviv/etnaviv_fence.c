@@ -80,6 +80,13 @@ etna_fence_fd_status(int fd)
    return info.status;
 }
 
+/* a fence fd that signaled with an error: a job the kernel killed */
+bool
+etna_fence_failed(struct pipe_fence_handle *fence)
+{
+   return fence->fence_fd >= 0 && etna_fence_fd_status(fence->fence_fd) < 0;
+}
+
 static bool
 etna_screen_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
                          struct pipe_fence_handle *fence, uint64_t timeout)

@@ -22,6 +22,7 @@
 #include "util/u_memory.h"
 
 #include "etnaviv_context.h"
+#include "etnaviv_fence.h"
 #include "etnaviv_query.h"
 
 struct etna_time_query {
@@ -98,11 +99,18 @@ etna_time_get_query_result(struct etna_context *ctx, struct etna_query *q,
    struct pipe_screen *pscreen = ctx->base.screen;
 
    if (tq->fence) {
-      if (!pscreen->fence_finish(pscreen, &ctx->base, tq->fence,
-                                 wait ? OS_TIMEOUT_INFINITE : 0))
+      if (pscreen->fence_finish(pscreen, &ctx->base, tq->fence,
+                                wait ? OS_TIMEOUT_INFINITE : 0)) {
+         tq->time = MAX2(tq->cpu, fence_signal_time(pscreen, tq->fence));
+      } else if (etna_fence_failed(tq->fence)) {
+         /* A job the kernel killed (hang check) is over too: rusticl fails
+          * its event, and still reads the profiling times, with
+          * read_blocked(), which panics without one. Give the time on the
+          * CPU when the query ended. */
+         tq->time = tq->cpu;
+      } else {
          return false;
-
-      tq->time = MAX2(tq->cpu, fence_signal_time(pscreen, tq->fence));
+      }
       pscreen->fence_reference(pscreen, &tq->fence, NULL);
    }
 

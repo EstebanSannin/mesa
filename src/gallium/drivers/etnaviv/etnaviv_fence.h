@@ -50,6 +50,9 @@ etna_fence_create(struct pipe_context *pctx, int fence_fd);
 int
 etna_fence_fd_status(int fd);
 
+bool
+etna_fence_failed(struct pipe_fence_handle *fence);
+
 void
 etna_fence_screen_init(struct pipe_screen *pscreen);
 
