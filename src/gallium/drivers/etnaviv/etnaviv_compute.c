@@ -262,16 +262,158 @@ etna_compute_view_reads_as_image(const struct pipe_sampler_view *sv)
    return true;
 }
 
+/* the sampler state compute texture t is read with, NULL for none */
+static void *
+etna_compute_sampler_for(const struct etna_context *ctx, const struct etna_shader *shader,
+                         unsigned t)
+{
+   return ctx->cs_sampler[(shader->sampler_remap & BITFIELD_BIT(t)) ? shader->sampler_for_texture[t] : t];
+}
+
+/* The key bits of the textures read with img_load (cs_teximg_mask), and of
+ * those, the ones whose sampler takes the texel at the coordinates: nearest,
+ * unnormalized, clamped to the edge or to OpenCL's border */
+static void
+etna_compute_key_img_textures(const struct etna_context *ctx, const struct etna_shader *shader,
+                              struct etna_shader_key *key)
+{
+   static const union pipe_color_union no_border;
+
+   key->tex_img_read = ctx->cs_teximg_mask;
+   u_foreach_bit(t, ctx->cs_teximg_mask) {
+      const struct pipe_sampler_state *ss = etna_compute_sampler_for(ctx, shader, t);
+
+      if (!ss || !ss->unnormalized_coords || ss->wrap_s != ss->wrap_t ||
+          ss->min_img_filter != PIPE_TEX_FILTER_NEAREST ||
+          ss->mag_img_filter != PIPE_TEX_FILTER_NEAREST)
+         continue;
+
+      if (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE) {
+         key->tex_img_sampled |= BITFIELD_BIT(t);
+      } else if (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER &&
+                 !memcmp(&ss->border_color, &no_border, sizeof(no_border))) {
+         key->tex_img_sampled |= BITFIELD_BIT(t);
+         key->tex_img_border |= BITFIELD_BIT(t);
+         if (!util_format_has_alpha(ctx->cs_sampler_view[t]->format))
+            key->tex_img_border_a1 |= BITFIELD_BIT(t);
+      }
+   }
+}
+
+/* 128-bit images are two planes: access without a format in the shader
+ * (OpenCL) needs to know which; and which have one component. Textures 0-7
+ * read as images are images 8-15; textures 8-31 (wide dispatches) have their
+ * own bits. */
+static void
+etna_compute_key_texbuf(const struct etna_context *ctx, struct etna_shader_key *key)
+{
+   u_foreach_bit(t, ctx->cs_texbuf_mask) {
+      const enum pipe_format format = ctx->cs_sampler_view[t]->format;
+      const bool is_128bit = util_format_get_blocksize(format) == 16;
+      const bool comp1 = util_format_get_nr_components(format) == 1;
+
+      if (t < 8) {
+         key->img_128bit |= is_128bit ? BITFIELD_BIT(ETNA_MAX_SHADER_IMAGES + t) : 0;
+         key->img_1comp |= comp1 ? BITFIELD_BIT(ETNA_MAX_SHADER_IMAGES + t) : 0;
+      } else if (key->cs_tex_wide) {
+         key->tex_img_128bit |= is_128bit ? BITFIELD_BIT(t) : 0;
+         key->tex_img_1comp |= comp1 ? BITFIELD_BIT(t) : 0;
+      }
+   }
+}
+
+/* OpenCL kernels may read 32 images (max_sampler_views), compute has the 16
+ * fragment slots: in a dispatch of more than 16 textures (compute-only
+ * contexts) 2D textures are read with img_load where they can be (images
+ * 8 + texture), and the textures the texture unit still reads take the
+ * fragment slots in order. The compiler numbers them (remap_tex_slots()), so
+ * a first variant, without the slots' state in its key, tells which; the
+ * variant of the dispatch has the same. At most 16 textures may need the
+ * texture unit: 3D, array, 1D and cube textures, normalized coordinates,
+ * filtering, wrapping, formats img_load doesn't read. */
+static bool
+etna_compute_probe_wide(struct etna_context *ctx, struct etna_shader *shader,
+                        struct etna_shader_key *key, uint8_t *map, unsigned *num_slots)
+{
+   ctx->cs_texbuf_mask = 0;
+   ctx->cs_teximg_mask = 0;
+   for (unsigned t = 0; t < ctx->cs_num_sampler_views; t++) {
+      const struct pipe_sampler_view *sv = ctx->cs_sampler_view[t];
+
+      if (!sv)
+         continue;
+
+      if (sv->target == PIPE_BUFFER) {
+         ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
+      } else if (etna_compute_view_reads_as_image(sv)) {
+         ctx->cs_teximg_mask |= BITFIELD_BIT(t);
+         ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
+      }
+   }
+
+   key->cs_tex_wide = 1;
+   etna_compute_key_img_textures(ctx, shader, key);
+   etna_compute_key_texbuf(ctx, key);
+
+   const struct etna_shader_variant *v = etna_shader_variant(shader, key, &ctx->base.debug, true);
+   if (!v)
+      return false;
+
+   if (v->cs_tex_slots > ctx->screen->specs.fragment_sampler_count) {
+      BUG("compute: %u textures need the texture unit, it has %u slots: dispatch skipped",
+          v->cs_tex_slots, ctx->screen->specs.fragment_sampler_count);
+      return false;
+   }
+
+   memcpy(map, v->cs_tex_slot, sizeof(v->cs_tex_slot));
+   *num_slots = v->cs_tex_slots;
+   return true;
+}
+
+/* the bits of a mask of textures, at their slots */
+static uint16_t
+etna_compute_slot_mask(uint32_t textures, const uint8_t *map)
+{
+   uint16_t slots = 0;
+
+   u_foreach_bit(t, textures) {
+      if (map[t] != 0xff)
+         slots |= BITFIELD_BIT(map[t]);
+   }
+
+   return slots;
+}
+
+/* map: in a wide dispatch, the slot of each texture (etna_compute_probe_wide()),
+ * num_views slots; NULL: textures in their own slots, as many as bound */
 static void
 etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures *saved,
-                           bool compute, const struct etna_shader *shader)
+                           bool compute, const struct etna_shader *shader, const uint8_t *map,
+                           unsigned num_views)
 {
    struct pipe_context *pctx = &ctx->base;
    const unsigned n = PIPE_MAX_SAMPLERS / 2;
    void *samplers[PIPE_MAX_SAMPLERS] = { NULL };
    struct pipe_sampler_view *views[PIPE_MAX_SAMPLERS] = { NULL };
 
-   if (compute) {
+   if (compute && map) {
+      saved->num_samplers = ctx->num_fragment_samplers;
+      saved->num_views = ctx->num_fragment_sampler_views;
+      for (unsigned i = 0; i < n; i++) {
+         saved->sampler[i] = ctx->sampler[i];
+         saved->view[i] = NULL;
+         pipe_sampler_view_reference(&saved->view[i], ctx->sampler_view[i]);
+      }
+      /* the textures the texture unit reads, in their slots */
+      for (unsigned t = 0; t < PIPE_MAX_SAMPLERS; t++) {
+         if (map[t] == 0xff)
+            continue;
+         views[map[t]] = ctx->cs_sampler_view[t];
+         samplers[map[t]] = etna_compute_sampler_for(ctx, shader, t);
+         if (!samplers[map[t]])
+            samplers[map[t]] = etna_compute_fetch_sampler(ctx);
+      }
+   } else if (compute) {
       saved->num_samplers = ctx->num_fragment_samplers;
       saved->num_views = ctx->num_fragment_sampler_views;
       for (unsigned i = 0; i < n; i++) {
@@ -313,7 +455,9 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
             ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
          }
       }
+   }
 
+   if (compute) {
       /* Per slot, a copy of the sampler made for its view:
        * - the shader filters linear samplers (lower_shader_linear), bound as a
        *   nearest copy: RGBA16 UNORM samples as integers, which don't filter,
@@ -373,7 +517,7 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
 
    pctx->bind_sampler_states(pctx, MESA_SHADER_FRAGMENT, 0, n, samplers);
    pctx->set_sampler_views(pctx, MESA_SHADER_FRAGMENT, 0,
-                           compute ? ctx->cs_num_sampler_views : saved->num_views, 0, views);
+                           compute ? num_views : saved->num_views, 0, views);
    if (!compute) {
       ctx->num_fragment_samplers = saved->num_samplers;
       for (unsigned i = 0; i < n; i++)
@@ -470,6 +614,14 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    struct etna_saved_textures saved;
    const uint32_t textures = shader->textures_used;
    struct etna_shader_key key = {};
+   /* more textures than fragment slots (OpenCL): etna_compute_probe_wide() */
+   const bool wide = ctx->compute_only && ctx->screen->specs.unified_samplers &&
+                     ctx->cs_num_sampler_views > ctx->screen->specs.fragment_sampler_count;
+   uint8_t slot_map[PIPE_MAX_SAMPLERS];
+   unsigned num_slots = 0;
+   /* the fragment slots the dispatch samples */
+   uint32_t slots = textures;
+   bool swapped = false;
 
    /* set by etna_compute_swap_textures() for this dispatch */
    ctx->cs_texbuf_mask = 0;
@@ -477,15 +629,28 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    ctx->cs_shader_linear = 0;
 
    if (textures) {
-      etna_compute_swap_textures(ctx, &saved, true, shader);
-      etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers,
-                                      shader->tg4_shadow_samplers);
+      if (wide) {
+         if (!etna_compute_probe_wide(ctx, shader, &key, slot_map, &num_slots))
+            goto out;
+         slots = BITFIELD_MASK(num_slots);
+      }
+
+      etna_compute_swap_textures(ctx, &saved, true, shader, wide ? slot_map : NULL,
+                                 wide ? num_slots : ctx->cs_num_sampler_views);
+      swapped = true;
+      if (wide)
+         etna_shader_key_set_fs_textures(ctx, &key,
+                                         etna_compute_slot_mask(shader->tex_lod_samplers, slot_map),
+                                         etna_compute_slot_mask(shader->tg4_shadow_samplers, slot_map));
+      else
+         etna_shader_key_set_fs_textures(ctx, &key, shader->tex_lod_samplers,
+                                         shader->tg4_shadow_samplers);
 
       /* The texture unit converts 8-bit normalized texels to float slightly
        * off (UNORM 67 reads as 67.02 / 255, 128 as 128.06 / 255; 0 and 255
        * are exact), in 2D and 3D, sampled or fetched. OpenCL wants the exact
        * value: reads that don't filter snap back to it in the shader. */
-      u_foreach_bit(i, textures & BITFIELD_MASK(16)) {
+      u_foreach_bit(i, slots & BITFIELD_MASK(16)) {
          const struct pipe_sampler_view *sv = ctx->sampler_view[i];
          const struct pipe_sampler_state *ss = ctx->sampler[i];
 
@@ -518,17 +683,10 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
             key.tex_unorm16 |= BITFIELD_BIT(i);
       }
 
-      /* textures read with img_load, and the samplers whose samples can be */
-      key.tex_img_read = ctx->cs_teximg_mask;
-      u_foreach_bit(t, ctx->cs_teximg_mask) {
-         const struct pipe_sampler_state *ss = ctx->sampler[t];
-
-         if (ss && ss->unnormalized_coords && !(ctx->cs_shader_linear & BITFIELD_BIT(t)) &&
-             ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
-             ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
-             ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE && ss->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
-            key.tex_img_sampled |= BITFIELD_BIT(t);
-      }
+      /* textures read with img_load, and the samplers whose samples can be
+       * (a wide dispatch has them from etna_compute_probe_wide()) */
+      if (!wide)
+         etna_compute_key_img_textures(ctx, shader, &key);
    }
 
    /* 128-bit images are two planes: access without a format in the shader
@@ -540,12 +698,7 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       if (util_format_get_nr_components(bound->img[i].format) == 1)
          key.img_1comp |= BITFIELD_BIT(i);
    }
-   u_foreach_bit(t, ctx->cs_texbuf_mask) {
-      if (util_format_get_blocksize(ctx->cs_sampler_view[t]->format) == 16)
-         key.img_128bit |= BITFIELD_BIT(ETNA_MAX_SHADER_IMAGES + t);
-      if (util_format_get_nr_components(ctx->cs_sampler_view[t]->format) == 1)
-         key.img_1comp |= BITFIELD_BIT(ETNA_MAX_SHADER_IMAGES + t);
-   }
+   etna_compute_key_texbuf(ctx, &key);
 
    struct etna_shader_variant *v =
       etna_shader_variant(shader, &key, &ctx->base.debug, true);
@@ -738,8 +891,8 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    u_foreach_bit(t, ctx->cs_texbuf_mask)
       resource_read(ctx, ctx->cs_sampler_view[t]->texture);
 
-   if (textures) {
-      u_foreach_bit(i, ctx->active_sampler_views & textures) {
+   if (slots) {
+      u_foreach_bit(i, ctx->active_sampler_views & slots) {
          etna_update_sampler_source(ctx->sampler_view[i], i);
          resource_read(ctx, ctx->sampler_view[i]->texture);
       }
@@ -871,8 +1024,8 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       pctx->flush(pctx, NULL, 0);
 
 out:
-   if (textures)
-      etna_compute_swap_textures(ctx, &saved, false, shader);
+   if (swapped)
+      etna_compute_swap_textures(ctx, &saved, false, shader, NULL, 0);
 }
 
 /* OpenCL global buffers: each handle holds an offset into its buffer, the

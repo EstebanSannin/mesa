@@ -144,9 +144,10 @@ get_sampler_lod(const struct etna_context *ctx, bool frag,
  * 128-bit formats are two planes of 64-bit texels, each with its own
  * descriptor, except in buffers (whole), which hold them as 16-byte texels.
  * Returns 0 for formats without a hardware image path. */
-/* Image descriptors 0-7 are the shader images, 8-15 the compute textures 0-7
- * read with the image instructions: buffers (OpenCL 1D image buffers) and the
- * OpenCL 2D textures of etna_compute_swap_textures(). */
+/* Image descriptors 0-7 are the shader images, 8-39 the compute textures
+ * 0-31 read with the image instructions: buffers (OpenCL 1D image buffers)
+ * and the OpenCL 2D textures of etna_compute_swap_textures() (textures 0-7,
+ * or all in a wide dispatch, see etna_compute_probe_wide()). */
 static const struct pipe_image_view *
 etna_uniform_image(const struct etna_context *ctx, mesa_shader_stage stage, unsigned index,
                    struct pipe_image_view *tmp)
@@ -396,7 +397,7 @@ etna_uniforms_write(const struct etna_context *ctx,
       } break;
 
       case ETNA_UNIFORM_IMAGE_DESC: {
-         const unsigned index = val & 0xf, plane = (val >> 4) & 0xf, word = val >> 8;
+         const unsigned index = val & 0x3f, plane = (val >> 6) & 0x3, word = val >> 8;
          struct pipe_image_view tmp;
          const struct pipe_image_view *img = etna_uniform_image(ctx, sobj->stage, index, &tmp);
          const struct etna_resource *rsc = etna_resource(img->resource);

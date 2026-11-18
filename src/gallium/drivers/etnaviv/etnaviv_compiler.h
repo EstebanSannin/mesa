@@ -151,6 +151,11 @@ struct etna_shader_variant {
    bool cs_fold_loop;
    /* OpenCL private memory per invocation, bytes (scratch) */
    uint32_t cs_private_size;
+   /* a wide compute dispatch (key cs_tex_wide): the fragment slot of each
+    * texture the texture unit reads (0xff: none), and their number, see
+    * remap_tex_slots() */
+   uint8_t cs_tex_slot[32];
+   uint8_t cs_tex_slots;
 
    /* shader is larger than GPU instruction limit, thus needs icache */
    bool needs_icache;

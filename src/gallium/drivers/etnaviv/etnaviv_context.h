@@ -344,8 +344,8 @@ struct etna_context {
    uint16_t cs_shader_linear;
    /* compute textures read as images 8 + slot: buffers, and the 2D textures
     * of cs_teximg_mask (see etna_compute_swap_textures()) */
-   uint16_t cs_texbuf_mask;
-   uint16_t cs_teximg_mask;
+   uint32_t cs_texbuf_mask;
+   uint32_t cs_teximg_mask;
    struct pipe_sampler_view *cs_sampler_view[PIPE_MAX_SAMPLERS];
    unsigned cs_num_samplers, cs_num_sampler_views;
    uint32_t compute_shared_bo_size;

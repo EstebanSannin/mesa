@@ -97,13 +97,24 @@ struct etna_shader_key
    /* compute: images (and buffer textures, 8 + slot) with a one-component
     * format, for image loads without a format in the shader (OpenCL) */
    unsigned img_1comp : 16;
-   /* compute-only contexts (OpenCL): the 2D textures 0-7 that the shader
-    * reads with img_load where it can (images 8 + slot, see
-    * etna_compute_swap_textures()), and of those, the ones whose sampler
-    * takes the texel at the coordinates (nearest, unnormalized, clamped to
-    * the edge), so that samples are read that way too */
-   unsigned tex_img_read : 8;
-   unsigned tex_img_sampled : 8;
+   /* compute-only contexts (OpenCL): the 2D textures (0-7, or all in a wide
+    * dispatch) that the shader reads with img_load where it can (images
+    * 8 + texture, see etna_compute_swap_textures()), and of those, the ones
+    * whose sampler takes the texel at the coordinates (nearest,
+    * unnormalized, clamped to the edge or to the border), so that samples
+    * are read that way too; of those, the ones clamped to the border, and
+    * the ones whose border alpha is 1 (formats without alpha) */
+   unsigned tex_img_read : 32;
+   unsigned tex_img_sampled : 32;
+   unsigned tex_img_border : 32;
+   unsigned tex_img_border_a1 : 32;
+   /* compute-only contexts (OpenCL): a dispatch of more than 16 textures
+    * (etna_compute_probe_wide()), whose textures the texture unit reads take
+    * the fragment slots in order (remap_tex_slots()); and the textures 8-31
+    * it reads as images 16-39 that are 128-bit or have one component */
+   unsigned cs_tex_wide : 1;
+   unsigned tex_img_128bit : 32;
+   unsigned tex_img_1comp : 32;
    /* compute: RGBA16 UNORM textures, sampled as integers and converted, and
     * the textures with a linear sampler that the shader filters
     * (lower_shader_linear) */
@@ -135,6 +146,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
        unlikely(a->tex_unorm8 || b->tex_unorm8 || a->tex_snorm8 || b->tex_snorm8) ||
        unlikely(a->img_128bit || b->img_128bit || a->img_1comp || b->img_1comp) ||
        unlikely(a->tex_img_read || b->tex_img_read) ||
+       unlikely(a->cs_tex_wide || b->cs_tex_wide) ||
        unlikely(a->tex_unorm16 || b->tex_unorm16) ||
        unlikely(a->tex_shader_linear || b->tex_shader_linear) ||
        unlikely(a->tex_layer_rint || b->tex_layer_rint) ||
@@ -161,8 +173,8 @@ struct etna_shader {
    /* OpenCL pairs any image with any sampler; the hardware samples a texture
     * slot with that slot's sampler state. Texture slots in sampler_remap take
     * the state of sampler sampler_for_texture[] (see etna_launch_grid). */
-   uint16_t sampler_remap;
-   uint8_t sampler_for_texture[16];
+   uint32_t sampler_remap;
+   uint8_t sampler_for_texture[32];
    uint32_t textures_used;
 
    struct util_shader_variant_list variants;

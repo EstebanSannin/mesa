@@ -737,7 +737,7 @@ remap_samplers(struct etna_shader *shader)
             nir_tex_instr *tex = nir_instr_as_tex(instr);
             const unsigned t = tex->texture_index, s = tex->sampler_index;
 
-            if (!nir_tex_instr_need_sampler(tex) || t == s || t >= 16)
+            if (!nir_tex_instr_need_sampler(tex) || t == s || t >= 32)
                continue;
 
             if (!(shader->sampler_remap & BITFIELD_BIT(t))) {

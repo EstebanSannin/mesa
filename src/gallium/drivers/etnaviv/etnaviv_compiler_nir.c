@@ -719,7 +719,7 @@ image_desc_src(struct etna_compile *c, unsigned image, unsigned plane)
    uint64_t want[4];
 
    for (unsigned i = 0; i < 4; i++)
-      want[i] = CONST_VAL(ETNA_UNIFORM_IMAGE_DESC, image | plane << 4 | i << 8).u64;
+      want[i] = CONST_VAL(ETNA_UNIFORM_IMAGE_DESC, image | plane << 6 | i << 8).u64;
 
    for (unsigned r = 0; r < ETNA_MAX_IMM / 4; r++) {
       bool match = true, empty = true;
@@ -1905,13 +1905,16 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
 }
 
 /* An OpenCL 2D texture read with img_load (key tex_img_read): fetches at
- * level 0, and, with a nearest, unnormalized sampler clamped to the edge
- * (key tex_img_sampled), samples at level 0, whose texel is the floor of the
- * coordinates clamped to the texture. Other reads keep the texture unit. */
+ * level 0, and, with a nearest, unnormalized sampler clamped to the edge or
+ * to the border (key tex_img_sampled), samples at level 0, whose texel is the
+ * floor of the coordinates clamped to the texture; outside it, the border:
+ * (0, 0, 0, 0), or (0, 0, 0, 1) for a format without alpha. Other reads keep
+ * the texture unit. */
 static bool
 lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
 {
    const bool sampled = key->tex_img_sampled & BITFIELD_BIT(tex->texture_index);
+   const bool border = key->tex_img_border & BITFIELD_BIT(tex->texture_index);
 
    if ((tex->op != nir_texop_txf &&
         !(sampled && (tex->op == nir_texop_tex || tex->op == nir_texop_txl))) ||
@@ -1937,6 +1940,7 @@ lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shade
    nir_def *index = nir_imm_int(b, 8 + tex->texture_index);
    nir_def *zero = nir_imm_int(b, 0);
    nir_def *xy = nir_trim_vector(b, nir_get_tex_src(tex, nir_tex_src_coord), 2);
+   nir_def *inside = NULL;
 
    if (tex->op != nir_texop_txf) {
       /* the floor of each coordinate; integer coordinates converted to
@@ -1954,8 +1958,11 @@ lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shade
 
       nir_def *size = nir_image_size(b, 2, 32, index, zero, .image_dim = GLSL_SAMPLER_DIM_2D,
                                      .image_array = false);
-      xy = nir_imin(b, nir_imax(b, nir_vec2(b, texel[0], texel[1]), nir_imm_ivec2(b, 0, 0)),
-                    nir_iadd_imm(b, size, -1));
+      nir_def *texel_xy = nir_vec2(b, texel[0], texel[1]);
+      xy = nir_imin(b, nir_imax(b, texel_xy, nir_imm_ivec2(b, 0, 0)), nir_iadd_imm(b, size, -1));
+      /* the texel is in the texture where clamping doesn't move it */
+      if (border)
+         inside = nir_ball_iequal(b, xy, texel_xy);
    }
 
    nir_def *repl = nir_image_load(b, tex->def.num_components, 32, index,
@@ -1963,6 +1970,15 @@ lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shade
                                   zero, zero, .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
                                   .format = PIPE_FORMAT_NONE, .access = ACCESS_NON_WRITEABLE,
                                   .dest_type = tex->dest_type);
+
+   if (inside) {
+      const bool a1 = key->tex_img_border_a1 & BITFIELD_BIT(tex->texture_index);
+      nir_def *one = nir_alu_type_get_base_type(tex->dest_type) == nir_type_float
+                        ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
+      nir_def *comps[4] = { zero, zero, zero, a1 ? one : zero };
+
+      repl = nir_bcsel(b, inside, repl, nir_vec(b, comps, tex->def.num_components));
+   }
 
    nir_def_replace(&tex->def, repl);
    return true;
@@ -1976,12 +1992,14 @@ static bool
 lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
 {
    const struct etna_shader_key *key = data;
+   /* textures 0-7, or all in a wide dispatch (images 8-39) */
+   const unsigned max = key->cs_tex_wide ? 32 : 8;
 
-   if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < 8 &&
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < max &&
        (key->tex_img_read & BITFIELD_BIT(tex->texture_index)))
       return lower_tex2d_to_image(b, tex, key);
 
-   if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF || tex->texture_index >= 8 ||
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF || tex->texture_index >= max ||
        (tex->op != nir_texop_txf && tex->op != nir_texop_txs))
       return false;
 
@@ -2006,6 +2024,64 @@ lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
 
    nir_def_replace(&tex->def, repl);
    return true;
+}
+
+/* A wide compute dispatch (key cs_tex_wide: OpenCL, more than 16 textures):
+ * the textures the texture unit still reads after lower_texbuf_to_image() take
+ * the fragment slots in order of their index, where etna_launch_grid() binds
+ * them. The passes after this one see slots, as for 16 textures or fewer. A
+ * variant that needs more than 16 slots isn't run (etna_compute_probe_wide());
+ * its extra textures share the last slot so that it compiles. */
+static void
+remap_tex_slots(nir_shader *s, struct etna_shader_variant *v)
+{
+   uint32_t used = 0;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex)
+               used |= BITFIELD_BIT(nir_instr_as_tex(instr)->texture_index);
+         }
+      }
+   }
+
+   memset(v->cs_tex_slot, 0xff, sizeof(v->cs_tex_slot));
+   v->cs_tex_slots = 0;
+   u_foreach_bit(t, used)
+      v->cs_tex_slot[t] = v->cs_tex_slots++;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            const unsigned slot = MIN2(v->cs_tex_slot[tex->texture_index], 15);
+
+            tex->texture_index = slot;
+            tex->sampler_index = slot;
+         }
+      }
+   }
+}
+
+/* Is image index (0-7 the shader images, 8-39 the textures read as images)
+ * 128-bit, or one component? Without a format in the shader (OpenCL) the key
+ * says. */
+static bool
+key_img_bit(const struct etna_shader_key *key, nir_src index, bool comp1)
+{
+   if (!nir_src_is_const(index))
+      return false;
+
+   const unsigned i = nir_src_as_uint(index);
+
+   if (i < 16)
+      return (comp1 ? key->img_1comp : key->img_128bit) & BITFIELD_BIT(i);
+
+   return i - 8 < 32 && ((comp1 ? key->tex_img_1comp : key->tex_img_128bit) & BITFIELD_BIT(i - 8));
 }
 
 /* Images are linear or 4x4 tiled (see etna_resource_create()). Loads and
@@ -2070,9 +2146,7 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    const unsigned bpp = util_format_get_blocksize(format);
    /* without a format (OpenCL), the key says which images are 128-bit */
    const bool is_128bit = bpp == 16 ||
-                          (format == PIPE_FORMAT_NONE && nir_src_is_const(intr->src[0]) &&
-                           nir_src_as_uint(intr->src[0]) < 16 &&
-                           (key->img_128bit & BITFIELD_BIT(nir_src_as_uint(intr->src[0]))));
+                          (format == PIPE_FORMAT_NONE && key_img_bit(key, intr->src[0], false));
    const bool planes = is_128bit && dim != GLSL_SAMPLER_DIM_BUF;
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
@@ -2087,8 +2161,7 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       const bool load = intr->intrinsic == nir_intrinsic_image_load;
       const nir_alu_type base = nir_alu_type_get_base_type(load ? nir_intrinsic_dest_type(intr)
                                                                 : nir_intrinsic_src_type(intr));
-      const bool one = nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) < 16 &&
-                       (key->img_1comp & BITFIELD_BIT(nir_src_as_uint(intr->src[0])));
+      const bool one = key_img_bit(key, intr->src[0], true);
       static const enum pipe_format stand_in[3][3] = {
          /* float, uint, int */
          { PIPE_FORMAT_R32_FLOAT, PIPE_FORMAT_R32_UINT, PIPE_FORMAT_R32_SINT },
@@ -2134,8 +2207,7 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
             t = nir_vec4(b, nir_channel(b, t, 0), nir_channel(b, t, 1),
                          nir_channel(b, hi, 0), nir_channel(b, hi, 1));
          } else if (format != PIPE_FORMAT_NONE ? util_format_get_nr_components(format) == 1 :
-                    nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) < 16 &&
-                    (key->img_1comp & BITFIELD_BIT(nir_src_as_uint(intr->src[0])))) {
+                    key_img_bit(key, intr->src[0], true)) {
             /* the load writes .x only: (r, 0, 0, 1); without a format in the
              * shader (OpenCL) the key says which images, and the result type
              * the type of the 1 */
@@ -2926,6 +2998,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    }
 
    NIR_PASS(_, s, nir_shader_tex_pass, lower_texbuf_to_image, nir_metadata_control_flow, &v->key);
+   if (v->key.cs_tex_wide)
+      remap_tex_slots(s, v);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_image_access,
             nir_metadata_control_flow, &v->key);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,

@@ -264,7 +264,14 @@ etna_init_shader_caps(struct etna_screen *screen)
       caps->max_inputs = 0;
       caps->max_outputs = 0;
       caps->max_texture_samplers = screen->specs.fragment_sampler_count;
-      caps->max_sampler_views = screen->specs.fragment_sampler_count;
+      /* OpenCL's read images (rusticl's max_read_images; OpenGL takes its
+       * limits from max_texture_samplers). With unified samplers compute has
+       * the whole array of 32 slots: a dispatch of more than 16 textures
+       * reads 2D textures with img_load where it can, and gives the fragment
+       * slots to the textures the texture unit reads (etna_launch_grid()). */
+      caps->max_sampler_views = screen->specs.unified_samplers
+         ? screen->specs.fragment_sampler_count + screen->specs.vertex_sampler_count
+         : screen->specs.fragment_sampler_count;
       caps->max_shader_buffers = ETNA_MAX_SHADER_BUFFERS;
       caps->max_shader_images = ETNA_MAX_SHADER_IMAGES;
       caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
