@@ -596,6 +596,38 @@ handle_clc_fn(struct vtn_builder *b, enum OpenCLstd_Entrypoints opcode,
    return ret_deref ? nir_load_deref(&b->nb, ret_deref) : NULL;
 }
 
+/* fma() of halves for hardware without a 16-bit fused multiply-add. The
+ * product of two halves is exact in fp32, and so is the error of its sum with
+ * the third operand (TwoSum). That sum rounded to odd in fp32 (24 >= 11 + 2
+ * bits) rounds to the correct half; rounded to nearest, as an fp32 fma would
+ * give it, it can land on a half tie that the exact result was past. */
+static nir_def *
+fma_half(nir_builder *nb, nir_def **srcs)
+{
+   const unsigned save_math_ctrl = nb->fp_math_ctrl;
+   nb->fp_math_ctrl |= nir_fp_exact;
+
+   nir_def *a = nir_f2f32(nb, srcs[0]);
+   nir_def *b = nir_f2f32(nb, srcs[1]);
+   nir_def *c = nir_f2f32(nb, srcs[2]);
+   nir_def *p = nir_fmul(nb, a, b);
+   nir_def *s = nir_fadd(nb, p, c);
+   nir_def *bb = nir_fsub(nb, s, p);
+   nir_def *err = nir_fadd(nb, nir_fsub(nb, p, nir_fsub(nb, s, bb)), nir_fsub(nb, c, bb));
+
+   /* inexact, finite and even: one step toward the exact sum, which is in
+    * the direction of the error's sign */
+   nir_def *inexact = nir_ine_imm(nb, nir_iand_imm(nb, err, 0x7fffffff), 0);
+   nir_def *finite = nir_ine_imm(nb, nir_iand_imm(nb, s, 0x7f800000), 0x7f800000);
+   nir_def *even = nir_ieq_imm(nb, nir_iand_imm(nb, s, 1), 0);
+   nir_def *away = nir_ushr_imm(nb, nir_ixor(nb, s, err), 31);
+   nir_def *odd = nir_iadd_imm(nb, nir_isub(nb, s, nir_ishl_imm(nb, away, 1)), 1);
+   s = nir_bcsel(nb, nir_iand(nb, inexact, nir_iand(nb, finite, even)), odd, s);
+
+   nb->fp_math_ctrl = save_math_ctrl;
+   return nir_f2f16_rtne(nb, s);
+}
+
 /* fma(p, x, y) with p a constant +-2^k, k >= 0 (the same k in every
  * component), for hardware without a fused multiply-add: p * x is exact
  * unless it overflows, so a multiply and an add round once, as fma does.
@@ -730,6 +762,8 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
    case OpenCLstd_Fma: {
       /* FIXME: the software implementation only supports fp32 for now. */
       if (srcs[0]->bit_size != 64 && !nir_has_ffma(nb->shader, srcs[0]->bit_size)) {
+         if (srcs[0]->bit_size == 16)
+            return fma_half(nb, srcs);
          if (srcs[0]->bit_size == 32) {
             const unsigned save_math_ctrl = nb->fp_math_ctrl;
             nb->fp_math_ctrl |= nir_fp_exact;
