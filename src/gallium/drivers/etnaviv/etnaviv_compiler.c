@@ -59,6 +59,9 @@ etna_compiler_create(const struct etna_core_info *info)
       /* no 64-bit integers: OpenCL builtins and conversions can still bring
        * some (u2u64), split them into 32-bit halves */
       .lower_int64_options = (nir_lower_int64_options)~0,
+      /* lowered in etna_compile_shader(), one component at a time: rusticl
+       * would lower a long16 division as a vector, all lanes live at once */
+      .late_lower_int64 = true,
       .lower_mul_2x32_64 = true,
       .lower_bitops = true,
       .lower_bitfield_insert = info->halti < 5,
