@@ -234,9 +234,11 @@ etna_create_sampler_view_state(struct pipe_context *pctx, struct pipe_resource *
          VIVS_TE_SAMPLER_CONFIG0_VWRAP(TEXTURE_WRAPMODE_REPEAT);
       break;
    case PIPE_TEXTURE_1D_ARRAY:
-      is_array = true;
-      base_height = res->base.array_size;
-      break;
+      /* a 2D array texture of one row, with T wrap to repeat, as a 1D
+       * texture: the layers are layer_stride apart */
+      sv->config0_mask = ~VIVS_TE_SAMPLER_CONFIG0_VWRAP__MASK;
+      sv->config0 |= VIVS_TE_SAMPLER_CONFIG0_VWRAP(TEXTURE_WRAPMODE_REPEAT);
+      FALLTHROUGH;
    case PIPE_TEXTURE_2D_ARRAY:
       is_array = true;
       base_depth = res->base.array_size;

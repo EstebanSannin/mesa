@@ -68,4 +68,9 @@ etna_state_update(struct etna_context *ctx);
 void
 etna_state_init(struct pipe_context *pctx);
 
+struct etna_shader_variant;
+void
+etna_upload_constbufs(struct etna_context *ctx, mesa_shader_stage stage,
+                      const struct etna_shader_variant *sobj);
+
 #endif /* ETNAVIV_STATE_H_ */

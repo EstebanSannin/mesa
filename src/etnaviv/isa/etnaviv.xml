@@ -27,7 +27,7 @@ SPDX-License-Identifier: MIT
 </template>
 
 <template name="INSTR_LOAD_STORE">
-	{NAME}{SAT}{SKPHP}{DENORM}{LOCAL}{TYPE}{LEFT_SHIFT}{PMODE}
+	{NAME}{SAT}{SKPHP}{DENORM}{LOCAL}{TYPE}{LEFT_SHIFT}{PMODE}{THREAD}
 </template>
 
 <enum name="#cond">

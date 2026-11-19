@@ -817,6 +817,11 @@ etna_try_blt_blit(struct pipe_context *pctx,
    assert(blit_info->src.level <= src->base.last_level);
    assert(blit_info->dst.level <= dst->base.last_level);
 
+   /* the interleaved 128-bit layout (etna_resource_create()) isn't the two
+    * planes the BLT copies: etna_blit() falls back to a copy */
+   if (src->interleaved || dst->interleaved)
+      return false;
+
    if (!translate_samples_to_xyscale(src->base.nr_samples, &src_xscale, &src_yscale))
       return false;
    if (!translate_samples_to_xyscale(dst->base.nr_samples, &dst_xscale, &dst_yscale))

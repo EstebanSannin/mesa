@@ -25,7 +25,7 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#include <libsync.h>
+#include "util/libsync.h"
 
 #include "etnaviv_fence.h"
 #include "etnaviv_context.h"
@@ -41,6 +41,11 @@ struct pipe_fence_handle {
    struct etna_screen *screen;
    int fence_fd;
    uint32_t timestamp;
+   /* a fence of a compute-only context (OpenCL): its fd tells a job the
+    * kernel's hang check killed, see etna_screen_fence_finish() */
+   bool check_error;
+   /* a compute dispatch before it was skipped (OpenCL, etna_launch_grid()) */
+   bool dispatch_failed;
 };
 
 static void
@@ -62,18 +67,57 @@ etna_screen_fence_reference(struct pipe_screen *pscreen,
    *ptr = fence;
 }
 
+/* The status of a fence fd: 1 signaled, 0 pending, negative when the job
+ * completed with an error. The kernel completes a job it reset after a hang
+ * with one: the scheduler cancels the guilty job and the later ones of its
+ * context (-ECANCELED). */
+int
+etna_fence_fd_status(int fd)
+{
+   struct sync_file_info info = {{0}};
+
+   if (ioctl(fd, SYNC_IOC_FILE_INFO, &info))
+      return 1;
+
+   return info.status;
+}
+
+/* a fence fd that signaled with an error: a job the kernel killed; or a
+ * fence after a compute dispatch the driver skipped */
+bool
+etna_fence_failed(struct pipe_fence_handle *fence)
+{
+   return fence->dispatch_failed ||
+          (fence->fence_fd >= 0 && etna_fence_fd_status(fence->fence_fd) < 0);
+}
+
+void
+etna_fence_set_failed(struct pipe_fence_handle *fence)
+{
+   fence->dispatch_failed = true;
+}
+
 static bool
 etna_screen_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
                          struct pipe_fence_handle *fence, uint64_t timeout)
 {
    MESA_TRACE_FUNC();
-   if (fence->fence_fd >= 0)
-      return !sync_wait(fence->fence_fd, timeout / 1000000);
+   if (fence->fence_fd >= 0) {
+      if (sync_wait(fence->fence_fd, timeout / 1000000))
+         return false;
+
+      /* A killed OpenCL job did its work in part, or not at all, and a
+       * skipped dispatch none: don't report it as finished. rusticl then
+       * fails its events (CL_OUT_OF_RESOURCES) instead of returning
+       * CL_SUCCESS with incomplete results. */
+      return !(fence->dispatch_failed ||
+               (fence->check_error && etna_fence_fd_status(fence->fence_fd) < 0));
+   }
 
    if (etna_pipe_wait_ns(fence->screen->pipe, fence->timestamp, timeout))
       return false;
 
-   return true;
+   return !fence->dispatch_failed;
 }
 
 void
@@ -121,6 +165,7 @@ etna_fence_create(struct pipe_context *pctx, int fence_fd)
    fence->screen = ctx->screen;
    fence->timestamp = etna_cmd_stream_timestamp(ctx->stream);
    fence->fence_fd = fence_fd;
+   fence->check_error = ctx->compute_only;
 
    return fence;
 }

@@ -51,6 +51,9 @@ static const struct etna_op_info etna_ops[] = {
 #define UOP(nir, op) UOPC(nir, op, TRUE)
    OP(mov, MOV), OP(fneg, MOV), OP(fabs, MOV), OP(fsat, MOV),
    OP(fmul, MUL), OP(fadd, ADD), OP(fmad, MAD),
+   /* only with ETNA_MESA_DEBUG=fast_fma, which claims a fused multiply-add:
+    * the unfused MAD all the same (not conformant) */
+   OP(ffma, MAD),
    OP(fdot2, DP2), OP(fdot3, DP3), OP(fdot4, DP4),
    OPC(fmin, SELECT, GT), OPC(fmax, SELECT, LT),
    OP(ffract, FRC), OP(frcp, RCP), OP(frsq, RSQ),
@@ -71,6 +74,7 @@ static const struct etna_op_info etna_ops[] = {
    UOP(u2u16, I2I),
    UOP(u2u8,  I2I),
    IOP(f2i32, F2I),
+   IOP(f2i32_rtne, F2IRND),
    OPCT(f2i16, F2I, TRUE, S16),
    OPCT(f2i8,  F2I, TRUE, S8),
    UOP(f2u32, F2I),
@@ -78,6 +82,11 @@ static const struct etna_op_info etna_ops[] = {
    OPCT(f2u8,  F2I, TRUE, U8),
    OPCT(f2f16, CONV, TRUE, F16),
    OPCT(f2f32, CONV, TRUE, F32),
+   /* only in dual16 code, once per work-item, which writes its half of the
+    * result (see dual16_rewrite()) */
+   OPCT(f2f16_rtne, MOV, TRUE, F32),
+   UOP(u2f16, I2F),
+   IOP(i2f16, I2F),
    UOP(b2f32, AND), /* AND with fui(1.0f) */
    UOP(b2i32, AND), /* AND with 1 */
    UOP(b2i8, AND),  /* AND with 1 */
@@ -85,7 +94,14 @@ static const struct etna_op_info etna_ops[] = {
    /* arithmetic */
    IOP(iadd, ADD),
    IOP(imul, IMULLO0),
-   /* IOP(imad, IMADLO0), */
+   IOP(imul_high, IMULHI0),
+   UOP(umul_high, IMULHI0),
+   IOP(imad, IMADLO0),
+   OPCT(imul8x4_etna, IMULLO0, TRUE, U8),
+   OPCT(imul16x2_etna, IMULLO0, TRUE, U16),
+   OPCT(imad8x4_etna, IMADLO0, TRUE, U8),
+   OPCT(imad16x2_etna, IMADLO0, TRUE, U16),
+   OPC(fsel_ord_etna, SELECT, EQ),
    IOP(ineg, ADD), /* ADD 0, -x */
    IOP(iabs, IABS),
    IOP(isign, SIGN),
@@ -187,11 +203,28 @@ etna_emit_alu(struct etna_compile *c, nir_alu_instr *alu, struct etna_inst_dst d
    case nir_op_fexp2:
    case nir_op_fsqrt:
    case nir_op_imul:
+   case nir_op_imul_high:
+   case nir_op_umul_high:
       /* scalar instructions we want src to be in x component */
       inst.src[0] = etna_src_swizzle(src[0], swiz_scalar);
       inst.src[1] = etna_src_swizzle(src[1], swiz_scalar);
       break;
+   case nir_op_f2i32_rtne:
+      /* round to nearest even, as NXP's compiler emits it */
+      inst.rounding = ISA_ROUNDING_RTNE;
+      break;
+   case nir_op_imad:
+      /* a scalar instruction, as IMULLO0 */
+      inst.src[0] = etna_src_swizzle(src[0], swiz_scalar);
+      inst.src[1] = etna_src_swizzle(src[1], swiz_scalar);
+      inst.src[2] = etna_src_swizzle(src[2], swiz_scalar);
+      break;
    /* deal with instructions which don't have 1:1 mapping */
+   case nir_op_fsel_ord_etna:
+      /* SELECT.EQ x, x, y */
+      inst.src[2] = src[1];
+      inst.src[1] = src[0];
+      break;
    case nir_op_fmin:
    case nir_op_fmax:
    case nir_op_imin:
@@ -232,6 +265,16 @@ etna_emit_alu(struct etna_compile *c, nir_alu_instr *alu, struct etna_inst_dst d
       break;
    default:
       break;
+   }
+
+   /* dual16: a conversion between half and float is a move once per
+    * work-item, which reads its half of a packed register or its own full
+    * register (th) and writes its half or (.hp) a full register */
+   if (c->variant->dual16 &&
+       (op == nir_op_f2f16 || op == nir_op_f2f16_rtne || op == nir_op_f2f32)) {
+      inst.opcode = ISA_OPC_MOV;
+      inst.type = ISA_TYPE_F32;
+      inst.src[1] = (struct etna_inst_src){ 0 };
    }
 
    /* set the "true" value for CMP instructions */

@@ -170,13 +170,23 @@ lower_bitfield_insert(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
       assert(alu->src[3].swizzle[i] == alu->src[3].swizzle[0]);
    }
 
-   nir_def *base = nir_ssa_for_alu_src(b, alu, 0);
-   nir_def *insert = nir_ssa_for_alu_src(b, alu, 1);
    nir_def *offset = nir_channel(b, alu->src[2].src.ssa, alu->src[2].swizzle[0]);
    nir_def *bits = nir_channel(b, alu->src[3].src.ssa, alu->src[3].swizzle[0]);
    nir_def *packed = nir_vec2(b, offset, bits);
 
-   nir_def_replace(&alu->def, nir_bitfield_insert_etna(b, base, insert, packed));
+   /* base and insert keep their swizzles (no mov for a swizzled operand) */
+   nir_alu_instr *bi = nir_alu_instr_create(b->shader, nir_op_bitfield_insert_etna);
+   nir_def_init(&bi->instr, &bi->def, alu->def.num_components, alu->def.bit_size);
+   for (unsigned i = 0; i < 2; i++) {
+      bi->src[i].src = nir_src_for_ssa(alu->src[i].src.ssa);
+      memcpy(bi->src[i].swizzle, alu->src[i].swizzle, sizeof(bi->src[i].swizzle));
+   }
+   bi->src[2].src = nir_src_for_ssa(packed);
+   bi->src[2].swizzle[0] = 0;
+   bi->src[2].swizzle[1] = 1;
+   nir_builder_instr_insert(b, &bi->instr);
+
+   nir_def_replace(&alu->def, &bi->def);
 
    return true;
 }

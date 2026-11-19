@@ -39,9 +39,12 @@
 
 #include <math.h>
 #include "isa/enums.h"
+#include "util/u_debug.h"
 #include "util/u_memory.h"
 #include "util/register_allocate.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_deref.h"
+#include "util/format/u_format.h"
 
 #include "util/compiler.h"
 #include "util/half_float.h"
@@ -64,7 +67,8 @@ etna_alu_to_scalar_filter_cb(const nir_instr *instr, const void *data)
    case nir_op_fcos:
    case nir_op_fsin:
    case nir_op_fdiv:
-   case nir_op_imul:
+   case nir_op_imul_high:
+   case nir_op_umul_high:
       return true;
    /* TODO: can do better than alu_to_scalar for vector compares */
    case nir_op_b32all_fequal2:
@@ -99,6 +103,28 @@ etna_alu_to_scalar_filter_cb(const nir_instr *instr, const void *data)
    }
 
    return false;
+}
+
+/* IMULLO0 and IMADLO0 are scalar too, but a product is split only after
+ * nir_opt_algebraic_late(): it fuses iadd(imul) into an imad where it sees
+ * the imul, and a vector product split before it hides behind a vec. An
+ * OpenCL int4 multiply-add took four IMULLO0 and a vector ADD instead of
+ * four IMADLO0.
+ */
+static bool
+etna_alu_to_scalar_late_filter_cb(const nir_instr *instr, const void *data)
+{
+   if (instr->type == nir_instr_type_alu) {
+      switch (nir_instr_as_alu(instr)->op) {
+      case nir_op_imul:
+      case nir_op_imad:
+         return true;
+      default:
+         break;
+      }
+   }
+
+   return etna_alu_to_scalar_filter_cb(instr, data);
 }
 
 static void
@@ -283,8 +309,8 @@ inline_immediate(uint32_t bits, unsigned *type, uint32_t *imm)
 static hw_src
 const_src(struct etna_compile *c, nir_const_value *value, unsigned num_components)
 {
-   /* use inline immediates if possible */
-   if (c->info->halti >= 2 && num_components == 1 &&
+   /* use inline immediates if possible (not in dual16 code) */
+   if (c->info->halti >= 2 && num_components == 1 && !c->variant->dual16 &&
        value[0].u64 >> 32 == ETNA_UNIFORM_CONSTANT) {
       unsigned type;
       uint32_t imm;
@@ -498,6 +524,10 @@ get_src(struct etna_compile *c, nir_src *src)
       case nir_intrinsic_load_vertex_id:
       case nir_intrinsic_load_uniform:
       case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_global_etna:
+      case nir_intrinsic_load_image_etna:
+      case nir_intrinsic_global_atomic_etna:
+      case nir_intrinsic_global_atomic_swap_etna:
       case nir_intrinsic_load_constant:
       case nir_intrinsic_load_reg:
       case nir_intrinsic_ddx:
@@ -582,6 +612,9 @@ ra_def(struct etna_compile *c, nir_def *def, unsigned *p_swiz)
    };
 }
 
+static nir_if *
+branch_compare(const struct etna_compile *c, nir_alu_instr *alu);
+
 static void
 emit_alu(struct etna_compile *c, nir_alu_instr * alu)
 {
@@ -589,6 +622,10 @@ emit_alu(struct etna_compile *c, nir_alu_instr * alu)
 
    /* marked as dead instruction (vecN and other bypassed instr) */
    if (is_dead_instruction(&alu->instr))
+      return;
+
+   /* emitted by emit_if() as the branch */
+   if (branch_compare(c, alu))
       return;
 
    assert(!(alu->op >= nir_op_vec2 && alu->op <= nir_op_vec4));
@@ -634,10 +671,13 @@ emit_alu(struct etna_compile *c, nir_alu_instr * alu)
    }
 
    /* src2 is the packed offset and bit count, not per-component data, so keep
-    * it instead of composing the destination swizzle onto it.
+    * it instead of composing the destination swizzle onto it. Its own swizzle
+    * stays: lower_alu() can merge it with another constant source into one
+    * uniform, with offset and bit count in .yz for example.
     */
    if (alu->op == nir_op_bitfield_insert_etna)
-      srcs[2] = src_swizzle(get_src(c, &alu->src[2].src), SWIZZLE(X, Y, Y, Y));
+      srcs[2] = src_swizzle(src_swizzle(get_src(c, &alu->src[2].src), ALU_SWIZ(&alu->src[2])),
+                            SWIZZLE(X, Y, Y, Y));
 
    etna_emit_alu(c, alu, dst, srcs);
 }
@@ -678,6 +718,112 @@ emit_tex(struct etna_compile *c, nir_tex_instr * tex)
    etna_emit_tex(c, tex, dst_swiz, dst, get_src(c, coord),
                  src1 ? get_src(c, src1) : SRC_DISABLE,
                  src2 ? get_src(c, src2) : SRC_DISABLE);
+}
+
+/* opcode and type of an atomic; NOP if the hardware has none */
+static enum isa_opc
+atomic_opcode(nir_atomic_op op, enum isa_type *type)
+{
+   *type = ISA_TYPE_S32;
+
+   switch (op) {
+   case nir_atomic_op_iadd:    return ISA_OPC_ATOMIC_ADD;
+   case nir_atomic_op_imin:    return ISA_OPC_ATOMIC_MIN;
+   case nir_atomic_op_imax:    return ISA_OPC_ATOMIC_MAX;
+   case nir_atomic_op_iand:    return ISA_OPC_ATOMIC_AND;
+   case nir_atomic_op_ior:     return ISA_OPC_ATOMIC_OR;
+   case nir_atomic_op_ixor:    return ISA_OPC_ATOMIC_XOR;
+   case nir_atomic_op_cmpxchg: return ISA_OPC_ATOMIC_CMP_XCHG;
+   case nir_atomic_op_umin:    *type = ISA_TYPE_U32; return ISA_OPC_ATOMIC_MIN;
+   case nir_atomic_op_umax:    *type = ISA_TYPE_U32; return ISA_OPC_ATOMIC_MAX;
+   case nir_atomic_op_xchg:    *type = ISA_TYPE_U32; return ISA_OPC_ATOMIC_XCHG;
+   default:                    return ISA_OPC_NOP;
+   }
+}
+
+/* An image descriptor fills a uniform register, in order: address, stride,
+ * size, format word (see etna_image_format_word()). */
+static hw_src
+image_desc_src(struct etna_compile *c, unsigned image, unsigned plane)
+{
+   uint64_t want[4];
+
+   for (unsigned i = 0; i < 4; i++)
+      want[i] = CONST_VAL(ETNA_UNIFORM_IMAGE_DESC, image | plane << 6 | i << 8).u64;
+
+   for (unsigned r = 0; r < ETNA_MAX_IMM / 4; r++) {
+      bool match = true, empty = true;
+
+      for (unsigned i = 0; i < 4; i++) {
+         match &= c->consts[r * 4 + i] == want[i];
+         empty &= !c->consts[r * 4 + i];
+      }
+
+      if (match || empty) {
+         memcpy(&c->consts[r * 4], want, sizeof(want));
+         c->const_count = MAX2(c->const_count, r + 1);
+         return SRC_CONST(r, INST_SWIZ_IDENTITY);
+      }
+   }
+
+   c->error = true;
+   return SRC_CONST(0, INST_SWIZ_IDENTITY);
+}
+
+/* img_load/img_store as NXP's compiler emits them for GLES: pack mode, the
+ * register type of the format class (f32 for float and normalized formats,
+ * which the hardware converts; u32/s32 with .denorm, and .sat for stores, for
+ * integer formats), coordinate .xyyy, or .xyzz for the 3D form whose z is the
+ * address of the layer. A load writes the components of the format, a store
+ * takes .xyzw. Without pack mode and with other fields the instructions work
+ * on byte lanes (as for NXP's NPU), one byte per texel. */
+static void
+emit_image(struct etna_compile *c, nir_intrinsic_instr *intr)
+{
+   const bool store = intr->intrinsic == nir_intrinsic_store_image_etna;
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool layered = nir_intrinsic_image_array(intr) || dim == GLSL_SAMPLER_DIM_3D ||
+                        dim == GLSL_SAMPLER_DIM_CUBE;
+   const enum pipe_format format = nir_intrinsic_format(intr);
+   const bool sint = util_format_is_pure_sint(format);
+   const bool uint = util_format_is_pure_uint(format);
+
+   if (!nir_src_is_const(intr->src[0])) {
+      compile_error(c, "dynamically indexed image\n");
+      return;
+   }
+
+   struct etna_inst inst = {
+      .opcode = store ? (layered ? ISA_OPC_IMG_STORE_3D : ISA_OPC_IMG_STORE)
+                      : (layered ? ISA_OPC_IMG_LOAD_3D : ISA_OPC_IMG_LOAD),
+      .type = sint ? ISA_TYPE_S32 : uint ? ISA_TYPE_U32 : ISA_TYPE_F32,
+      .pmode = 1,
+      /* NXP's img_store.denorm for the interleaved 128-bit layout: a
+       * whole 16-byte texel of a 2D image (planes have a 64-bit format,
+       * buffers the buffer dimension) */
+      .denorm = sint || uint ||
+                (store && !layered && dim == GLSL_SAMPLER_DIM_2D &&
+                 util_format_get_blocksize(format) == 16),
+      .sat = store && (sint || uint),
+      .src[0] = image_desc_src(c, nir_src_as_uint(intr->src[0]), nir_intrinsic_component(intr)),
+      .src[1] = src_swizzle(get_src(c, &intr->src[1]),
+                            layered ? SWIZZLE(X, Y, Z, Z) : SWIZZLE(X, Y, Y, Y)),
+   };
+
+   if (store) {
+      inst.dst.write_mask = ISA_WRMASK_XYZW;
+      inst.src[2] = get_src(c, &intr->src[2]);
+   } else {
+      /* components of the format: lower_image_access() gives a plane of a
+       * 128-bit format a format of two 32-bit components */
+      const unsigned comps = util_format_get_nr_components(format);
+      unsigned dst_swiz;
+
+      inst.dst = ra_def(c, &intr->def, &dst_swiz);
+      inst.dst.write_mask &= BITFIELD_MASK(comps);
+   }
+
+   emit_inst(c, &inst);
 }
 
 static void
@@ -788,6 +934,92 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
          .src[2] = get_src(c, &intr->src[0]),
       });
       break;
+   case nir_intrinsic_load_image_etna:
+   case nir_intrinsic_store_image_etna:
+      emit_image(c, intr);
+      break;
+   case nir_intrinsic_load_global_etna: {
+      unsigned dst_swiz;
+      const nir_alu_type type = nir_intrinsic_dest_type(intr);
+      /* the base first, as NXP's compiler: LEFT_SHIFT applies to the second
+       * operand, which can also be an immediate */
+      emit_inst(c, &(struct etna_inst) {
+         .opcode = ISA_OPC_LOAD,
+         .type = type == nir_type_uint8 ? ISA_TYPE_U8 : type == nir_type_uint16 ? ISA_TYPE_U16 : ISA_TYPE_U32,
+         .left_shift = nir_intrinsic_offset_shift(intr),
+         .dst = ra_def(c, &intr->def, &dst_swiz),
+         .src[0] = get_src(c, &intr->src[0]),
+         .src[1] = get_src(c, &intr->src[1]),
+      });
+   } break;
+   case nir_intrinsic_store_global_etna:
+      emit_inst(c, &(struct etna_inst) {
+         .opcode = ISA_OPC_STORE,
+         .type = nir_intrinsic_src_type(intr) == nir_type_uint8 ? ISA_TYPE_U8 :
+                 nir_intrinsic_src_type(intr) == nir_type_uint16 ? ISA_TYPE_U16 :
+                 nir_intrinsic_src_type(intr) == nir_type_float16 ? ISA_TYPE_F16 : ISA_TYPE_U32,
+         .denorm = 1,
+         .left_shift = nir_intrinsic_offset_shift(intr),
+         .dst = {
+            .write_mask = nir_intrinsic_write_mask(intr),
+         },
+         .src[0] = get_src(c, &intr->src[1]),
+         .src[1] = get_src(c, &intr->src[2]),
+         .src[2] = get_src(c, &intr->src[0]),
+      });
+      break;
+   case nir_intrinsic_global_atomic_etna:
+   case nir_intrinsic_global_atomic_swap_etna: {
+      enum isa_type type;
+      enum isa_opc opc = atomic_opcode(nir_intrinsic_atomic_op(intr), &type);
+      unsigned dst_swiz;
+
+      if (opc == ISA_OPC_NOP) {
+         compile_error(c, "unsupported atomic op %d\n", nir_intrinsic_atomic_op(intr));
+         break;
+      }
+
+      struct etna_inst_src data = get_src(c, &intr->src[2]);
+      struct etna_inst_dst dst = ra_def(c, &intr->def, &dst_swiz);
+
+      /* atomic_cmp_xchg takes the new and the compared value from .x and .y of
+       * its destination register, like the blob emits it (dst t0.x, data
+       * t0.xy). The result has a full register that no source of this
+       * instruction shares (see RA): copy the operand there and let the old
+       * value replace .x. The operand itself can stay live, in a loop. */
+      if (opc == ISA_OPC_ATOMIC_CMP_XCHG) {
+         emit_inst(c, &(struct etna_inst) {
+            .opcode = ISA_OPC_MOV,
+            .dst = { .use = 1, .reg = dst.reg, .write_mask = ISA_WRMASK_XY__ },
+            .src[0] = data,
+         });
+         emit_inst(c, &(struct etna_inst) {
+            .opcode = opc,
+            .type = type,
+            .skphp = 1,
+            .dst = { .use = 1, .reg = dst.reg, .write_mask = ISA_WRMASK_X___ },
+            .src[0] = get_src(c, &intr->src[0]),
+            .src[1] = get_src(c, &intr->src[1]),
+            .src[2] = SRC_REG(dst.reg, SWIZZLE(X, Y, Y, Y)),
+         });
+         break;
+      }
+
+      /* like the blob: address, offset, data */
+      emit_inst(c, &(struct etna_inst) {
+         .opcode = opc,
+         .type = type,
+         .skphp = 1,
+         .dst = dst,
+         .src[0] = get_src(c, &intr->src[0]),
+         .src[1] = get_src(c, &intr->src[1]),
+         .src[2] = data,
+      });
+   } break;
+   case nir_intrinsic_barrier:
+      if (nir_intrinsic_execution_scope(intr) >= SCOPE_WORKGROUP)
+         emit_inst(c, &(struct etna_inst) { .opcode = ISA_OPC_BARRIER });
+      break;
    case nir_intrinsic_load_front_face:
    case nir_intrinsic_load_frag_coord:
       break;
@@ -804,9 +1036,77 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
    }
 }
 
+/* dual16: a 16-bit value, or a 32-bit copy of one (insert_vec_mov()), is
+ * packed halves */
+static bool
+dual16_packed_def(nir_def *def)
+{
+   if (def->bit_size == 16)
+      return true;
+
+   nir_instr *instr = nir_def_instr(def);
+   return instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == nir_op_mov &&
+          nir_instr_as_alu(instr)->src[0].src.ssa->bit_size == 16;
+}
+
+static bool
+dual16_record_src(nir_src *src, void *data)
+{
+   struct etna_compile *c = data;
+   nir_instr *parent = nir_def_instr(src->ssa);
+   bool temp = parent->type == nir_instr_type_alu;
+
+   if (parent->type == nir_instr_type_intrinsic) {
+      const nir_intrinsic_op op = nir_instr_as_intrinsic(parent)->intrinsic;
+      temp = op == nir_intrinsic_load_input || op == nir_intrinsic_load_reg;
+   }
+   if (!temp || c->d16_nrec >= ARRAY_SIZE(c->d16_rec))
+      return true;
+
+   hw_src h = get_src(c, src);
+   if (!h.use || h.rgroup != ISA_REG_GROUP_TEMP)
+      return true;
+
+   unsigned mask = 0;
+   for (unsigned j = 0; j < 4; j++)
+      mask |= 1 << ((h.swiz >> (2 * j)) & 3);
+   c->d16_rec[c->d16_nrec].reg = h.reg;
+   c->d16_rec[c->d16_nrec].mask = mask;
+   c->d16_rec[c->d16_nrec].kind = dual16_packed_def(src->ssa) ? ETNA_D16_P : ETNA_D16_W;
+   c->d16_nrec++;
+   return true;
+}
+
+/* dual16: the kinds of the result and the register sources of the
+ * instructions emitted for instr (see emit_inst()) */
+static void
+dual16_record(struct etna_compile *c, nir_instr *instr)
+{
+   c->d16_nrec = 0;
+   c->d16_dst = ETNA_D16_W;
+   c->d16_from_nir = false;
+
+   /* a vecN or a modifier folded into its users emits nothing, and the
+    * values written straight into a vecN's register have none of their own */
+   if (instr->type == nir_instr_type_alu && is_dead_instruction(instr))
+      return;
+
+   if (instr->type == nir_instr_type_alu) {
+      c->d16_dst = dual16_packed_def(&nir_instr_as_alu(instr)->def) ? ETNA_D16_P : ETNA_D16_W;
+      c->d16_from_nir = true;
+   } else if (instr->type == nir_instr_type_intrinsic &&
+              nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_global_etna) {
+      c->d16_from_nir = true;
+   }
+   if (c->d16_from_nir)
+      nir_foreach_src(instr, dual16_record_src, c);
+}
+
 static void
 emit_instr(struct etna_compile *c, nir_instr * instr)
 {
+   if (c->d16)
+      dual16_record(c, instr);
    switch (instr->type) {
    case nir_instr_type_alu:
       emit_alu(c, nir_instr_as_alu(instr));
@@ -828,6 +1128,8 @@ emit_instr(struct etna_compile *c, nir_instr * instr)
       compile_error(c, "Unhandled NIR instruction type: %d\n", instr->type);
       break;
    }
+   c->d16_from_nir = false;
+   c->d16_nrec = 0;
 }
 
 static void
@@ -847,10 +1149,84 @@ emit_block(struct etna_compile *c, nir_block * block)
 static void
 emit_cf_list(struct etna_compile *c, struct exec_list *list);
 
+/* an integer compare the backend fuses into the branch of the if it is the
+ * condition of (see split_branch_compares()): the opposite test, which
+ * branches to the else block */
+static bool
+branch_compare_op(nir_op op, enum isa_cond *cond, enum isa_type *type)
+{
+   switch (op) {
+   case nir_op_ilt32: *cond = ISA_COND_GE; *type = ISA_TYPE_S32; return true;
+   case nir_op_ige32: *cond = ISA_COND_LT; *type = ISA_TYPE_S32; return true;
+   case nir_op_ult32: *cond = ISA_COND_GE; *type = ISA_TYPE_U32; return true;
+   case nir_op_uge32: *cond = ISA_COND_LT; *type = ISA_TYPE_U32; return true;
+   case nir_op_ieq32: *cond = ISA_COND_NE; *type = ISA_TYPE_U32; return true;
+   case nir_op_ine32: *cond = ISA_COND_EQ; *type = ISA_TYPE_U32; return true;
+   default: return false;
+   }
+}
+
+/* the if whose branch alu becomes: alu is a 32-bit scalar integer compare
+ * without source modifiers, the last instruction of its block, and only the
+ * condition of the if right after that block (single-mode code) */
+static nir_if *
+branch_compare(const struct etna_compile *c, nir_alu_instr *alu)
+{
+   enum isa_cond cond;
+   enum isa_type type;
+
+   if (c->nir->info.stage != MESA_SHADER_COMPUTE || c->variant->dual16 ||
+       (c->variant->cs_fold > 1 && !c->variant->cs_fold_loop) ||
+       !branch_compare_op(alu->op, &cond, &type) ||
+       alu->def.num_components != 1 || nir_src_bit_size(alu->src[0].src) != 32 ||
+       !list_is_singular(&alu->def.uses) || !nir_def_used_by_if(&alu->def) ||
+       nir_instr_next(&alu->instr))
+      return NULL;
+
+   for (unsigned i = 0; i < 2; i++) {
+      if (is_src_mod_neg(&alu->instr, i) || is_src_mod_abs(&alu->instr, i))
+         return NULL;
+   }
+
+   nir_cf_node *next = nir_cf_node_next(&alu->instr.block->cf_node);
+   if (!next || next->type != nir_cf_node_if)
+      return NULL;
+
+   nir_if *nif = nir_cf_node_as_if(next);
+   return nif->condition.ssa == &alu->def ? nif : NULL;
+}
+
 static void
 emit_if(struct etna_compile *c, nir_if * nif)
 {
-   etna_emit_jump(c, nir_if_first_else_block(nif)->index, get_src(c, &nif->condition));
+   nir_instr *cond_instr = nir_def_instr(nif->condition.ssa);
+   nir_alu_instr *cmp = cond_instr->type == nir_instr_type_alu ? nir_instr_as_alu(cond_instr) : NULL;
+   enum isa_cond cond;
+   enum isa_type type;
+
+   if (cmp && branch_compare(c, cmp) == nif && branch_compare_op(cmp->op, &cond, &type)) {
+      struct etna_inst inst = {
+         .opcode = ISA_OPC_BRANCH_BINARY,
+         .cond = cond,
+         .type = type,
+         .imm = nir_if_first_else_block(nif)->index,
+      };
+      for (unsigned i = 0; i < 2; i++) {
+         inst.src[i] = src_swizzle(get_src(c, &cmp->src[i].src), ALU_SWIZ(&cmp->src[i]));
+         if (inst.src[i].rgroup != ISA_REG_GROUP_IMMED)
+            inst.src[i].swiz = INST_SWIZ_BROADCAST(inst.src[i].swiz & 3);
+      }
+      /* an immediate goes second, as in NXP's code: the mirrored test */
+      if (inst.src[0].rgroup == ISA_REG_GROUP_IMMED) {
+         const struct etna_inst_src t = inst.src[0];
+         inst.src[0] = inst.src[1];
+         inst.src[1] = t;
+         inst.cond = cond == ISA_COND_GE ? ISA_COND_LE : cond == ISA_COND_LT ? ISA_COND_GT : cond;
+      }
+      emit_inst(c, &inst);
+   } else {
+      etna_emit_jump(c, nir_if_first_else_block(nif)->index, get_src(c, &nif->condition));
+   }
    emit_cf_list(c, &nif->then_list);
 
    /* jump at end of then_list to skip else_list
@@ -1131,6 +1507,12 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             break;
          case nir_instr_type_load_const: {
             nir_load_const_instr *load_const = nir_instr_as_load_const(instr);
+            /* dual16: a half constant goes up as a float, which packed
+             * instructions read as a half */
+            if (c->variant->dual16 && load_const->def.bit_size == 16) {
+               for (unsigned i = 0; i < load_const->def.num_components; i++)
+                  load_const->value[i].u64 = fui(_mesa_half_to_float(load_const->value[i].u16));
+            }
             for (unsigned  i = 0; i < load_const->def.num_components; i++)
                load_const->value[i] = CONST(load_const->value[i].u32);
          } break;
@@ -1189,6 +1571,47 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             case nir_intrinsic_load_first_vertex:
                value[0] = CONST_VAL(ETNA_UNIFORM_XFB_FIRST_VERTEX, 0);
                break;
+            case nir_intrinsic_load_workgroup_size:
+               for (unsigned i = 0; i < 3; i++)
+                  value[i] = CONST_VAL(ETNA_UNIFORM_WORKGROUP_SIZE, i);
+               break;
+            case nir_intrinsic_load_num_workgroups:
+               for (unsigned i = 0; i < intr->def.num_components; i++)
+                  value[i] = CONST_VAL(ETNA_UNIFORM_NUM_WORKGROUPS, i);
+               break;
+            case nir_intrinsic_load_base_workgroup_id:
+               for (unsigned i = 0; i < intr->def.num_components; i++)
+                  value[i] = CONST_VAL(ETNA_UNIFORM_BASE_WORKGROUP_ID, i);
+               break;
+            case nir_intrinsic_get_ssbo_size:
+               value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_SIZE, nir_src_as_uint(intr->src[0]));
+               break;
+            case nir_intrinsic_load_scratch_base_ptr:
+               /* BASE 1: OpenCL private memory, BASE 0: workgroup folding */
+               value[0] = CONST_VAL(nir_intrinsic_base(intr) ? ETNA_UNIFORM_PRIVATE_ADDR :
+                                                               ETNA_UNIFORM_SCRATCH_ADDR, 0);
+               break;
+            case nir_intrinsic_load_shared_slice_etna:
+               value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_SLICE, 0);
+               break;
+            case nir_intrinsic_load_shared_base_ptr:
+               value[0] = CONST_VAL(ETNA_UNIFORM_SHARED_ADDR, 0);
+               break;
+            case nir_intrinsic_load_image_param_etna:
+               if (!nir_src_is_const(intr->src[0])) {
+                  compile_error(c, "dynamically indexed image\n");
+                  continue;
+               }
+               value[0] = CONST_VAL(ETNA_UNIFORM_IMAGE_ADDR + nir_intrinsic_base(intr),
+                                    nir_src_as_uint(intr->src[0]));
+               break;
+            case nir_intrinsic_load_ssbo_address_etna:
+               if (!nir_src_is_const(intr->src[0])) {
+                  compile_error(c, "dynamically indexed SSBO\n");
+                  continue;
+               }
+               value[0] = CONST_VAL(ETNA_UNIFORM_SSBO_ADDR, nir_src_as_uint(intr->src[0]));
+               break;
             default:
                continue;
             }
@@ -1212,6 +1635,26 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
       c->const_count = indirect_max;
    }
 
+   /* stbase.py: the base address of LOAD and STORE can be a uniform, as
+    * NXP's code has it ("store.denorm.ls2 mem.x___, u2.xxxx, ..."): a mov of
+    * a uniform component (a kernel argument in a vec4) is replaced by that
+    * component as a scalar constant, read from its uniform. STOREs keep the
+    * mov in variants folded by unrolling and in shaders that read images:
+    * there the freed register raised the resident threads of a sampling-bound
+    * kernel (climgcap rd_lin 0.73 -> 0.58 GB/s, 0.74 again with
+    * ETNA_CL_MIN_TEMPS=11) or cost OpenCV's GaussianBlur filters about 0.6%
+    * on the board. */
+   bool reads_images = false;
+   nir_foreach_block(block, c->impl) {
+      nir_foreach_instr(instr, block) {
+         reads_images |= instr->type == nir_instr_type_tex ||
+                         (instr->type == nir_instr_type_intrinsic &&
+                          nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_image_etna);
+      }
+   }
+   const bool store_base_uniform = !reads_images &&
+                                   !(c->variant->cs_fold > 1 && !c->variant->cs_fold_loop);
+
    /* add mov for any store output using sysval/const and for depth stores from intrinsics */
    nir_foreach_block(block, c->impl) {
       nir_foreach_instr_safe(instr, block) {
@@ -1232,8 +1675,105 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
                nir_src_rewrite(src, nir_mov(&b, src->ssa));
             }
          } break;
+         case nir_intrinsic_load_image_etna:
+         case nir_intrinsic_store_image_etna:
+            /* the descriptor is a uniform: coordinate and value go through
+             * registers (src 0 is the image index) */
+            for (unsigned i = 1; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; i++) {
+               if (nir_src_is_const(intr->src[i])) {
+                  b.cursor = nir_before_instr(instr);
+                  nir_src_rewrite(&intr->src[i], nir_mov(&b, intr->src[i].ssa));
+               }
+            }
+            break;
+         case nir_intrinsic_load_global_etna:
+         case nir_intrinsic_store_global_etna:
+         case nir_intrinsic_global_atomic_etna:
+         case nir_intrinsic_global_atomic_swap_etna: {
+            /* the address is a uniform: offset and data that would be
+             * another uniform go through registers (one distinct uniform per
+             * instruction). An inline immediate is not a uniform, and LOAD
+             * takes one as its offset (NXP's code has load u0.x, 0:s20);
+             * STORE with an immediate offset or value faulted (MMU, OpenCV's
+             * Canny), so its constants stay in registers */
+            const bool store = intr->intrinsic == nir_intrinsic_store_global_etna;
+            const bool load = intr->intrinsic == nir_intrinsic_load_global_etna;
+            nir_src *base = load ? &intr->src[0] : store ? &intr->src[1] : NULL;
+
+            if (base && (load || store_base_uniform) && nir_def_is_alu(base->ssa) &&
+                nir_def_as_alu(base->ssa)->op == nir_op_mov && base->ssa->num_components == 1 &&
+                nir_def_instr_type(nir_def_as_alu(base->ssa)->src[0].src.ssa) == nir_instr_type_load_const) {
+               nir_alu_instr *mov = nir_def_as_alu(base->ssa);
+               const nir_load_const_instr *lc =
+                  nir_instr_as_load_const(nir_def_instr(mov->src[0].src.ssa));
+               const nir_const_value value = lc->value[mov->src[0].swizzle[0]];
+
+               /* a uniform slot, not a constant (STORE faults on immediates) */
+               if (lc->def.bit_size == 32 && value.u64 >> 32 != ETNA_UNIFORM_CONSTANT) {
+                  b.cursor = nir_before_instr(instr);
+                  nir_src_rewrite(base, nir_build_imm(&b, 1, 32, &value));
+                  if (nir_def_is_unused(&mov->def))
+                     nir_instr_remove(&mov->instr);
+               }
+            }
+
+            nir_src *srcs[] = { store ? &intr->src[2] : &intr->src[1],
+                                store ? &intr->src[0] : load ? NULL : &intr->src[2] };
+
+            for (unsigned i = 0; i < ARRAY_SIZE(srcs); i++) {
+               if (srcs[i] && nir_src_is_const(*srcs[i]) && load &&
+                   !needs_uniform_slot(nir_instr_as_load_const(nir_def_instr(srcs[i]->ssa))))
+                  continue;
+               if (srcs[i] && nir_src_is_const(*srcs[i])) {
+                  b.cursor = nir_before_instr(instr);
+                  nir_src_rewrite(srcs[i], nir_mov(&b, srcs[i]->ssa));
+               }
+            }
+         } break;
          default:
             break;
+         }
+      }
+   }
+
+   /* An input or a system value sits in a fixed register and emits no
+    * instruction. As a phi source, nir_convert_from_ssa() can merge it into
+    * the phi's register web, which then gets a single fixed register: with
+    * two inputs feeding one phi, one of them is read from the other's
+    * register, and the first input's register is free for other values.
+    * Copy such sources in the predecessor block instead.
+    */
+   nir_foreach_block(block, c->impl) {
+      nir_foreach_phi(phi, block) {
+         nir_foreach_phi_src(src, phi) {
+            nir_instr *instr = nir_def_instr(src->src.ssa);
+            bool fixed = is_sysval(instr);
+
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+               fixed |= op == nir_intrinsic_load_input ||
+                        op == nir_intrinsic_load_instance_id ||
+                        op == nir_intrinsic_load_vertex_id;
+            }
+            if (!fixed)
+               continue;
+
+            b.cursor = nir_after_block_before_jump(src->pred);
+            nir_src_rewrite(&src->src, nir_mov(&b, src->src.ssa));
+         }
+      }
+   }
+
+   /* the backend has 32-bit registers only (and 1-bit booleans) */
+   nir_foreach_block(block, c->impl) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+         if (def && (def->bit_size == 8 || (def->bit_size == 16 && !c->variant->dual16)) &&
+             instr->type != nir_instr_type_load_const) {
+            char *str = nir_instr_as_str(instr, NULL);
+            compile_error(c, "%u-bit value not lowered: %s\n", def->bit_size, str);
+            ralloc_free(str);
+            return false;
          }
       }
    }
@@ -1242,7 +1782,12 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
    nir_convert_from_ssa(shader, true, false);
    nir_trivialize_registers(shader);
 
-   etna_ra_assign(c, shader);
+   if (!etna_ra_assign(c, shader)) {
+      mesa_loge("etnaviv: register allocation failed (%u nodes)", c->num_nodes);
+      ralloc_free(c->g);
+      ralloc_free(c->live_map);
+      return false;
+   }
 
    emit_cf_list(c, &nir_shader_get_entrypoint(shader)->body);
 
@@ -1261,6 +1806,69 @@ max_uniforms(const struct etna_shader_variant *v)
 }
 
 static bool
+is_branch_inst(const struct etna_inst *inst)
+{
+   return inst->opcode == ISA_OPC_BRANCH || inst->opcode == ISA_OPC_BRANCH_UNARY ||
+          inst->opcode == ISA_OPC_BRANCH_BINARY;
+}
+
+/* drop instruction p of the code; branch targets are block indices until the
+ * code is assembled, so only the block starts after p move */
+static void
+remove_code_inst(struct etna_compile *c, unsigned num_blocks, int p)
+{
+   memmove(&c->code[p], &c->code[p + 1], (c->inst_ptr - p - 1) * sizeof(c->code[0]));
+   c->inst_ptr--;
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if ((int)c->block_ptr[b] > p)
+         c->block_ptr[b]--;
+   }
+}
+
+/* The end of a loop, "if (c) break;" with nothing after it but the back edge,
+ * is emitted as
+ *    p:   branch.!c -> L          (L = p + 2, the empty else block)
+ *    p+1: branch    -> E          (the break)
+ *    L:   branch    -> H          (the back edge)
+ * With nothing else branching to p + 1 or L, branch on the condition straight
+ * to H and fall through to the break:
+ *    p:   branch.!c -> H
+ *    p+1: branch    -> E          (gone where E follows)
+ * The same control flow, one branch fewer per iteration. */
+static void
+loop_branches(struct etna_compile *c, unsigned num_blocks)
+{
+   for (int p = 0; p + 2 < c->inst_ptr; p++) {
+      const struct etna_inst *a = &c->code[p], *b = &c->code[p + 1], *d = &c->code[p + 2];
+
+      if ((a->opcode != ISA_OPC_BRANCH_UNARY && a->opcode != ISA_OPC_BRANCH_BINARY) ||
+          b->opcode != ISA_OPC_BRANCH || d->opcode != ISA_OPC_BRANCH ||
+          a->imm >= num_blocks || b->imm >= num_blocks || d->imm >= num_blocks ||
+          (int)c->block_ptr[a->imm] != p + 2)
+         continue;
+
+      bool other = false;
+      for (int i = 0; i < c->inst_ptr && !other; i++) {
+         if (i == p || !is_branch_inst(&c->code[i]))
+            continue;
+         if (c->code[i].imm >= num_blocks)
+            other = true;
+         else
+            other = (int)c->block_ptr[c->code[i].imm] == p + 1 ||
+                    (int)c->block_ptr[c->code[i].imm] == p + 2;
+      }
+      if (other)
+         continue;
+
+      const unsigned exit = b->imm;
+      c->code[p].imm = d->imm;
+      remove_code_inst(c, num_blocks, p + 2);
+      if ((int)c->block_ptr[exit] == p + 2)
+         remove_code_inst(c, num_blocks, p + 1);
+   }
+}
+
+static bool
 etna_compile_check_limits(struct etna_shader_variant *v)
 {
    const struct etna_core_info *info = v->shader->info;
@@ -1272,9 +1880,14 @@ etna_compile_check_limits(struct etna_shader_variant *v)
       return false;
    }
 
-   if (v->num_temps > info->gpu.max_registers) {
-      DBG("Number of registers (%d) exceeds maximum %d", v->num_temps,
-          info->gpu.max_registers);
+   /* The NUM_TEMPS fields of VS/PS_TEMP_REGISTER_CONTROL have 6 bits: a
+    * shader that takes all 64 temporaries would program 0 and run with
+    * garbage registers (MMU faults, GPU hangs). */
+   const unsigned max_temps = MIN2(info->gpu.max_registers,
+                                   VIVS_PS_TEMP_REGISTER_CONTROL_NUM_TEMPS__MASK);
+
+   if (v->num_temps > max_temps) {
+      DBG("Number of registers (%d) exceeds maximum %d", v->num_temps, max_temps);
       return false;
    }
 
@@ -1339,6 +1952,2207 @@ fill_vs_mystery(struct etna_shader_variant *v)
                              VIVS_VS_LOAD_BALANCING_D(0x0f);
 }
 
+/* NIR's fmin and fmax return the other operand for a NaN one (minNum and
+ * maxNum) when they preserve NaNs, as OpenCL's do. A SELECT with a
+ * comparison, as they are emitted, does that for a NaN second operand but
+ * returns a NaN first one: test the first one before. */
+static bool
+lower_fminmax_nan(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if ((alu->op != nir_op_fmin && alu->op != nir_op_fmax) ||
+       !nir_alu_instr_is_nan_preserve(alu) || alu->def.bit_size != 32)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
+
+   const unsigned save_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl = 0;
+   nir_def *sel = alu->op == nir_op_fmax ? nir_fmax(b, x, y) : nir_fmin(b, x, y);
+   b->fp_math_ctrl = save_math_ctrl;
+
+   /* the bits, not a comparison: x is NaN when |x| is above infinity */
+   nir_def *x_nan = nir_ult(b, nir_imm_int(b, 0x7f800000), nir_iand_imm(b, x, 0x7fffffff));
+   nir_def_replace(&alu->def, nir_bcsel(b, x_nan, y, sel));
+   return true;
+}
+
+/* CL_CONFIG value order 3: t0 = global ID, t1 = local ID, t2 = workgroup ID */
+static nir_def *
+load_cs_input(nir_builder *b, unsigned reg, unsigned *input_count)
+{
+   *input_count = MAX2(*input_count, reg + 1);
+   return nir_load_input(b, 3, 32, nir_imm_int(b, 0), .base = reg);
+}
+
+static bool
+lower_cs_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   unsigned *input_count = data;
+   nir_def *val;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global_invocation_id:
+      val = load_cs_input(b, 0, input_count);
+      break;
+   case nir_intrinsic_load_local_invocation_id:
+      val = load_cs_input(b, 1, input_count);
+      break;
+   case nir_intrinsic_load_workgroup_id:
+      /* the hardware counts the workgroups of each dispatch from 0, and
+       * etna_launch_grid() may dispatch a grid in parts: the first workgroup
+       * of the part is a uniform */
+      val = nir_iadd(b, load_cs_input(b, 2, input_count), nir_load_base_workgroup_id(b, 32));
+      break;
+   case nir_intrinsic_load_local_invocation_index: {
+      nir_def *id = load_cs_input(b, 1, input_count);
+      nir_def *size;
+
+      /* OpenCL kernels have the workgroup size of the dispatch */
+      if (b->shader->info.workgroup_size_variable) {
+         size = nir_load_workgroup_size(b);
+      } else {
+         const uint16_t *s = b->shader->info.workgroup_size;
+         size = nir_imm_ivec3(b, s[0], s[1], s[2]);
+      }
+
+      val = nir_iadd(b, nir_channel(b, id, 0),
+                     nir_imul(b, nir_iadd(b, nir_channel(b, id, 1),
+                                          nir_imul(b, nir_channel(b, id, 2), nir_channel(b, size, 1))),
+                              nir_channel(b, size, 0)));
+      break;
+   }
+   default:
+      return false;
+   }
+
+   nir_def_replace(&intr->def, nir_u2uN(b, val, intr->def.bit_size));
+   return true;
+}
+
+/* a narrow store: STORE.u8/u16 takes a 32-bit register and writes its low
+ * byte or half */
+static nir_def *
+store_value32(nir_builder *b, nir_def *v)
+{
+   return v->bit_size < 32 ? nir_u2u32(b, v) : v;
+}
+
+static nir_alu_type
+store_type(const nir_def *v)
+{
+   return v->bit_size < 32 ? (nir_alu_type)(nir_type_uint | v->bit_size) : nir_type_invalid;
+}
+
+/* OpenCL private memory that stays memory (dynamically indexed arrays) comes
+ * as scratch access: each invocation of the dispatch has a slot of
+ * scratch_size bytes in the private buffer, addressed as global memory. */
+static bool
+lower_private_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned size = *(unsigned *)data;
+   const bool load = intr->intrinsic == nir_intrinsic_load_scratch;
+
+   if (!load && intr->intrinsic != nir_intrinsic_store_scratch)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *wid = nir_load_workgroup_id(b);
+   nir_def *num = nir_load_num_workgroups(b);
+   nir_def *group = nir_iadd(b, nir_channel(b, wid, 0),
+                             nir_imul(b, nir_channel(b, num, 0),
+                                      nir_iadd(b, nir_channel(b, wid, 1),
+                                               nir_imul(b, nir_channel(b, num, 1),
+                                                        nir_channel(b, wid, 2)))));
+   nir_def *block;
+   if (b->shader->info.workgroup_size_variable) {
+      block = nir_load_workgroup_size(b);
+   } else {
+      const uint16_t *s = b->shader->info.workgroup_size;
+      block = nir_imm_ivec3(b, s[0], s[1], s[2]);
+   }
+   nir_def *threads = nir_imul(b, nir_channel(b, block, 0),
+                               nir_imul(b, nir_channel(b, block, 1), nir_channel(b, block, 2)));
+   nir_def *slot = nir_iadd(b, nir_imul(b, group, threads), nir_load_local_invocation_index(b));
+   nir_def *offset = intr->src[load ? 0 : 1].ssa;
+   nir_def *addr = nir_iadd(b, nir_load_scratch_base_ptr(b, 1, 32, .base = 1),
+                            nir_iadd(b, nir_imul_imm(b, slot, size), offset));
+   /* slots are 16-byte aligned */
+   const unsigned align_mul = MIN2(nir_intrinsic_align_mul(intr), 16);
+   const unsigned align_offset = nir_intrinsic_align_offset(intr) % align_mul;
+
+   if (load) {
+      nir_def *repl = nir_load_global(b, intr->def.num_components, intr->def.bit_size, addr,
+                                      .align_mul = align_mul, .align_offset = align_offset);
+      nir_def_replace(&intr->def, repl);
+   } else {
+      nir_store_global(b, intr->src[0].ssa, addr, .write_mask = nir_intrinsic_write_mask(intr),
+                       .align_mul = align_mul, .align_offset = align_offset);
+      nir_instr_remove(&intr->instr);
+   }
+
+   return true;
+}
+
+/* Shared memory lives in DDR, one slice per workgroup: address = shared base +
+ * linear workgroup index * slice size + offset. barrier() keeps the threads of
+ * a group in step, and the slices of different groups never overlap. */
+static bool
+lower_shared_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned slice = *(unsigned *)data;
+   unsigned off_src;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_shared:
+   case nir_intrinsic_shared_atomic:
+   case nir_intrinsic_shared_atomic_swap:
+      off_src = 0;
+      break;
+   case nir_intrinsic_store_shared:
+      off_src = 1;
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *wid = nir_load_workgroup_id(b);
+   nir_def *num = nir_load_num_workgroups(b);
+   nir_def *group = nir_iadd(b, nir_channel(b, wid, 0),
+                             nir_imul(b, nir_channel(b, num, 0),
+                                      nir_iadd(b, nir_channel(b, wid, 1),
+                                               nir_imul(b, nir_channel(b, num, 1),
+                                                        nir_channel(b, wid, 2)))));
+   /* with __local kernel arguments the slice size is the dispatch's */
+   nir_def *slice_size = b->shader->info.cs.has_variable_shared_mem ?
+                         nir_load_shared_slice_etna(b) : nir_imm_int(b, slice);
+   nir_def *offset = nir_iadd(b, nir_imul(b, group, slice_size),
+                              nir_iadd_imm(b, intr->src[off_src].ssa, nir_intrinsic_base(intr)));
+   nir_def *addr = nir_load_shared_base_ptr(b, 1, 32);
+   nir_def *repl = NULL;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_shared:
+      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size, addr, offset);
+      break;
+   case nir_intrinsic_store_shared:
+      nir_store_global_etna(b, store_value32(b, intr->src[0].ssa), addr, offset,
+                            .write_mask = nir_intrinsic_write_mask(intr),
+                            .src_type = store_type(intr->src[0].ssa));
+      break;
+   case nir_intrinsic_shared_atomic:
+      repl = nir_global_atomic_etna(b, intr->def.bit_size, addr, offset, intr->src[1].ssa,
+                                    .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   case nir_intrinsic_shared_atomic_swap:
+      repl = nir_global_atomic_swap_etna(b, intr->def.bit_size, addr, offset,
+                                         nir_vec2(b, intr->src[2].ssa, intr->src[1].ssa),
+                                         .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   default:
+      UNREACHABLE("not a shared memory access");
+   }
+
+   if (repl)
+      nir_def_rewrite_uses(&intr->def, repl);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+enum etna_image_param {
+   ETNA_IMAGE_ADDR,
+   ETNA_IMAGE_STRIDE,
+   ETNA_IMAGE_LAYER_STRIDE,
+   ETNA_IMAGE_WIDTH,
+   ETNA_IMAGE_HEIGHT,
+   ETNA_IMAGE_DEPTH,
+   ETNA_IMAGE_TILED,
+   ETNA_IMAGE_PLANE_OFFSET,
+};
+
+static nir_def *
+image_param(nir_builder *b, nir_def *index, enum etna_image_param param)
+{
+   return nir_load_image_param_etna(b, index, .base = param);
+}
+
+static void
+image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *align)
+{
+   unsigned s = glsl_type_is_array(type) ? glsl_get_aoa_size(type) : 1;
+
+   *size = s;
+   *align = s;
+}
+
+/* An OpenCL 2D texture read with img_load (key tex_img_read): fetches at
+ * level 0, and, with a nearest, unnormalized sampler clamped to the edge or
+ * to the border (key tex_img_sampled), samples at level 0, whose texel is the
+ * floor of the coordinates clamped to the texture; outside it, the border:
+ * (0, 0, 0, 0), or (0, 0, 0, 1) for a format without alpha. The samples of
+ * textures with the sampler in the key (tex_img_sampler) are
+ * lower_tex2d_il()'s. Other reads keep the texture unit. */
+static nir_def *
+il_int_coord(nir_builder *b, nir_def *coord, unsigned c);
+
+static bool
+lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
+{
+   const bool sampled = key->tex_img_sampled & BITFIELD_BIT(tex->texture_index);
+   const bool border = key->tex_img_border & BITFIELD_BIT(tex->texture_index);
+   const bool hwclamp = key->tex_img_hwclamp & BITFIELD_BIT(tex->texture_index);
+
+   if ((tex->op != nir_texop_txf &&
+        !(sampled && (tex->op == nir_texop_tex || tex->op == nir_texop_txl))) ||
+       tex->is_shadow || tex->is_sparse || tex->def.bit_size != 32)
+      return false;
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      switch (tex->src[i].src_type) {
+      case nir_tex_src_coord:
+         break;
+      case nir_tex_src_lod:
+         /* 0 or 0.0 */
+         if (!nir_src_is_const(tex->src[i].src) || nir_src_as_uint(tex->src[i].src) != 0)
+            return false;
+         break;
+      default:
+         return false;
+      }
+   }
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *index = nir_imm_int(b, 8 + tex->texture_index);
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *xy = nir_trim_vector(b, nir_get_tex_src(tex, nir_tex_src_coord), 2);
+   nir_def *inside = NULL;
+
+   if (tex->op != nir_texop_txf) {
+      /* the floor of each coordinate; integer coordinates converted to
+       * float (read_imagef() with int2: libclc's float(c) + 0.5, the texel
+       * centre) are taken as they are (il_int_coord()) */
+      nir_def *texel[2];
+      for (unsigned c = 0; c < 2; c++) {
+         texel[c] = il_int_coord(b, xy, c);
+         if (!texel[c])
+            texel[c] = nir_f2i32(b, nir_ffloor(b, nir_channel(b, xy, c)));
+      }
+
+      nir_def *texel_xy = nir_vec2(b, texel[0], texel[1]);
+      nir_def *size = nir_image_size(b, 2, 32, index, zero, .image_dim = GLSL_SAMPLER_DIM_2D,
+                                     .image_array = false);
+      /* one axis at a time, as il_sample(): the clamp of an axis that
+       * doesn't change between reads (x down a column) is shared by them,
+       * and the clamps of the other axis vectorize across reads; the last
+       * texel stays a vector, so that reads of several images at the same
+       * coordinates still clamp both axes in one imin */
+      nir_def *last = nir_iadd_imm(b, size, -1);
+      nir_def *clamped[2];
+      for (unsigned c = 0; c < 2; c++)
+         clamped[c] = nir_imin(b, nir_imax_imm(b, texel[c], 0), nir_channel(b, last, c));
+      /* the descriptor clamps to the edge itself */
+      xy = hwclamp && !border ? texel_xy : nir_vec2(b, clamped[0], clamped[1]);
+      /* the texel is in the texture where clamping doesn't move it */
+      if (border)
+         inside = nir_ball_iequal(b, xy, texel_xy);
+   }
+
+   nir_def *repl = nir_image_load(b, tex->def.num_components, 32, index,
+                                  nir_vec4(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1), zero, zero),
+                                  zero, zero, .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+                                  .format = PIPE_FORMAT_NONE, .access = ACCESS_NON_WRITEABLE,
+                                  .dest_type = tex->dest_type);
+
+   if (inside) {
+      const bool a1 = key->tex_img_border_a1 & BITFIELD_BIT(tex->texture_index);
+      nir_def *one = nir_alu_type_get_base_type(tex->dest_type) == nir_type_float
+                        ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
+      nir_def *comps[4] = { zero, zero, zero, a1 ? one : zero };
+
+      repl = nir_bcsel(b, inside, repl, nir_vec(b, comps, tex->def.num_components));
+   }
+
+   nir_def_replace(&tex->def, repl);
+   return true;
+}
+
+/* a texel of an OpenCL 2D texture in the interleaved 128-bit layout, image
+ * index: one 16-byte img_load */
+static nir_def *
+il_load(nir_builder *b, nir_def *index, nir_def *x, nir_def *y, nir_alu_type type)
+{
+   nir_def *zero = nir_imm_int(b, 0);
+
+   return nir_image_load(b, 4, 32, index, nir_vec4(b, x, y, zero, zero), zero, zero,
+                         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+                         .format = PIPE_FORMAT_NONE, .access = ACCESS_NON_WRITEABLE,
+                         .dest_type = type);
+}
+
+/* the sampler of an OpenCL texture in the interleaved layout, or of another
+ * whose samples the shader does (tex_img_sampler), from the key; border_a1:
+ * the border is (0, 0, 0, 1), for formats without alpha */
+struct il_sampler {
+   bool normalized, linear, border, repeat, mirror, border_a1;
+};
+
+/* The integer x of channel c of a sample coordinate that is i2f32(x), or
+ * i2f32(x) + 0.5: vtn moves the integer coordinates of a sampled read
+ * (read_image*(image, sampler, int2)) to the texel centre. floor() of that
+ * is x, for any x of an image. NULL for other coordinates. */
+static nir_def *
+il_int_coord(nir_builder *b, nir_def *coord, unsigned c)
+{
+   nir_scalar f = nir_scalar_resolved(coord, c);
+
+   if (nir_scalar_is_alu(f) && nir_scalar_alu_op(f) == nir_op_fadd) {
+      for (unsigned k = 0; k < 2; k++) {
+         nir_scalar h = nir_scalar_chase_alu_src(f, 1 - k);
+
+         if (nir_scalar_is_const(h) && nir_scalar_as_float(h) == 0.5) {
+            f = nir_scalar_chase_alu_src(f, k);
+            break;
+         }
+      }
+   }
+
+   if (nir_scalar_is_alu(f) && nir_scalar_alu_op(f) == nir_op_i2f32 &&
+       nir_scalar_chase_alu_src(f, 0).def->bit_size == 32)
+      return nir_mov_scalar(b, nir_scalar_chase_alu_src(f, 0));
+
+   return NULL;
+}
+
+/* u, the texel position of sample coordinate s on an axis of size n texels:
+ * s * n (normalized), s (unnormalized), (s - floor(s)) * n (repeat),
+ * |s - 2 rint(s / 2)| * n (mirrored repeat). Repeat and mirrored repeat take
+ * normalized coordinates only (OpenCL leaves the others undefined): those
+ * clamp to the edge. Any number of components. */
+static nir_def *
+il_position(nir_builder *b, const struct il_sampler *sm, nir_def *s, nir_def *n)
+{
+   nir_def *nf = nir_i2f32(b, n);
+
+   if (sm->normalized && sm->repeat)
+      return nir_fmul(b, nir_fsub(b, s, nir_ffloor(b, s)), nf);
+
+   if (sm->normalized && sm->mirror) {
+      nir_def *m = nir_fmul_imm(b, nir_fround_even(b, nir_fmul_imm(b, s, 0.5)), 2.0);
+      return nir_fmul(b, nir_fabs(b, nir_fsub(b, s, m)), nf);
+   }
+
+   return sm->normalized ? nir_fmul(b, s, nf) : s;
+}
+
+/* An OpenCL sample of a 2D texture in the interleaved layout, as the OpenCL C
+ * specification computes it ("Image addressing and filtering"):
+ * - Nearest: texel floor(u) (il_position()), back by the size past the last
+ *   texel (repeat). An integer coordinate (read_image*(image, sampler,
+ *   int2), which takes unnormalized nearest samplers) is taken as it is
+ *   (il_int_coord()). One axis at a time, so that the reads of a loop vectorize
+ *   across samples and the work of an axis that doesn't change leaves it.
+ * - Linear: texels i0 = floor(u - 0.5) and i1 = i0 + 1, i0 forward by the size
+ *   before the first texel and i1 back past the last (repeat), weights
+ *   (1 - a)(1 - b), a(1 - b), (1 - a)b and ab with (a, b) = frac(u - 0.5),
+ *   summed in that order, as lower_shader_linear() does. Both axes and both
+ *   texels of each at once, a vec4 (x0, y0, x1, y1), whose channels the four
+ *   loads take as their coordinates.
+ * - With CLK_ADDRESS_CLAMP a texel outside the image reads as the border,
+ *   (0, 0, 0, 0), or (0, 0, 0, 1) for formats without alpha (one unsigned
+ *   compare: below 0 or past the last). Every texel is clamped into the image
+ *   for the load, from a NaN or infinite coordinate too. */
+static nir_def *
+il_sample(nir_builder *b, const struct il_sampler *sm, nir_def *index, nir_def *coord,
+          nir_alu_type type)
+{
+   nir_def *size = nir_image_size(b, 2, 32, index, nir_imm_int(b, 0),
+                                  .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false);
+   const bool repeat = sm->normalized && sm->repeat;
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *one = nir_alu_type_get_base_type(type) == nir_type_float ? nir_imm_float(b, 1.0f)
+                                                                     : nir_imm_int(b, 1);
+   nir_def *border = nir_vec4(b, zero, zero, zero, sm->border_a1 ? one : zero);
+
+   if (!sm->linear) {
+      nir_def *texel[2], *out = NULL;
+
+      for (unsigned c = 0; c < 2; c++) {
+         nir_def *n = nir_channel(b, size, c);
+         nir_def *last = nir_iadd_imm(b, n, -1);
+         nir_def *x = sm->normalized ? NULL : il_int_coord(b, coord, c);
+
+         if (!x)
+            x = nir_f2i32(b, nir_ffloor(b, il_position(b, sm, nir_channel(b, coord, c), n)));
+         if (repeat)
+            x = nir_bcsel(b, nir_ilt(b, last, x), nir_isub(b, x, n), x);
+         if (sm->border) {
+            nir_def *o = nir_ult(b, last, x);
+            out = out ? nir_ior(b, out, o) : o;
+         }
+         texel[c] = nir_imin(b, nir_imax_imm(b, x, 0), last);
+      }
+
+      nir_def *v = il_load(b, index, texel[0], texel[1], type);
+
+      return out ? nir_bcsel(b, out, border, v) : v;
+   }
+
+   static const unsigned xyxy[4] = { 0, 1, 0, 1 };
+   /* the texels of the taps: (x0, y0), (x1, y0), (x0, y1), (x1, y1) */
+   static const unsigned tap_x[4] = { 0, 2, 0, 2 }, tap_y[4] = { 1, 1, 3, 3 };
+   nir_def *n = nir_swizzle(b, size, xyxy, 4);
+   nir_def *last = nir_iadd_imm(b, n, -1);
+   nir_def *x = nir_fadd_imm(b, il_position(b, sm, nir_swizzle(b, coord, xyxy, 4), n), -0.5);
+   nir_def *x0 = nir_ffloor(b, x);
+   nir_def *a = nir_fsub(b, x, x0);
+   nir_def *i = nir_iadd(b, nir_f2i32(b, x0), nir_imm_ivec4(b, 0, 0, 1, 1));
+
+   if (repeat) {
+      i = nir_bcsel(b, nir_ilt_imm(b, i, 0), nir_iadd(b, i, n), i);
+      i = nir_bcsel(b, nir_ilt(b, last, i), nir_isub(b, i, n), i);
+   }
+
+   nir_def *out = sm->border ? nir_ult(b, last, i) : NULL;
+   i = nir_imin(b, nir_imax_imm(b, i, 0), last);
+
+   /* (1 - a, 1 - b, a, b), then the weight of each tap */
+   nir_def *w = nir_fadd(b, nir_fmul(b, a, nir_imm_vec4(b, -1.0, -1.0, 1.0, 1.0)),
+                         nir_imm_vec4(b, 1.0, 1.0, 0.0, 0.0));
+   nir_def *weight = nir_fmul(b, nir_swizzle(b, w, tap_x, 4), nir_swizzle(b, w, tap_y, 4));
+   nir_def *tap_out = out ? nir_ior(b, nir_swizzle(b, out, tap_x, 4), nir_swizzle(b, out, tap_y, 4))
+                          : NULL;
+   nir_def *v = NULL;
+
+   for (unsigned m = 0; m < 4; m++) {
+      nir_def *tap = il_load(b, index, nir_channel(b, i, tap_x[m]), nir_channel(b, i, tap_y[m]), type);
+
+      if (tap_out)
+         tap = nir_bcsel(b, nir_channel(b, tap_out, m), border, tap);
+
+      tap = nir_fmul(b, tap, nir_channel(b, weight, m));
+      v = v ? nir_fadd(b, v, tap) : tap;
+   }
+
+   return v;
+}
+
+/* An OpenCL 2D texture in the interleaved 128-bit layout (key tex_il), which
+ * the texture unit can't read: every read with the image instructions, as
+ * image 8 + texture, in any texture slot. Size queries read the descriptor,
+ * fetches (read_image*() without a sampler) load the texel, and samples do
+ * the key's sampler in the shader (il_sample()). The texture has one level.
+ * read_imageh() rounds to the nearest half. The samples of the other textures
+ * read with img_load whose sampler is in the key (tex_img_sampler: one level)
+ * come here too; the texture unit keeps those it can't do. */
+static bool
+lower_tex2d_il(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
+{
+   const unsigned t = tex->texture_index;
+   const nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+
+   if (tex->op == nir_texop_txs) {
+      b->cursor = nir_before_instr(&tex->instr);
+      nir_def_replace(&tex->def,
+                      nir_image_size(b, tex->def.num_components, 32, nir_imm_int(b, 8 + t),
+                                     nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                                     .image_array = false));
+      return true;
+   }
+
+   bool supported = (tex->op == nir_texop_txf || tex->op == nir_texop_tex ||
+                     tex->op == nir_texop_txl) && !tex->is_shadow && !tex->is_sparse &&
+                    (tex->def.bit_size == 32 || (tex->def.bit_size == 16 && base == nir_type_float));
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type != nir_tex_src_coord && tex->src[i].src_type != nir_tex_src_lod)
+         supported = false;
+   }
+
+   if (!supported) {
+      if (key->tex_il & BITFIELD_BIT(t))
+         mesa_loge("etnaviv: texture op %u of the interleaved 128-bit texture %u isn't supported",
+                   tex->op, t);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *index = nir_imm_int(b, 8 + t);
+   nir_def *coord = nir_trim_vector(b, nir_get_tex_src(tex, nir_tex_src_coord), 2);
+   const nir_alu_type type = base | 32;
+   nir_def *v;
+
+   if (tex->op == nir_texop_txf) {
+      v = il_load(b, index, nir_channel(b, coord, 0), nir_channel(b, coord, 1), type);
+   } else {
+      const struct il_sampler sm = {
+         .normalized = key->tex_il_normalized & BITFIELD_BIT(t),
+         /* OpenCL filters float reads only */
+         .linear = (key->tex_il_linear & BITFIELD_BIT(t)) && base == nir_type_float,
+         .border = key->tex_il_border & BITFIELD_BIT(t),
+         .repeat = key->tex_il_repeat & BITFIELD_BIT(t),
+         .mirror = key->tex_il_mirror & BITFIELD_BIT(t),
+         .border_a1 = key->tex_img_border_a1 & BITFIELD_BIT(t),
+      };
+
+      v = il_sample(b, &sm, index, coord, type);
+   }
+
+   if (tex->def.bit_size == 16)
+      v = nir_f2f16_rtne(b, v);
+
+   nir_def_replace(&tex->def, nir_trim_vector(b, v, tex->def.num_components));
+   return true;
+}
+
+/* OpenCL 1D image buffers that are read only come as buffer textures, which
+ * the texture unit can't sample, and OpenCL 2D textures are read
+ * faster by the image instructions (lower_tex2d_to_image()): read them with
+ * those, as images 8 + texture index (see etna_uniform_image()). 2D textures
+ * in the interleaved 128-bit layout are read that way in any slot, every
+ * read (lower_tex2d_il()), and so are the samples of the textures with the
+ * sampler in the key (tex_img_sampler). */
+static bool
+lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct etna_shader_key *key = data;
+   /* textures 0-7, or all in a wide dispatch (images 8-39) */
+   const unsigned max = key->cs_tex_wide ? 32 : 8;
+
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < 32 &&
+       ((key->tex_il & BITFIELD_BIT(tex->texture_index)) ||
+        ((key->tex_img_sampler & BITFIELD_BIT(tex->texture_index)) &&
+         (tex->op == nir_texop_tex || tex->op == nir_texop_txl))))
+      return lower_tex2d_il(b, tex, key);
+
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < max &&
+       (key->tex_img_read & BITFIELD_BIT(tex->texture_index)))
+      return lower_tex2d_to_image(b, tex, key);
+
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF || tex->texture_index >= max ||
+       (tex->op != nir_texop_txf && tex->op != nir_texop_txs))
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *index = nir_imm_int(b, 8 + tex->texture_index);
+   nir_def *repl;
+
+   if (tex->op == nir_texop_txs) {
+      repl = nir_image_size(b, tex->def.num_components, 32, index, nir_imm_int(b, 0),
+                            .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false);
+   } else {
+      nir_def *x = nir_channel(b, nir_get_tex_src(tex, nir_tex_src_coord), 0);
+      nir_def *zero = nir_imm_int(b, 0);
+
+      repl = nir_image_load(b, tex->def.num_components, 32, index,
+                            nir_vec4(b, x, zero, zero, zero), zero, zero,
+                            .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false,
+                            .format = PIPE_FORMAT_NONE, .access = ACCESS_NON_WRITEABLE,
+                            .dest_type = tex->dest_type);
+   }
+
+   nir_def_replace(&tex->def, repl);
+   return true;
+}
+
+/* A wide compute dispatch (key cs_tex_wide: OpenCL, more than 16 textures):
+ * the textures the texture unit still reads after lower_texbuf_to_image() take
+ * the fragment slots in order of their index, where etna_launch_grid() binds
+ * them. The passes after this one see slots, as for 16 textures or fewer. A
+ * variant that needs more than 16 slots isn't run (etna_compute_probe_wide());
+ * its extra textures share the last slot so that it compiles. */
+static void
+remap_tex_slots(nir_shader *s, struct etna_shader_variant *v)
+{
+   uint32_t used = 0;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex)
+               used |= BITFIELD_BIT(nir_instr_as_tex(instr)->texture_index);
+         }
+      }
+   }
+
+   memset(v->cs_tex_slot, 0xff, sizeof(v->cs_tex_slot));
+   v->cs_tex_slots = 0;
+   u_foreach_bit(t, used)
+      v->cs_tex_slot[t] = v->cs_tex_slots++;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            const unsigned slot = MIN2(v->cs_tex_slot[tex->texture_index], 15);
+
+            tex->texture_index = slot;
+            tex->sampler_index = slot;
+         }
+      }
+   }
+}
+
+/* Is image index (0-7 the shader images, 8-39 the textures read as images)
+ * 128-bit, or one component? Without a format in the shader (OpenCL) the key
+ * says. */
+static bool
+key_img_bit(const struct etna_shader_key *key, nir_src index, bool comp1)
+{
+   if (!nir_src_is_const(index))
+      return false;
+
+   const unsigned i = nir_src_as_uint(index);
+
+   if (i < 16)
+      return (comp1 ? key->img_1comp : key->img_128bit) & BITFIELD_BIT(i);
+
+   return i - 8 < 32 && ((comp1 ? key->tex_img_1comp : key->tex_img_128bit) & BITFIELD_BIT(i - 8));
+}
+
+/* Is image index (as key_img_bit()) a 2D image in the interleaved 128-bit
+ * layout (OpenCL), whose 16-byte texels img_load and img_store take whole? */
+static bool
+key_il_bit(const struct etna_shader_key *key, nir_src index)
+{
+   if (!nir_src_is_const(index))
+      return false;
+
+   const unsigned i = nir_src_as_uint(index);
+
+   if (i < 8)
+      return key->img_il & BITFIELD_BIT(i);
+
+   return i - 8 < 32 && (key->tex_il & BITFIELD_BIT(i - 8));
+}
+
+/* Is image index (as key_img_bit()) a texture with the sampler in the key
+ * (tex_img_sampler), whose loads are the texels of OpenCL samples? */
+static bool
+key_sampler_bit(const struct etna_shader_key *key, nir_src index)
+{
+   if (!nir_src_is_const(index))
+      return false;
+
+   const unsigned i = nir_src_as_uint(index);
+
+   return i >= 8 && i - 8 < 32 && (key->tex_img_sampler & BITFIELD_BIT(i - 8));
+}
+
+/* Images are linear or 4x4 tiled (see etna_resource_create()). Loads and
+ * stores use img_load/img_store, which address and convert texels through
+ * the image descriptor. 128-bit formats are two stacked planes of 64-bit
+ * texels (xy, then zw), see etna_resource_level_second_plane_offset(),
+ * except in buffers and in the interleaved layout of OpenCL 2D images (key
+ * img_il, tex_il), which hold them as 16-byte texels.
+ * Atomics (r32ui, r32i) address the texel in the shader and use the atomic
+ * instructions: linear base + layer * layer stride + y * stride + x * 4,
+ * tiled in tiles of 4x4 texels in rows of stride * 4 bytes. */
+static bool
+lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct etna_shader_key *key = data;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   /* image derefs to binding indices, like gl_nir_lower_images() */
+   if (intr->intrinsic == nir_intrinsic_image_deref_load ||
+       intr->intrinsic == nir_intrinsic_image_deref_store ||
+       intr->intrinsic == nir_intrinsic_image_deref_size ||
+       intr->intrinsic == nir_intrinsic_image_deref_atomic ||
+       intr->intrinsic == nir_intrinsic_image_deref_atomic_swap) {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      nir_variable *var = nir_deref_instr_get_variable(deref);
+      nir_def *index = nir_iadd_imm(b, nir_build_deref_offset(b, deref, image_type_size_align_1),
+                                    var->data.driver_location);
+
+      nir_rewrite_image_intrinsic(intr, index, nir_image_intrinsic_type_default);
+   }
+
+   if (intr->intrinsic != nir_intrinsic_image_load &&
+       intr->intrinsic != nir_intrinsic_image_store &&
+       intr->intrinsic != nir_intrinsic_image_size &&
+       intr->intrinsic != nir_intrinsic_image_atomic &&
+       intr->intrinsic != nir_intrinsic_image_atomic_swap)
+      return false;
+
+   nir_def *index = intr->src[0].ssa;
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool array = nir_intrinsic_image_array(intr);
+   const bool layered = array || dim == GLSL_SAMPLER_DIM_3D || dim == GLSL_SAMPLER_DIM_CUBE;
+   /* 1D and buffer images have one row: y is 0, a 1D array has its layer in y */
+   const bool one_row = dim == GLSL_SAMPLER_DIM_1D || dim == GLSL_SAMPLER_DIM_BUF;
+
+   if (intr->intrinsic == nir_intrinsic_image_size) {
+      nir_def *size[3] = {
+         image_param(b, index, ETNA_IMAGE_WIDTH),
+         image_param(b, index, ETNA_IMAGE_HEIGHT),
+         image_param(b, index, ETNA_IMAGE_DEPTH),
+      };
+      if (dim == GLSL_SAMPLER_DIM_CUBE && array)
+         size[2] = nir_udiv_imm(b, size[2], 6);
+      /* a 1D array has its layers second */
+      if (dim == GLSL_SAMPLER_DIM_1D && array)
+         size[1] = size[2];
+      nir_def_replace(&intr->def, nir_vec(b, size, intr->def.num_components));
+      return true;
+   }
+
+   const enum pipe_format format = nir_intrinsic_format(intr);
+   const unsigned bpp = util_format_get_blocksize(format);
+   /* 2D images in the interleaved 128-bit layout (OpenCL) */
+   const bool il = dim == GLSL_SAMPLER_DIM_2D && !array && key_il_bit(key, intr->src[0]);
+   /* without a format (OpenCL), the key says which images are 128-bit */
+   const bool is_128bit = il || bpp == 16 ||
+                          (format == PIPE_FORMAT_NONE && key_img_bit(key, intr->src[0], false));
+   /* two planes, but 16-byte texels in buffers and the interleaved layout */
+   const bool planes = is_128bit && dim != GLSL_SAMPLER_DIM_BUF && !il;
+   const unsigned texel_bytes = planes ? 8 : bpp;
+   nir_def *coord = intr->src[1].ssa;
+
+   /* Without a format in the shader (OpenCL) the descriptor converts, but the
+    * instruction still takes the register type and the components from the
+    * format (emit_image()): give it a stand-in of the access's type, with one
+    * component, four, or a 128-bit format (two per plane). */
+   enum pipe_format emit_format = format;
+   if (format == PIPE_FORMAT_NONE &&
+       (intr->intrinsic == nir_intrinsic_image_load || intr->intrinsic == nir_intrinsic_image_store)) {
+      const bool load = intr->intrinsic == nir_intrinsic_image_load;
+      const nir_alu_type base = nir_alu_type_get_base_type(load ? nir_intrinsic_dest_type(intr)
+                                                                : nir_intrinsic_src_type(intr));
+      const bool one = key_img_bit(key, intr->src[0], true);
+      static const enum pipe_format stand_in[3][3] = {
+         /* float, uint, int */
+         { PIPE_FORMAT_R32_FLOAT, PIPE_FORMAT_R32_UINT, PIPE_FORMAT_R32_SINT },
+         { PIPE_FORMAT_R16G16B16A16_FLOAT, PIPE_FORMAT_R16G16B16A16_UINT, PIPE_FORMAT_R16G16B16A16_SINT },
+         { PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_UINT, PIPE_FORMAT_R32G32B32A32_SINT },
+      };
+      const unsigned t = base == nir_type_uint ? 1 : base == nir_type_int ? 2 : 0;
+
+      emit_format = stand_in[is_128bit ? 2 : one ? 0 : 1][t];
+   }
+
+   /* a plane of a 128-bit format holds two of its 32-bit components, which
+    * is what emit_image() loads */
+   if (planes)
+      emit_format = util_format_is_pure_uint(emit_format) ? PIPE_FORMAT_R32G32_UINT :
+                    util_format_is_pure_sint(emit_format) ? PIPE_FORMAT_R32G32_SINT :
+                                                             PIPE_FORMAT_R32G32_FLOAT;
+
+   if (one_row) {
+      nir_def *zero = nir_imm_int(b, 0);
+      coord = nir_vec4(b, nir_channel(b, coord, 0), zero,
+                       array ? nir_channel(b, coord, 1) : zero, zero);
+   }
+
+   /* img_load/img_store with the image descriptor. The 3D form takes the
+    * address of the layer as its z coordinate. 128-bit formats are two
+    * planes of 64-bit texels, xy then zw, each with its own descriptor. */
+   if (intr->intrinsic == nir_intrinsic_image_load || intr->intrinsic == nir_intrinsic_image_store) {
+      nir_def *hcoord[2];
+
+      for (unsigned p = 0; p < 1 + planes; p++) {
+         if (layered) {
+            nir_def *base = image_param(b, index, ETNA_IMAGE_ADDR);
+            if (p)
+               base = nir_iadd(b, base, image_param(b, index, ETNA_IMAGE_PLANE_OFFSET));
+            nir_def *layer = nir_iadd(b, base, nir_imul(b, nir_channel(b, coord, 2),
+                                                        image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
+            hcoord[p] = nir_vec3(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1), layer);
+         } else if (il || key_sampler_bit(key, intr->src[0])) {
+            /* channels of one value (the texels of an OpenCL sample,
+             * il_sample()): one swizzle, which the instruction takes without
+             * a mov (real_def()) */
+            nir_scalar x = nir_scalar_resolved(coord, 0), y = nir_scalar_resolved(coord, 1);
+
+            hcoord[p] = x.def == y.def && x.def->bit_size == 32
+                           ? nir_swizzle(b, x.def, (unsigned[]){ x.comp, y.comp }, 2)
+                           : nir_trim_vector(b, coord, 2);
+         } else {
+            hcoord[p] = nir_trim_vector(b, coord, 2);
+         }
+      }
+
+      if (intr->intrinsic == nir_intrinsic_image_load) {
+         nir_def *t = nir_load_image_etna(b, index, hcoord[0], .component = 0,
+                                          .image_dim = dim, .image_array = array, .format = emit_format);
+         if (planes) {
+            nir_def *hi = nir_load_image_etna(b, index, hcoord[1], .component = 1,
+                                              .image_dim = dim, .image_array = array, .format = emit_format);
+            t = nir_vec4(b, nir_channel(b, t, 0), nir_channel(b, t, 1),
+                         nir_channel(b, hi, 0), nir_channel(b, hi, 1));
+         } else if (format != PIPE_FORMAT_NONE ? util_format_get_nr_components(format) == 1 :
+                    key_img_bit(key, intr->src[0], true)) {
+            /* the load writes .x only: (r, 0, 0, 1); without a format in the
+             * shader (OpenCL) the key says which images, and the result type
+             * the type of the 1 */
+            const bool int_one = format != PIPE_FORMAT_NONE ? util_format_is_pure_integer(format) :
+               nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) != nir_type_float;
+            nir_def *one = int_one ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0);
+            t = nir_vec4(b, nir_channel(b, t, 0), nir_imm_int(b, 0), nir_imm_int(b, 0), one);
+         }
+         nir_def_replace(&intr->def, nir_trim_vector(b, t, intr->def.num_components));
+      } else {
+         nir_def *v = intr->src[3].ssa;
+         nir_store_image_etna(b, index, hcoord[0], v, .component = 0,
+                              .image_dim = dim, .image_array = array, .format = emit_format);
+         if (planes)
+            nir_store_image_etna(b, index, hcoord[1], nir_swizzle(b, v, (unsigned[]){ 2, 3, 2, 3 }, 4),
+                                 .component = 1, .image_dim = dim,
+                                 .image_array = array, .format = emit_format);
+         nir_instr_remove(&intr->instr);
+      }
+      return true;
+   }
+
+   nir_def *x = nir_channel(b, coord, 0);
+   nir_def *y = dim == GLSL_SAMPLER_DIM_1D ? nir_imm_int(b, 0) : nir_channel(b, coord, 1);
+   nir_def *stride = image_param(b, index, ETNA_IMAGE_STRIDE);
+
+   nir_def *linear = nir_iadd(b, nir_imul_imm(b, x, texel_bytes), nir_imul(b, y, stride));
+   nir_def *in_tile = nir_iadd(b, nir_ishl_imm(b, nir_iand_imm(b, y, 3), 2), nir_iand_imm(b, x, 3));
+   nir_def *tiled =
+      nir_iadd(b, nir_imul(b, nir_ushr_imm(b, y, 2), nir_ishl_imm(b, stride, 2)),
+               nir_imul_imm(b, nir_iadd(b, nir_ishl_imm(b, nir_ushr_imm(b, x, 2), 4), in_tile),
+                            texel_bytes));
+   nir_def *offset = nir_bcsel(b, nir_ine_imm(b, image_param(b, index, ETNA_IMAGE_TILED), 0),
+                               tiled, linear);
+
+   if (layered)
+      offset = nir_iadd(b, offset, nir_imul(b, nir_channel(b, coord, 2),
+                                            image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
+
+   nir_def *addr = image_param(b, index, ETNA_IMAGE_ADDR);
+
+   /* r32ui and r32i only */
+   if (intr->intrinsic == nir_intrinsic_image_atomic) {
+      nir_def_replace(&intr->def,
+                      nir_global_atomic_etna(b, 32, addr, offset, intr->src[3].ssa,
+                                             .atomic_op = nir_intrinsic_atomic_op(intr)));
+   } else {
+      nir_def_replace(&intr->def,
+                      nir_global_atomic_swap_etna(b, 32, addr, offset,
+                                                  nir_vec2(b, intr->src[4].ssa, intr->src[3].ssa),
+                                                  .atomic_op = nir_intrinsic_atomic_op(intr)));
+   }
+
+   return true;
+}
+
+/* an ALU instruction with a 64-bit source or result */
+static bool
+is_64bit_alu(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->def.bit_size == 64)
+      return true;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      if (nir_src_bit_size(alu->src[i].src) == 64)
+         return true;
+   }
+   return false;
+}
+
+/* Memory is accessed in aligned 32-bit words: narrower or unaligned loads
+ * become word loads plus extraction, narrower stores atomic and/or on the
+ * word (OpenCL char and short data, 8-bit kernel arguments). */
+static nir_mem_access_size_align
+etna_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size,
+                           uint32_t align_mul, uint32_t align_offset, bool offset_is_const,
+                           enum gl_access_qualifier access, const void *cb_data)
+{
+   /* STORE.u8 / STORE.u16 write one narrow value: no atomics for a store
+    * that isn't whole 32-bit words */
+   const uint32_t align = nir_combined_align(align_mul, align_offset);
+
+   /* LOAD.u8 / LOAD.u16 read one narrow value, zero-extended: no word
+    * load and extraction for one that isn't whole 32-bit words */
+   if ((intrin == nir_intrinsic_load_global || intrin == nir_intrinsic_load_global_constant) &&
+       bit_size < 32 && align >= bit_size / 8 && (align < 4 || bytes % 4)) {
+      return (nir_mem_access_size_align){
+         .num_components = 1,
+         .bit_size = bit_size,
+         .align = bit_size / 8,
+         .shift = nir_mem_access_shift_method_scalar,
+      };
+   }
+   if ((intrin == nir_intrinsic_store_global || intrin == nir_intrinsic_store_shared) &&
+       bit_size < 32 && align >= bit_size / 8 && (align < 4 || bytes % 4)) {
+      return (nir_mem_access_size_align){
+         .num_components = 1,
+         .bit_size = bit_size,
+         .align = bit_size / 8,
+         .shift = nir_mem_access_shift_method_scalar,
+      };
+   }
+
+   return (nir_mem_access_size_align){
+      .num_components = MIN2(DIV_ROUND_UP(bytes, 4), 4),
+      .bit_size = 32,
+      .align = 4,
+      .shift = nir_mem_access_shift_method_scalar,
+   };
+}
+
+/* adjacent 32-bit accesses become one access of up to four components: LOAD
+ * and STORE take any 4-byte aligned address */
+static bool
+etna_vectorize_mem_cb(unsigned align_mul, unsigned align_offset, unsigned bit_size,
+                      unsigned num_components, int64_t hole_size,
+                      nir_intrinsic_instr *low, nir_intrinsic_instr *high, void *data)
+{
+   if (hole_size > 0 || bit_size != 32 || num_components > 4)
+      return false;
+   return nir_combined_align(align_mul, align_offset) >= 4;
+}
+
+/* The sequences below do half precision in fp32, for every input exactly as
+ * the conversions would: fp32 ops round to nearest even and flush fp32
+ * denormals on inputs and results (half denormals are normal fp32 values),
+ * MAD is unfused (every product here is exact, so fusing wouldn't change a
+ * result), integer ops work on the bits. They are vector code: no shift left
+ * by a constant (lower_bitops makes it a scalar IMULLO0), BIT_INSERT instead.
+ * The hardware CONV to and from f16 would replace them where it is exact. */
+
+/* The 32-bit value whose low 16 bits are the 16-bit scalar s, the upper
+ * bits unknown, and the shift that brings them down: through the widening
+ * and narrowing that nir_lower_bit_size() leaves around a vector of 16-bit
+ * values, to the 32-bit value or the half of a 32-bit word that it comes
+ * from. */
+static bool
+low16_source(nir_scalar s, nir_scalar *word, unsigned *shift)
+{
+   s = nir_scalar_chase_movs(s);
+   while (nir_scalar_is_alu(s)) {
+      const nir_op op = nir_scalar_alu_op(s);
+      if (op == nir_op_unpack_32_2x16 || op == nir_op_unpack_32_2x16_split_x ||
+          op == nir_op_unpack_32_2x16_split_y) {
+         *shift = op == nir_op_unpack_32_2x16_split_y || (op == nir_op_unpack_32_2x16 && s.comp) ? 16 : 0;
+         *word = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+         return true;
+      }
+      if (op != nir_op_u2u16 && op != nir_op_i2i16)
+         return false;
+
+      s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+      if (s.def->bit_size != 32)
+         return false;
+      /* u2u16(iand(x, 0xffff)): x, if nothing else reads the mask
+       * (fold_narrow_conversion() makes u2u32(u2u16(x)) one) */
+      if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iand &&
+          list_is_singular(&s.def->uses)) {
+         for (unsigned i = 0; i < 2; i++) {
+            nir_scalar m = nir_scalar_chase_alu_src(s, i);
+            if (nir_scalar_is_const(m) && (nir_scalar_as_uint(m) & 0xffff) == 0xffff) {
+               s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 1 - i));
+               break;
+            }
+         }
+      }
+      /* u2u16(u2u32(x)) of a 16-bit x: x again */
+      if (!nir_scalar_is_alu(s) ||
+          (nir_scalar_alu_op(s) != nir_op_u2u32 && nir_scalar_alu_op(s) != nir_op_i2i32) ||
+          nir_scalar_chase_alu_src(s, 0).def->bit_size != 16) {
+         *shift = 0;
+         *word = s;
+         return true;
+      }
+      s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+   }
+   return false;
+}
+
+/* 32-bit values whose low 16 bits are the components of a 16-bit value v,
+ * the upper bits unknown (low16_source(), or u2u32 of the component), for
+ * code that reads only the low 16 bits and then needs no mask. */
+static nir_def *
+low16_bits(nir_builder *b, nir_def *v)
+{
+   nir_scalar words[NIR_MAX_VEC_COMPONENTS];
+   nir_const_value shifts[NIR_MAX_VEC_COMPONENTS];
+   bool shifted = false;
+
+   for (unsigned i = 0; i < v->num_components; i++) {
+      unsigned shift = 0;
+      if (!low16_source(nir_get_scalar(v, i), &words[i], &shift))
+         words[i] = nir_get_scalar(nir_u2u32(b, nir_channel(b, v, i)), 0);
+      shifts[i] = nir_const_value_for_uint(shift, 32);
+      shifted |= shift;
+   }
+
+   nir_def *w = nir_vec_scalars(b, words, v->num_components);
+   return shifted ? nir_ushr(b, w, nir_build_imm(b, v->num_components, 32, shifts)) : w;
+}
+
+/* pack_32_2x16 of two 16-bit values (a 16-bit vector store, from
+ * nir_lower_mem_access_bit_sizes()): one BIT_INSERT of the words they come
+ * from, where the lowered pack masks both and shifts the high one with a
+ * scalar IMULLO0 (lower_bitops). halti5, as the compute shaders that have it. */
+static bool
+lower_pack_32_2x16(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_pack_32_2x16)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *w = low16_bits(b, nir_ssa_for_alu_src(b, alu, 0));
+   nir_def_replace(&alu->def, nir_bitfield_insert(b, nir_channel(b, w, 0), nir_channel(b, w, 1),
+                                                  nir_imm_int(b, 16), nir_imm_int(b, 16)));
+   return true;
+}
+
+/* A 16-bit float as a 32-bit one, exactly. 0x70000000 | (h & 0x7fff) << 13
+ * rebiases the half's exponent by 224: infinity and NaN come out as fp32
+ * infinity and NaN with the payload, a finite half as its value times 2^112.
+ * f = that * 2^-112 is a normal half's value; for a denormal half (exponent
+ * 0) it is 2^-15 + m * 2^-25, and g = 2f - 2^-14 is m * 2^-24 exactly, while
+ * g >= f for a normal half. The smaller of f, g and the rebiased bits (all
+ * non-negative: an unsigned min of their bits) is the value, and for infinity
+ * and NaN the rebiased bits themselves. */
+static nir_def *
+half_to_float(nir_builder *b, nir_def *half)
+{
+   nir_def *h = low16_bits(b, half);
+   nir_def *biased = nir_bitfield_insert(b, nir_imm_int(b, 0x70000000), h,
+                                         nir_imm_int(b, 13), nir_imm_int(b, 15));
+
+   const unsigned save_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact;
+   nir_def *f = nir_fmul_imm(b, biased, 0x1p-112);
+   nir_def *g = nir_fmad(b, biased, nir_imm_float(b, 0x1p-111f), nir_imm_float(b, -0x1p-14f));
+   b->fp_math_ctrl = save_math_ctrl;
+
+   nir_def *abs = nir_umin(b, nir_umin(b, f, g), biased);
+   return nir_bitfield_insert(b, abs, nir_ushr_imm(b, h, 15), nir_imm_int(b, 31), nir_imm_int(b, 1));
+}
+
+/* An fp32 value rounded to the nearest half, kept in fp32: f2f32(f2f16(x))
+ * without the conversions. With E the exponent of x clamped to [-14, 15],
+ * 2^(E+13) + |x| rounds |x| to a multiple of 2^(E-10), the half's ulp
+ * (2^-24 below 2^-14, where halves are denormal), to nearest even: 2^(E+13)
+ * is an even multiple of it. Subtracting 2^(E+13) again is exact. A result of
+ * 65536 or more (|x| from 65520 up) times 2^112 overflows to infinity, and
+ * the scale back is exact for every half. The sign comes from x, also for a
+ * zero. Infinity stays infinity, NaN stays NaN. */
+static nir_def *
+round_to_half(nir_builder *b, nir_def *x)
+{
+   nir_def *pow2 = nir_umin_imm(b, nir_umax_imm(b, nir_iand_imm(b, x, 0x7f800000), 0x38800000),
+                                0x47000000);
+
+   const unsigned save_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact;
+   nir_def *t = nir_fmad(b, pow2, nir_imm_float(b, 8192.0f), nir_fabs(b, x));
+   nir_def *r = nir_fmad(b, nir_fneg(b, pow2), nir_imm_float(b, 8192.0f), t);
+   r = nir_fmul_imm(b, nir_fmul_imm(b, r, 0x1p112), 0x1p-112);
+   b->fp_math_ctrl = save_math_ctrl;
+
+   return nir_bitfield_insert(b, x, r, nir_imm_int(b, 0), nir_imm_int(b, 31));
+}
+
+/* An fp32 value to half bits, rounded to nearest even (f2f16, f2f16_rtne),
+ * in the low 16 bits. |x| clamped to 65536 (the top of the rounding to half,
+ * from 65520 on), 2^(E+13) + |x| rounds as in round_to_half(): its bits are
+ * those of 2^(E+13) plus k, |x| in units of the half's ulp, 0 to 2048. k plus
+ * (E + 14) << 10 is the half (k = 2048 carries into the exponent, 65536 into
+ * infinity); 2^(E+13) has no bits in the low 16, (E + 14) << 10 is
+ * 2^E's bits >> 13, plus 0x3c00 in the low 16 bits. A NaN gives 0x7e00, as
+ * nir_lower_fp16_casts(). */
+static nir_def *
+float_to_half_rtne(nir_builder *b, nir_def *x)
+{
+   nir_def *abs = nir_iand_imm(b, x, 0x7fffffff);
+   nir_def *a = nir_umin_imm(b, abs, 0x47800000);
+   nir_def *pow2 = nir_umax_imm(b, nir_iand_imm(b, a, 0x7f800000), 0x38800000);
+
+   const unsigned save_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact;
+   nir_def *t = nir_fmad(b, pow2, nir_imm_float(b, 8192.0f), a);
+   b->fp_math_ctrl = save_math_ctrl;
+
+   nir_def *h = nir_iadd(b, t, nir_iadd_imm(b, nir_ushr_imm(b, pow2, 13), 0x3c00));
+   h = nir_bcsel(b, nir_ult(b, nir_imm_int(b, 0x7f800000), abs), nir_imm_int(b, 0x7e00), h);
+   return nir_bitfield_insert(b, nir_ushr_imm(b, x, 16), h, nir_imm_int(b, 0), nir_imm_int(b, 15));
+}
+
+/* Whether a 32-bit float is the value of a half (or NaN) without rounding: a
+ * half converted, a constant that is one, a value rounded to half before
+ * (in rounded), or what moves, neg, abs, sat, min, max and selects make of
+ * those: each returns one of its operands, negated, or 0 or 1. */
+/* an integer that a half holds exactly: get_local_id() (max_block_size is at
+ * most 1024 in every dimension) or a constant within +-2048 */
+static bool
+is_half_int(nir_scalar s)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s))
+      return nir_scalar_as_int(s) >= -2048 && nir_scalar_as_int(s) <= 2048;
+   if (nir_scalar_is_intrinsic(s))
+      return nir_scalar_intrinsic_op(s) == nir_intrinsic_load_local_invocation_id;
+   return false;
+}
+
+static bool
+is_half_value(nir_scalar s, struct set *rounded, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s)) {
+      const float v = uif(nir_scalar_as_uint(s));
+      return isnan(v) || fui(_mesa_half_to_float(_mesa_float_to_half(v))) == fui(v);
+   }
+
+   if (!nir_scalar_is_alu(s) || !depth)
+      return false;
+   if (_mesa_set_search(rounded, s.def))
+      return true;
+
+   unsigned first = 0;
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_f2f32:
+      return nir_scalar_chase_alu_src(s, 0).def->bit_size == 16;
+   case nir_op_u2f32:
+   case nir_op_i2f32:
+      return nir_scalar_chase_alu_src(s, 0).def->bit_size == 32 &&
+             is_half_int(nir_scalar_chase_alu_src(s, 0));
+   case nir_op_bcsel:
+      first = 1;
+      FALLTHROUGH;
+   case nir_op_fneg:
+   case nir_op_fabs:
+   case nir_op_fsat:
+   case nir_op_fmin:
+   case nir_op_fmax:
+      for (unsigned i = first; i < nir_op_infos[nir_scalar_alu_op(s)].num_inputs; i++) {
+         if (!is_half_value(nir_scalar_chase_alu_src(s, i), rounded, depth - 1))
+            return false;
+      }
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* f2f32(f2f16(x)) of an fp32 x, which nir_lower_bit_size() leaves between two
+ * widened half operations: round x to half precision without leaving fp32,
+ * all components at once, or keep x where it is a half already. The f2f16
+ * stays for other uses (a store), or goes as dead code. */
+static bool
+fold_half_round_trip(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   struct set *rounded = data;
+
+   if (alu->op != nir_op_f2f32 || alu->src[0].src.ssa->bit_size != 16)
+      return false;
+
+   /* each component: an f2f16 (to nearest even) of an fp32 value, or a
+    * u2f16/i2f16 of a 32-bit integer, through movs, vecs and the
+    * u2u16(u2u32()) that nir_lower_bit_size() puts around 16-bit vecs */
+   const bool rtz = b->shader->info.float_controls_execution_mode & FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16;
+   nir_scalar src[NIR_MAX_VEC_COMPONENTS];
+   nir_op conv[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < alu->def.num_components; i++) {
+      nir_scalar h = nir_get_scalar(alu->src[0].src.ssa, alu->src[0].swizzle[i]);
+      for (;;) {
+         h = nir_scalar_chase_movs(h);
+         if (!nir_scalar_is_alu(h) || h.def->bit_size != 16 || nir_scalar_alu_op(h) != nir_op_u2u16)
+            break;
+         nir_scalar w = nir_scalar_chase_movs(nir_scalar_chase_alu_src(h, 0));
+         if (!nir_scalar_is_alu(w) || nir_scalar_alu_op(w) != nir_op_u2u32 ||
+             nir_scalar_chase_alu_src(w, 0).def->bit_size != 16)
+            break;
+         h = nir_scalar_chase_alu_src(w, 0);
+      }
+      if (!nir_scalar_is_alu(h))
+         return false;
+      conv[i] = nir_scalar_alu_op(h);
+      src[i] = nir_scalar_chase_alu_src(h, 0);
+      if (src[i].def->bit_size != 32 ||
+          !(conv[i] == nir_op_f2f16_rtne || (conv[i] == nir_op_f2f16 && !rtz) ||
+            ((conv[i] == nir_op_u2f16 || conv[i] == nir_op_i2f16) && !rtz)))
+         return false;
+   }
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_scalar comps[NIR_MAX_VEC_COMPONENTS];
+   bool exact = true;
+   for (unsigned i = 0; i < alu->def.num_components; i++) {
+      if (conv[i] == nir_op_u2f16 || conv[i] == nir_op_i2f16) {
+         nir_def *n = nir_channel(b, src[i].def, src[i].comp);
+         comps[i] = nir_get_scalar(conv[i] == nir_op_u2f16 ? nir_u2f32(b, n) : nir_i2f32(b, n), 0);
+         exact &= is_half_int(src[i]);
+      } else {
+         comps[i] = src[i];
+         exact &= is_half_value(src[i], rounded, 8);
+      }
+   }
+
+   nir_def *x = nir_vec_scalars(b, comps, alu->def.num_components);
+   nir_def *res = exact ? x : round_to_half(b, x);
+   _mesa_set_add(rounded, res);
+   nir_def_replace(&alu->def, res);
+   return true;
+}
+
+static bool
+in_loop(nir_instr *instr, nir_loop *loop)
+{
+   for (nir_cf_node *n = &instr->block->cf_node; n; n = n->parent) {
+      if (n == &loop->cf_node)
+         return true;
+   }
+   return false;
+}
+
+/* A half carried by a phi, a loop's accumulator for example, is after
+ * nir_lower_bit_size() a 32-bit phi of its bits, which the arithmetic
+ * converts to fp32 at every use, and every iteration converts its new value
+ * to half bits. Carry the fp32 value in a phi of its own instead: its sources
+ * are f2f32 of the half sources, and f2f32(f2f16(x)) folds into
+ * round_to_half(x). Uses of the bits after the loop keep the bits phi, but
+ * its sources that are a conversion to half become 0x10000 (no 16-bit
+ * value): there the bits are f2f16 of the fp32 value, which is what the
+ * conversion gave (f2f16 of x rounded to half is f2f16(x), also for a NaN);
+ * a source that wasn't converted (an initial value) keeps its bits. */
+static bool
+carry_half_phi_as_float(nir_builder *b, nir_phi_instr *phi)
+{
+   if (phi->def.bit_size != 32)
+      return false;
+
+   nir_loop *loop = NULL;
+   nir_cf_node *parent = phi->instr.block->cf_node.parent;
+   if (parent->type == nir_cf_node_loop &&
+       nir_loop_first_block(nir_cf_node_as_loop(parent)) == phi->instr.block)
+      loop = nir_cf_node_as_loop(parent);
+
+   /* the uses: u2u16 of the phi (nir_lower_bit_size()), used by f2f32 or,
+    * after the loop, by anything but a phi */
+   nir_alu_instr *narrow[16];
+   unsigned num_narrow = 0;
+   bool any_float = false, any_bits = false;
+   nir_foreach_use_including_if(src, &phi->def) {
+      if (nir_src_is_if(src) || num_narrow == ARRAY_SIZE(narrow))
+         return false;
+      nir_instr *use = nir_src_use_instr(src);
+      if (use->type != nir_instr_type_alu || nir_instr_as_alu(use)->op != nir_op_u2u16)
+         return false;
+      narrow[num_narrow++] = nir_instr_as_alu(use);
+      nir_foreach_use_including_if(usrc, &nir_instr_as_alu(use)->def) {
+         if (nir_src_is_if(usrc))
+            return false;
+         nir_instr *user = nir_src_use_instr(usrc);
+         if (user->type == nir_instr_type_alu && nir_instr_as_alu(user)->op == nir_op_f2f32) {
+            any_float = true;
+            continue;
+         }
+         if (!loop || user->type == nir_instr_type_phi || in_loop(user, loop))
+            return false;
+         any_bits = true;
+      }
+   }
+   if (!any_float)
+      return false;
+
+   /* the sources: u2u32 of a half, or a constant one (nir_lower_bit_size()
+    * folds u2u32 of a constant) */
+   nir_foreach_phi_src(src, phi) {
+      if (nir_src_is_const(src->src)) {
+         for (unsigned i = 0; i < phi->def.num_components; i++) {
+            if (nir_src_comp_as_uint(src->src, i) > 0xffff)
+               return false;
+         }
+      } else if (!nir_def_is_alu(src->src.ssa) || nir_def_as_alu(src->src.ssa)->op != nir_op_u2u32 ||
+                 nir_def_as_alu(src->src.ssa)->src[0].src.ssa->bit_size != 16) {
+         return false;
+      }
+   }
+
+   nir_const_value marker[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < phi->def.num_components; i++)
+      marker[i] = nir_const_value_for_uint(0x10000, 32);
+
+   nir_phi_instr *fphi = nir_phi_instr_create(b->shader);
+   nir_def_init(&fphi->instr, &fphi->def, phi->def.num_components, 32);
+   bool marked = false;
+   nir_foreach_phi_src(src, phi) {
+      b->cursor = nir_after_block_before_jump(src->pred);
+      nir_def *half = nir_src_is_const(src->src) ? nir_u2u16(b, src->src.ssa) :
+                      nir_ssa_for_alu_src(b, nir_def_as_alu(src->src.ssa), 0);
+      nir_phi_instr_add_src(fphi, src->pred, nir_f2f32(b, half));
+      if (any_bits && nir_def_is_alu(half) &&
+          (nir_def_as_alu(half)->op == nir_op_f2f16 || nir_def_as_alu(half)->op == nir_op_f2f16_rtne)) {
+         nir_src_rewrite(&src->src, nir_build_imm(b, phi->def.num_components, 32, marker));
+         marked = true;
+      }
+   }
+   nir_instr_insert_after(&phi->instr, &fphi->instr);
+
+   for (unsigned n = 0; n < num_narrow; n++) {
+      nir_alu_instr *u = narrow[n];
+      nir_foreach_use_safe(usrc, &u->def) {
+         nir_instr *user = nir_src_use_instr(usrc);
+         b->cursor = nir_before_instr(user);
+         if (user->type == nir_instr_type_alu && nir_instr_as_alu(user)->op == nir_op_f2f32) {
+            nir_alu_instr *cvt = nir_instr_as_alu(user);
+            unsigned swizzle[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < cvt->def.num_components; i++)
+               swizzle[i] = u->src[0].swizzle[cvt->src[0].swizzle[i]];
+            nir_def_replace(&cvt->def, nir_swizzle(b, &fphi->def, swizzle, cvt->def.num_components));
+         } else if (marked) {
+            nir_def *bits = nir_bcsel(b, nir_ieq_imm(b, &phi->def, 0x10000),
+                                      nir_u2u32(b, nir_f2f16(b, &fphi->def)), &phi->def);
+            unsigned swizzle[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < u->def.num_components; i++)
+               swizzle[i] = u->src[0].swizzle[i];
+            nir_src_rewrite(usrc, nir_u2u16(b, nir_swizzle(b, bits, swizzle, u->def.num_components)));
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+carry_half_phis_as_float(nir_shader *s)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, s) {
+      nir_builder b = nir_builder_create(impl);
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_phi_safe(phi, block)
+            impl_progress |= carry_half_phi_as_float(&b, phi);
+      }
+      nir_progress(impl_progress, impl, nir_metadata_control_flow);
+      progress |= impl_progress;
+   }
+   return progress;
+}
+
+static bool
+fold_half_round_trips(nir_shader *s)
+{
+   struct set *rounded = _mesa_pointer_set_create(NULL);
+   bool progress = nir_shader_alu_pass(s, fold_half_round_trip, nir_metadata_control_flow, rounded);
+   _mesa_set_destroy(rounded, NULL);
+   return progress;
+}
+
+/* vecN(f2f32(a), f2f32(b), ...) of 16-bit scalars (vload_halfN with 2-byte
+ * aligned loads): f2f32(vecN(a, b, ...)), one vector conversion */
+static bool
+gather_half_conversions(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (!nir_op_is_vec(alu->op) || alu->def.bit_size != 32)
+      return false;
+
+   nir_scalar halves[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < alu->def.num_components; i++) {
+      nir_def *src = alu->src[i].src.ssa;
+      if (!nir_def_is_alu(src) || nir_def_as_alu(src)->op != nir_op_f2f32 ||
+          nir_def_as_alu(src)->src[0].src.ssa->bit_size != 16 || !list_is_singular(&src->uses))
+         return false;
+      halves[i] = nir_scalar_chase_alu_src(nir_get_scalar(src, alu->src[i].swizzle[0]), 0);
+   }
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def_replace(&alu->def, nir_f2f32(b, nir_vec_scalars(b, halves, alu->def.num_components)));
+   return true;
+}
+
+/* No 16-bit float ALU: conversions from a half go through its exact 32-bit
+ * value, those to a half from integers through a 32-bit float, and those
+ * rounding to nearest even from a 32-bit float through float_to_half_rtne();
+ * the other rounding modes stay for nir_lower_fp16_casts(). */
+static bool
+lower_fp16_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (!nir_op_infos[alu->op].is_conversion)
+      return false;
+
+   const nir_alu_type src_type = nir_op_infos[alu->op].input_types[0];
+   const nir_alu_type dst_type = nir_op_infos[alu->op].output_type;
+   const unsigned src_bits = alu->src[0].src.ssa->bit_size;
+   const bool from_half = nir_alu_type_get_base_type(src_type) == nir_type_float && src_bits == 16;
+   const bool to_half = nir_alu_type_get_base_type(dst_type) == nir_type_float && alu->def.bit_size == 16;
+   const bool rtne = alu->op == nir_op_f2f16_rtne ||
+                     (alu->op == nir_op_f2f16 &&
+                      !(b->shader->info.float_controls_execution_mode & FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16));
+   const bool from_float32 = nir_alu_type_get_base_type(src_type) == nir_type_float && src_bits == 32;
+
+   if (!from_half && !(to_half && nir_alu_type_get_base_type(src_type) != nir_type_float) &&
+       !(to_half && from_float32 && rtne))
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *res;
+
+   if (from_half && to_half) {
+      res = src;
+   } else if (from_half) {
+      res = nir_type_convert(b, half_to_float(b, src), nir_type_float32,
+                             nir_alu_type_get_base_type(dst_type) | alu->def.bit_size,
+                             nir_rounding_mode_undef);
+   } else {
+      nir_def *f = from_float32 ? src :
+                   nir_type_convert(b, src, nir_alu_type_get_base_type(src_type) | src_bits,
+                                    nir_type_float32, nir_rounding_mode_undef);
+      res = nir_u2u16(b, float_to_half_rtne(b, f));
+   }
+
+   nir_def_replace(&alu->def, res);
+   return true;
+}
+
+/* OpenCL read_imageh and write_imageh: the texture unit and the image
+ * instructions work on 32-bit values. A 16-bit result is the 32-bit one
+ * converted (to nearest even: a texel of a half format converts exactly, one
+ * of an 8-bit normalized format rounds), a 16-bit value to store is widened
+ * first (exactly). */
+static bool
+widen_16bit_image_access(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   nir_def *def;
+   nir_alu_type type;
+
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (tex->def.bit_size != 16)
+         return false;
+      def = &tex->def;
+      type = nir_alu_type_get_base_type(tex->dest_type);
+      tex->dest_type = type | 32;
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_image_load:
+      case nir_intrinsic_image_deref_load:
+      case nir_intrinsic_bindless_image_load:
+         if (intr->def.bit_size != 16)
+            return false;
+         def = &intr->def;
+         type = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr));
+         nir_intrinsic_set_dest_type(intr, type | 32);
+         break;
+      case nir_intrinsic_image_store:
+      case nir_intrinsic_image_deref_store:
+      case nir_intrinsic_bindless_image_store: {
+         nir_def *value = intr->src[3].ssa;
+         if (value->bit_size != 16)
+            return false;
+         type = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
+         b->cursor = nir_before_instr(instr);
+         nir_src_rewrite(&intr->src[3], nir_type_convert(b, value, type | 16, type | 32,
+                                                         nir_rounding_mode_undef));
+         nir_intrinsic_set_src_type(intr, type | 32);
+         return true;
+      }
+      default:
+         return false;
+      }
+   } else {
+      return false;
+   }
+
+   def->bit_size = 32;
+   b->cursor = nir_after_instr(instr);
+   nir_def *narrow = nir_type_convert(b, def, type | 32, type | 16, nir_rounding_mode_undef);
+   nir_def_rewrite_uses_after(def, narrow);
+   return true;
+}
+
+/* no 8- or 16-bit arithmetic: do it in 32 bits */
+static unsigned
+etna_lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
+{
+   if (instr->type == nir_instr_type_phi) {
+      const unsigned size = nir_instr_as_phi(instr)->def.bit_size;
+      return size == 8 || size == 16 ? 32 : 0;
+   }
+
+   if (instr->type != nir_instr_type_alu)
+      return 0;
+
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   unsigned size = alu->def.bit_size;
+
+   /* conversions have sized types: fold_narrow_conversion() handles them */
+   if (nir_op_infos[alu->op].is_conversion)
+      return 0;
+
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+      if (alu->src[i].src.ssa->bit_size != 1)
+         size = MIN2(size == 1 ? 32 : size, alu->src[i].src.ssa->bit_size);
+
+   return size == 8 || size == 16 ? 32 : 0;
+}
+
+/* After nir_lower_bit_size(): widen(narrow(x)) of a 32-bit x is a mask or a
+ * sign extension in 32 bits (with lower_extract_byte, nir_opt_algebraic
+ * leaves u2u32(u2u8(x)) alone, and the 8-bit value would reach the backend) */
+static bool
+fold_narrow_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   bool sign, to_float;
+
+   /* f2u8(x) of a 32-bit float is u2u8(f2u32(x)), b2i8(x) is u2u8(b2i32(x)),
+    * u2u16(x) of an 8-bit x is u2u16(u2u32(x)): split them, so that only the
+    * narrowing of a 32-bit integer is left, folded below into its widening
+    * user */
+   if (alu->def.bit_size == 8 || alu->def.bit_size == 16) {
+      const unsigned src_size = alu->src[0].src.ssa->bit_size;
+      nir_def *wide = NULL;
+
+      b->cursor = nir_before_instr(&alu->instr);
+      switch (alu->op) {
+      case nir_op_f2u8:
+      case nir_op_f2u16:
+         if (src_size == 32)
+            wide = nir_f2u32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_f2i8:
+      case nir_op_f2i16:
+         if (src_size == 32)
+            wide = nir_f2i32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_b2i8:
+      case nir_op_b2i16:
+         wide = nir_b2i32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_u2u8:
+      case nir_op_u2u16:
+         if (src_size == 8 || src_size == 16)
+            wide = nir_u2u32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      case nir_op_i2i8:
+      case nir_op_i2i16:
+         if (src_size == 8 || src_size == 16)
+            wide = nir_i2i32(b, nir_ssa_for_alu_src(b, alu, 0));
+         break;
+      default:
+         break;
+      }
+
+      if (wide) {
+         nir_def_replace(&alu->def, nir_u2uN(b, wide, alu->def.bit_size));
+         return true;
+      }
+   }
+
+   switch (alu->op) {
+   case nir_op_u2u32: sign = false; to_float = false; break;
+   case nir_op_i2i32: sign = true; to_float = false; break;
+   case nir_op_u2f32: sign = false; to_float = true; break;
+   case nir_op_i2f32: sign = true; to_float = true; break;
+   default:
+      return false;
+   }
+
+   if (!nir_def_is_alu(alu->src[0].src.ssa))
+      return false;
+
+   nir_alu_instr *narrow = nir_instr_as_alu(nir_def_instr(alu->src[0].src.ssa));
+   if ((narrow->op != nir_op_u2u8 && narrow->op != nir_op_u2u16 &&
+        narrow->op != nir_op_i2i8 && narrow->op != nir_op_i2i16) ||
+       narrow->src[0].src.ssa->bit_size != 32)
+      return false;
+
+   const unsigned bits = narrow->def.bit_size;
+   b->cursor = nir_before_instr(&alu->instr);
+
+   /* a value LOAD.u8/u16 zero-extended is its own unsigned widening */
+   nir_def *src32 = narrow->src[0].src.ssa;
+   if (!sign && !to_float && nir_def_is_intrinsic(src32)) {
+      nir_intrinsic_instr *ld = nir_def_as_intrinsic(src32);
+      if (ld->intrinsic == nir_intrinsic_load_global_etna &&
+          nir_alu_type_get_type_size(nir_intrinsic_dest_type(ld)) == bits &&
+          (narrow->op == nir_op_u2u8 || narrow->op == nir_op_u2u16)) {
+         nir_def_replace(&alu->def, src32);
+         return true;
+      }
+   }
+
+   unsigned swiz[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < alu->def.num_components; i++)
+      swiz[i] = alu->src[0].swizzle[i];
+   nir_def *x = nir_swizzle(b, nir_ssa_for_alu_src(b, narrow, 0), swiz, alu->def.num_components);
+   nir_def *v = sign ? nir_ishr_imm(b, nir_ishl_imm(b, x, 32 - bits), 32 - bits) :
+                       nir_iand_imm(b, x, BITFIELD_MASK(bits));
+   if (to_float)
+      v = sign ? nir_i2f32(b, v) : nir_u2f32(b, v);
+
+   nir_def_replace(&alu->def, v);
+   return true;
+}
+
+/* The low 8 or 16 bits of a sum, product or bitwise op depend only on
+ * the low 8 or 16 bits of its sources, and a product by 2^k (a left shift by
+ * k) needs k bits less of the other source than its users need of it: the
+ * sign extension of an 8-bit value is ishr(imul(x, 1 << 24), 24).
+ * narrow_use_bits() is the number of low bits of a value that one use needs,
+ * from need[], the bits the users of each def need (0: none known yet).
+ */
+static unsigned
+narrow_class(unsigned bits)
+{
+   return bits <= 8 ? 8 : bits <= 16 ? 16 : 32;
+}
+
+static unsigned
+narrow_shift(nir_alu_instr *alu, unsigned other, bool shift)
+{
+   if (!nir_src_is_const(alu->src[other].src))
+      return 0;
+
+   const uint32_t v = nir_src_comp_as_uint(alu->src[other].src, alu->src[other].swizzle[0]);
+   for (unsigned i = 1; i < alu->def.num_components; i++) {
+      if (nir_src_comp_as_uint(alu->src[other].src, alu->src[other].swizzle[i]) != v)
+         return 0;
+   }
+
+   if (shift)
+      return v & 31;
+   return util_is_power_of_two_nonzero(v) ? ffs(v) - 1 : 0;
+}
+
+static unsigned
+narrow_use_bits(nir_src *src, const uint8_t *need)
+{
+   if (nir_src_is_if(src))
+      return 32;
+
+   nir_instr *instr = nir_src_use_instr(src);
+   if (instr->type == nir_instr_type_phi)
+      return need[nir_instr_as_phi(instr)->def.index];
+
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      /* the value of a store that the emitter makes 8 or 16 bits wide */
+      if (intr->intrinsic == nir_intrinsic_store_global_etna && src == &intr->src[0]) {
+         const nir_alu_type type = nir_intrinsic_src_type(intr);
+         return type == nir_type_uint8 ? 8 : type == nir_type_uint16 ? 16 : 32;
+      }
+      return 32;
+   }
+
+   if (instr->type != nir_instr_type_alu)
+      return 32;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->def.bit_size != 32 && !nir_op_infos[alu->op].is_conversion)
+      return 32;
+
+   const unsigned idx = container_of(src, nir_alu_src, src) - alu->src;
+   const unsigned bits = need[alu->def.index];
+
+   switch (alu->op) {
+   case nir_op_u2u8:
+   case nir_op_i2i8:
+      return 8;
+   case nir_op_u2u16:
+   case nir_op_i2i16:
+      return 16;
+   case nir_op_iand: {
+      /* a mask */
+      const unsigned other = 1 - idx;
+      if (nir_src_is_const(alu->src[other].src)) {
+         uint32_t mask = 0;
+         for (unsigned i = 0; i < alu->def.num_components; i++)
+            mask |= nir_src_comp_as_uint(alu->src[other].src, alu->src[other].swizzle[i]);
+         return MIN2(bits, mask <= 0xff ? 8 : mask <= 0xffff ? 16 : 32);
+      }
+      return bits;
+   }
+   case nir_op_imul: {
+      const unsigned k = narrow_shift(alu, 1 - idx, false);
+      return narrow_class(bits > k ? bits - k : 1);
+   }
+   case nir_op_ishl: {
+      if (idx != 0)
+         return 32;
+      const unsigned k = narrow_shift(alu, 1, true);
+      return narrow_class(bits > k ? bits - k : 1);
+   }
+   case nir_op_iadd:
+   case nir_op_ineg:
+   case nir_op_imad:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_inot:
+   case nir_op_mov:
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+      return bits;
+   default:
+      return 32;
+   }
+}
+
+/* OpenCL char and short arithmetic is lowered to 32 bits. A product or
+ * multiply-add whose users need only its low 8 or 16 bits becomes a lane
+ * product (imul8x4_etna and the others): one IMULLO0 or IMADLO0 for every
+ * component of a vector, where a 32-bit one takes one per component.
+ */
+static bool
+etna_narrow_products(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      bool impl_progress = false;
+      nir_index_ssa_defs(impl);
+      uint8_t *need = calloc(impl->ssa_alloc, 1);
+      if (!need)
+         return progress;
+
+      /* users before defs, until the phis of loops settle: need[] only grows */
+      bool changed;
+      do {
+         changed = false;
+         nir_foreach_block_reverse(block, impl) {
+            nir_foreach_instr_reverse(instr, block) {
+               nir_def *def = nir_instr_def(instr);
+               if (!def)
+                  continue;
+
+               unsigned bits = 0;
+               nir_foreach_use_including_if(src, def) {
+                  bits = MAX2(bits, narrow_use_bits(src, need));
+                  if (bits == 32)
+                     break;
+               }
+               if (bits > need[def->index]) {
+                  need[def->index] = bits;
+                  changed = true;
+               }
+            }
+         }
+      } while (changed);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            const unsigned bits = need[alu->def.index];
+            if (alu->def.bit_size != 32 || !bits || bits == 32)
+               continue;
+
+            if (alu->op == nir_op_imul)
+               alu->op = bits == 8 ? nir_op_imul8x4_etna : nir_op_imul16x2_etna;
+            else if (alu->op == nir_op_imad)
+               alu->op = bits == 8 ? nir_op_imad8x4_etna : nir_op_imad16x2_etna;
+            else
+               continue;
+            /* the bits above the lane can wrap */
+            alu->no_signed_wrap = false;
+            alu->no_unsigned_wrap = false;
+            impl_progress = true;
+         }
+      }
+
+      free(need);
+      nir_progress(impl_progress, impl, nir_metadata_control_flow);
+      progress |= impl_progress;
+   }
+
+   return progress;
+}
+
+/* the two operands of a global access for an OpenCL address: LOAD and STORE
+ * add them, so base + offset needs no add of its own (and no register for an
+ * offset of 0) */
+static void
+split_global_address(nir_builder *b, nir_def *addr, nir_def **base, nir_def **offset)
+{
+   nir_instr *instr = nir_def_instr(addr);
+   nir_alu_instr *alu = instr->type == nir_instr_type_alu ? nir_instr_as_alu(instr) : NULL;
+
+   if (alu && alu->op == nir_op_iadd && alu->def.num_components == 1) {
+      const bool const0 = nir_src_is_const(alu->src[0].src);
+      *base = nir_ssa_for_alu_src(b, alu, const0 ? 1 : 0);
+      *offset = nir_ssa_for_alu_src(b, alu, const0 ? 0 : 1);
+      return;
+   }
+
+   *base = addr;
+   *offset = nir_imm_int(b, 0);
+}
+
+/* LOAD and STORE shift their second address operand left by up to 7 bits
+ * (LEFT_SHIFT) before they add it to the first, so an offset that is an index
+ * scaled by a power of two needs no shift or multiply of its own: the index
+ * goes in as the offset, the scale as OFFSET_SHIFT. One instruction less for
+ * every indexed access (NXP's compiler emits load.ls2, store.ls6, ...). */
+static bool
+fold_offset_shift(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   unsigned off;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global_etna:
+      off = 1;
+      break;
+   case nir_intrinsic_store_global_etna:
+      off = 2;
+      break;
+   default:
+      return false;
+   }
+
+   if (nir_intrinsic_offset_shift(intr))
+      return false;
+
+   nir_scalar s = nir_scalar_resolved(intr->src[off].ssa, 0);
+   if (!nir_scalar_is_alu(s))
+      return false;
+
+   nir_op op = nir_scalar_alu_op(s);
+   nir_scalar src0 = nir_scalar_chase_alu_src(s, 0);
+   nir_scalar src1 = nir_scalar_chase_alu_src(s, 1);
+   nir_scalar index;
+   uint64_t shift;
+
+   if (op == nir_op_ishl && nir_scalar_is_const(src1)) {
+      index = src0;
+      shift = nir_scalar_as_uint(src1) & 31;
+   } else if (op == nir_op_imul && (nir_scalar_is_const(src0) || nir_scalar_is_const(src1))) {
+      const bool c0 = nir_scalar_is_const(src0);
+      const uint64_t scale = nir_scalar_as_uint(c0 ? src0 : src1);
+      if (!util_is_power_of_two_nonzero64(scale))
+         return false;
+      index = c0 ? src1 : src0;
+      shift = util_logbase2_64(scale);
+   } else {
+      return false;
+   }
+
+   if (shift == 0 || shift > 7)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[off], nir_channel(b, index.def, index.comp));
+   nir_intrinsic_set_offset_shift(intr, shift);
+   return true;
+}
+
+/* LOAD at base + (index + k), k a constant LOAD takes inline (20-bit integer):
+ * base + index, which CSE shares between the loads that differ only by k
+ * (a vload3 of uchar), with the immediate offset k. STORE keeps its offset in
+ * a register (immediates faulted). */
+static bool
+split_load_offset(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_etna || nir_intrinsic_offset_shift(intr))
+      return false;
+
+   /* not in kernels with barrier() (OpenCV's separable filters, Canny's
+    * stage 1): there the global loads come in a burst that fills shared
+    * memory before the barrier, and without the per-load adds the loads of
+    * neighbouring pixels ran three in a row; GaussianBlur's row filter got
+    * 1.5% slower on the board for 6 instructions less */
+   if (b->shader->info.uses_control_barrier)
+      return false;
+
+   /* an add that only this load reads: the add moves to the base */
+   nir_scalar off = nir_scalar_resolved(intr->src[1].ssa, 0);
+   if (!nir_scalar_is_alu(off) || nir_scalar_alu_op(off) != nir_op_iadd ||
+       !list_is_singular(&off.def->uses) || nir_def_used_by_if(off.def))
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar k = nir_scalar_chase_alu_src(off, i);
+      nir_scalar index = nir_scalar_chase_alu_src(off, 1 - i);
+
+      if (!nir_scalar_is_const(k) || nir_scalar_is_const(index) || index.def->bit_size != 32)
+         continue;
+
+      const int64_t v = nir_scalar_as_int(k);
+      if (v < -0x80000 || v >= 0x80000)
+         continue;
+
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_src_rewrite(&intr->src[0], nir_iadd(b, intr->src[0].ssa, nir_channel(b, index.def, index.comp)));
+      nir_src_rewrite(&intr->src[1], nir_imm_int(b, v));
+      return true;
+   }
+   return false;
+}
+
+/* the scalar 32-bit imul or imad (op) that only s reads */
+static nir_alu_instr *
+single_use_product(nir_alu_src *s, nir_op op)
+{
+   if (!nir_src_is_alu(s->src) || s->swizzle[0] != 0)
+      return NULL;
+
+   nir_alu_instr *p = nir_def_as_alu(s->src.ssa);
+   if (p->op != op || p->def.num_components != 1 || p->def.bit_size != 32 ||
+       !list_is_singular(&p->def.uses) || nir_def_used_by_if(&p->def))
+      return NULL;
+   return p;
+}
+
+/* iadd(imul(a, b), d) -> imad(a, b, d); iadd(imad(a, b, c), d) ->
+ * imad(a, b, iadd(c, d)) when c or d is a product to fuse next: the products
+ * of a sum become one IMADLO0 chain (integer arithmetic wraps, so the order
+ * doesn't change the bits) */
+static bool
+fold_imad_chain(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_iadd || alu->def.num_components != 1 || alu->def.bit_size != 32)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_alu_instr *mul = single_use_product(&alu->src[i], nir_op_imul);
+      if (!mul)
+         continue;
+
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def_replace(&alu->def, nir_imad(b, nir_ssa_for_alu_src(b, mul, 0), nir_ssa_for_alu_src(b, mul, 1),
+                                          nir_ssa_for_alu_src(b, alu, 1 - i)));
+      return true;
+   }
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_alu_instr *mad = single_use_product(&alu->src[i], nir_op_imad);
+      if (!mad)
+         continue;
+
+      nir_alu_src *d = &alu->src[1 - i];
+      if (!single_use_product(&mad->src[2], nir_op_imul) && !single_use_product(&mad->src[2], nir_op_imad) &&
+          !single_use_product(d, nir_op_imul) && !single_use_product(d, nir_op_imad))
+         continue;
+
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def *sum = nir_iadd(b, nir_ssa_for_alu_src(b, mad, 2), nir_ssa_for_alu_src(b, alu, 1 - i));
+      nir_def_replace(&alu->def, nir_imad(b, nir_ssa_for_alu_src(b, mad, 0), nir_ssa_for_alu_src(b, mad, 1),
+                                          sum));
+      return true;
+   }
+   return false;
+}
+
+/* a single-use 32-bit scalar integer compare (see branch_compare_op()) */
+static nir_alu_instr *
+fusable_compare(nir_def *def)
+{
+   if (def->num_components != 1 || !list_is_singular(&def->uses) || !nir_def_is_alu(def))
+      return NULL;
+
+   nir_alu_instr *alu = nir_def_as_alu(def);
+   switch (alu->op) {
+   case nir_op_ilt32:
+   case nir_op_ige32:
+   case nir_op_ult32:
+   case nir_op_uge32:
+   case nir_op_ieq32:
+   case nir_op_ine32:
+      return nir_src_bit_size(alu->src[0].src) == 32 ? alu : NULL;
+   default:
+      return NULL;
+   }
+}
+
+/* The ifs that branch_compare() turns into compare-and-branches: if (a && b)
+ * with an empty else and no phi after it becomes if (a) { if (b) }, and the
+ * compare an if tests moves to the end of the block before the if, from
+ * earlier in that block (or from before the outer if of a split). */
+static bool
+split_branch_compares(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      bool impl_progress = false;
+      bool again = true;
+
+      while (again) {
+         again = false;
+         nir_foreach_block(block, impl) {
+            nir_if *nif = nir_block_get_following_if(block);
+            if (!nif)
+               continue;
+
+            nir_def *cond = nif->condition.ssa;
+            nir_alu_instr *cmp = fusable_compare(cond);
+
+            if (!cmp && nir_def_is_alu(cond) && list_is_singular(&cond->uses) &&
+                nir_def_as_alu(cond)->op == nir_op_iand && cond->num_components == 1) {
+               nir_alu_instr *and = nir_def_as_alu(cond);
+               nir_alu_instr *a = fusable_compare(and->src[0].src.ssa);
+               nir_alu_instr *b = fusable_compare(and->src[1].src.ssa);
+               nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
+
+               if (!a || !b || a == b || and->src[0].swizzle[0] || and->src[1].swizzle[0] ||
+                   !nir_cf_list_is_empty_block(&nif->else_list) || (nir_block_first_instr(after) &&
+                   nir_block_first_instr(after)->type == nir_instr_type_phi))
+                  continue;
+
+               nir_builder bld = nir_builder_at(nir_before_cf_node(&nif->cf_node));
+               nir_if *outer = nir_push_if(&bld, &a->def);
+               nir_pop_if(&bld, outer);
+
+               nir_src_rewrite(&nif->condition, &b->def);
+               nir_instr_remove(&and->instr);
+
+               nir_cf_list list;
+               nir_cf_extract(&list, nir_before_cf_node(&nif->cf_node), nir_after_cf_node(&nif->cf_node));
+               nir_cf_reinsert(&list, nir_after_cf_list(&outer->then_list));
+
+               nir_instr_move(nir_before_cf_node(&nif->cf_node), &b->instr);
+               nir_instr_move(nir_before_cf_node(&outer->cf_node), &a->instr);
+               impl_progress = again = true;
+               break;
+            }
+
+            if (cmp && cmp->instr.block == block && nir_instr_next(&cmp->instr)) {
+               nir_instr_move(nir_after_block(block), &cmp->instr);
+               impl_progress = true;
+            }
+         }
+      }
+
+      progress |= nir_progress(impl_progress, impl, nir_metadata_none);
+   }
+
+   return progress;
+}
+
+/* STORE.u8/u16 writes the low byte or half of its value: a mask of the
+ * value that keeps those bits (the widening of an 8- or 16-bit value) is
+ * not needed */
+static bool
+drop_narrow_store_mask(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_global_etna)
+      return false;
+
+   const unsigned bits = nir_alu_type_get_type_size(nir_intrinsic_src_type(intr));
+   if ((bits != 8 && bits != 16) || intr->src[0].ssa->num_components != 1)
+      return false;
+
+   nir_scalar v = nir_scalar_resolved(intr->src[0].ssa, 0);
+   if (!nir_scalar_is_alu(v) || nir_scalar_alu_op(v) != nir_op_iand)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar m = nir_scalar_chase_alu_src(v, i);
+      if (!nir_scalar_is_const(m))
+         continue;
+      const uint32_t keep = BITFIELD_MASK(bits);
+      if ((nir_scalar_as_uint(m) & keep) != keep)
+         continue;
+      nir_scalar x = nir_scalar_chase_alu_src(v, 1 - i);
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_src_rewrite(&intr->src[0], nir_channel(b, x.def, x.comp));
+      return true;
+   }
+   return false;
+}
+
+/* SSBO access becomes address + offset: the address is a uniform the driver
+ * fills with the GPU address of the bound buffer. OpenCL global access
+ * (32-bit addresses) is the same, the address split in two. */
+static bool
+lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   nir_def *base, *offset;
+
+   nir_def *repl = NULL;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+      split_global_address(b, intr->src[0].ssa, &base, &offset);
+      if (intr->def.bit_size == 8 || intr->def.bit_size == 16) {
+         /* LOAD.u8/u16 zero-extends into the 32-bit register */
+         assert(intr->def.num_components == 1);
+         repl = nir_u2uN(b, nir_load_global_etna(b, 1, 32, base, offset,
+                                                 .dest_type = intr->def.bit_size == 8 ? nir_type_uint8
+                                                                                      : nir_type_uint16),
+                         intr->def.bit_size);
+      } else {
+         repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size, base, offset);
+      }
+      break;
+   case nir_intrinsic_store_global:
+      split_global_address(b, intr->src[1].ssa, &base, &offset);
+      /* dual16: STORE.f16 stores each work-item's half */
+      if (data && ((const struct etna_shader_variant *)data)->dual16 &&
+          intr->src[0].ssa->bit_size == 16) {
+         nir_store_global_etna(b, intr->src[0].ssa, base, offset,
+                               .write_mask = nir_intrinsic_write_mask(intr),
+                               .src_type = nir_type_float16);
+         break;
+      }
+      nir_store_global_etna(b, store_value32(b, intr->src[0].ssa), base, offset,
+                            .write_mask = nir_intrinsic_write_mask(intr),
+                            .src_type = store_type(intr->src[0].ssa));
+      break;
+   case nir_intrinsic_global_atomic:
+      repl = nir_global_atomic_etna(b, intr->def.bit_size, intr->src[0].ssa, nir_imm_int(b, 0),
+                                    intr->src[1].ssa,
+                                    .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   case nir_intrinsic_global_atomic_swap:
+      repl = nir_global_atomic_swap_etna(b, intr->def.bit_size, intr->src[0].ssa,
+                                         nir_imm_int(b, 0),
+                                         nir_vec2(b, intr->src[2].ssa, intr->src[1].ssa),
+                                         .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   case nir_intrinsic_load_ssbo:
+      repl = nir_load_global_etna(b, intr->def.num_components, intr->def.bit_size,
+                                  nir_load_ssbo_address_etna(b, intr->src[0].ssa),
+                                  intr->src[1].ssa);
+      break;
+   case nir_intrinsic_store_ssbo:
+      nir_store_global_etna(b, intr->src[0].ssa,
+                            nir_load_ssbo_address_etna(b, intr->src[1].ssa),
+                            intr->src[2].ssa,
+                            .write_mask = nir_intrinsic_write_mask(intr));
+      break;
+   case nir_intrinsic_ssbo_atomic:
+      repl = nir_global_atomic_etna(b, intr->def.bit_size,
+                                    nir_load_ssbo_address_etna(b, intr->src[0].ssa),
+                                    intr->src[1].ssa, intr->src[2].ssa,
+                                    .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   case nir_intrinsic_ssbo_atomic_swap:
+      repl = nir_global_atomic_swap_etna(b, intr->def.bit_size,
+                                         nir_load_ssbo_address_etna(b, intr->src[0].ssa),
+                                         intr->src[1].ssa,
+                                         nir_vec2(b, intr->src[3].ssa, intr->src[2].ssa),
+                                         .atomic_op = nir_intrinsic_atomic_op(intr));
+      break;
+   default:
+      return false;
+   }
+
+   if (repl)
+      nir_def_rewrite_uses(&intr->def, repl);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 static uint8_t
 alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
 {
@@ -1368,8 +4182,1235 @@ alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
    return 4;
 }
 
+static uint8_t
+etna_vectorize_cb(const nir_instr *instr, UNUSED const void *data);
+
 static bool
-compile_shader(struct etna_shader_variant *v, bool spill_constants)
+block_in_loop(nir_block *block, nir_loop *loop)
+{
+   for (nir_cf_node *n = &block->cf_node; n; n = n->parent) {
+      if (n == &loop->cf_node)
+         return true;
+   }
+   return false;
+}
+
+/* one phi for the phis of group (num_comps components in all): sources are
+ * vecs of theirs, their uses channels of it */
+static void
+pack_phi_group(nir_builder *b, nir_block *header, nir_loop *loop, nir_phi_instr **group,
+               unsigned count, unsigned num_comps)
+{
+   nir_scalar fwd[4], back[4];
+   nir_block *fwd_pred = NULL, *back_pred = NULL;
+   unsigned k = 0;
+
+   for (unsigned i = 0; i < count; i++) {
+      nir_foreach_phi_src(src, group[i]) {
+         const bool in = block_in_loop(src->pred, loop);
+         for (unsigned c = 0; c < group[i]->def.num_components; c++) {
+            if (in)
+               back[k + c] = nir_get_scalar(src->src.ssa, c);
+            else
+               fwd[k + c] = nir_get_scalar(src->src.ssa, c);
+         }
+         if (in)
+            back_pred = src->pred;
+         else
+            fwd_pred = src->pred;
+      }
+      k += group[i]->def.num_components;
+   }
+
+   nir_phi_instr *phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&phi->instr, &phi->def, num_comps, 32);
+   b->cursor = nir_after_block_before_jump(fwd_pred);
+   nir_phi_instr_add_src(phi, fwd_pred, nir_vec_scalars(b, fwd, num_comps));
+   b->cursor = nir_after_block_before_jump(back_pred);
+   nir_phi_instr_add_src(phi, back_pred, nir_vec_scalars(b, back, num_comps));
+   nir_instr_insert(nir_before_block(header), &phi->instr);
+
+   b->cursor = nir_after_phis(header);
+   k = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const unsigned n = group[i]->def.num_components;
+      nir_def_replace(&group[i]->def, nir_channels(b, &phi->def, BITFIELD_RANGE(k, n)));
+      k += n;
+   }
+}
+
+/* Independent chains carried by a loop in phis of their own (clpeak's
+ * x0..x3 = a * xi + b): the same operations on different values, which
+ * nir_opt_vectorize() merges only once the values are components of one SSA
+ * def. Group the 32-bit phis of 1-3 components whose back-edge value is made
+ * by the same ALU opcode into phis of up to four. */
+static bool
+pack_loop_phis(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_builder b = nir_builder_create(impl);
+      bool impl_progress = false;
+      nir_index_instrs(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_cf_node *parent = block->cf_node.parent;
+         if (parent->type != nir_cf_node_loop ||
+             nir_loop_first_block(nir_cf_node_as_loop(parent)) != block)
+            continue;
+         nir_loop *loop = nir_cf_node_as_loop(parent);
+
+         nir_phi_instr *cand[32];
+         nir_op op[32];
+         unsigned first_use[32];
+         bool taken[32] = { false };
+         unsigned n = 0;
+         nir_foreach_phi(phi, block) {
+            if (n == ARRAY_SIZE(cand))
+               break;
+            if (phi->def.bit_size != 32 || phi->def.num_components > 3)
+               continue;
+            nir_phi_src *back = NULL;
+            unsigned srcs = 0, fwds = 0;
+            nir_foreach_phi_src(src, phi) {
+               srcs++;
+               if (block_in_loop(src->pred, loop))
+                  back = src;
+               else
+                  fwds++;
+            }
+            if (srcs != 2 || fwds != 1 || !back)
+               continue;
+            /* the opcode that makes every component of the back-edge value
+             * (through movs and vecs: the phi of x1..x3 gets vec3(x1, x2.x,
+             * x2.y) when the narrowing of x1 stayed apart) */
+            bool same = true;
+            nir_op back_op = nir_num_opcodes;
+            for (unsigned c = 0; c < phi->def.num_components && same; c++) {
+               nir_scalar sc = nir_scalar_chase_movs(nir_get_scalar(back->src.ssa, c));
+               if (!nir_scalar_is_alu(sc) || (c && nir_scalar_alu_op(sc) != back_op))
+                  same = false;
+               else
+                  back_op = nir_scalar_alu_op(sc);
+            }
+            if (!same)
+               continue;
+            /* in the program order of their back-edge values:
+             * nir_opt_vectorize() puts the components of what it merges in
+             * program order, and the back-edge source is then the merged
+             * value as it is, no swizzle */
+            unsigned first = 0;
+            for (unsigned c = 0; c < phi->def.num_components; c++)
+               first = MAX2(first, nir_def_instr(nir_scalar_chase_movs(nir_get_scalar(back->src.ssa, c)).def)->index);
+            unsigned at = n;
+            while (at && first_use[at - 1] > first) {
+               cand[at] = cand[at - 1];
+               op[at] = op[at - 1];
+               first_use[at] = first_use[at - 1];
+               at--;
+            }
+            cand[at] = phi;
+            op[at] = back_op;
+            first_use[at] = first;
+            n++;
+         }
+
+         for (unsigned i = 0; i < n; i++) {
+            if (taken[i])
+               continue;
+            nir_phi_instr *group[4];
+            unsigned count = 0, comps = 0;
+            for (unsigned j = i; j < n && comps < 4; j++) {
+               if (taken[j] || op[j] != op[i] || comps + cand[j]->def.num_components > 4)
+                  continue;
+               group[count++] = cand[j];
+               comps += cand[j]->def.num_components;
+               taken[j] = true;
+            }
+            if (count < 2)
+               continue;
+            pack_phi_group(&b, block, loop, group, count, comps);
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_none);
+   }
+   return progress;
+}
+
+/* the ALU instructions in loops, roughly as emitted: a vec one move per
+ * source that isn't in its place already, an operation the backend splits
+ * one per component */
+static unsigned
+loop_alu_cost(nir_shader *s, const struct etna_core_info *info)
+{
+   unsigned cost = 0;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         bool in_any_loop = false;
+         for (nir_cf_node *n = block->cf_node.parent; n && !in_any_loop; n = n->parent)
+            in_any_loop = n->type == nir_cf_node_loop;
+         if (!in_any_loop)
+            continue;
+
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (nir_op_is_vec(alu->op)) {
+               for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+                  if (i == 0 || alu->src[i].src.ssa != alu->src[0].src.ssa ||
+                      alu->src[i].swizzle[0] != alu->src[0].swizzle[0] + i)
+                     cost++;
+               }
+            } else if (etna_alu_to_scalar_late_filter_cb(instr, info) ||
+                       (alu->op == nir_op_iadd && alu->def.bit_size == 32 &&
+                        ((nir_def_is_alu(alu->src[0].src.ssa) &&
+                          nir_def_as_alu(alu->src[0].src.ssa)->op == nir_op_imul) ||
+                         (nir_def_is_alu(alu->src[1].src.ssa) &&
+                          nir_def_as_alu(alu->src[1].src.ssa)->op == nir_op_imul)))) {
+               /* a 32-bit iadd of an imul becomes a scalar IMADLO0 late */
+               cost += alu->def.num_components;
+            } else {
+               cost++;
+            }
+         }
+      }
+   }
+   return cost;
+}
+
+static void
+vectorize_and_clean(nir_shader *s)
+{
+   /* the channels of a packed phi are movs until copy propagation, and
+    * nir_opt_vectorize() only merges users of the same def */
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   while (OPT(s, nir_opt_vectorize, etna_vectorize_cb, NULL));
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_dce);
+   NIR_PASS(_, s, nir_opt_cse);
+}
+
+/* pack_loop_phis() on a clone, kept where the vectorized loops get shorter */
+static void
+etna_pack_loop_chains(nir_shader *s, const struct etna_core_info *info)
+{
+   bool has_loop = false;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl)
+         has_loop |= block->cf_node.parent->type == nir_cf_node_loop;
+   }
+   if (!has_loop)
+      return;
+
+   nir_shader *trial = nir_shader_clone(ralloc_parent(s), s);
+   bool packed = false;
+   NIR_PASS(packed, trial, pack_loop_phis);
+   if (!packed) {
+      ralloc_free(trial);
+      return;
+   }
+
+   vectorize_and_clean(trial);
+   vectorize_and_clean(s);
+   if (loop_alu_cost(trial, info) < loop_alu_cost(s, info))
+      nir_shader_replace(s, trial);
+   else
+      ralloc_free(trial);
+}
+
+/* An intrinsic takes a scalar operand as a whole value, so a vector op that
+ * only computes addresses (loads and stores of single components) needs a mov
+ * per component back out of the vector: keep those scalar */
+static uint8_t
+etna_vectorize_cb(const nir_instr *instr, UNUSED const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return 4;
+
+   const nir_def *def = &nir_instr_as_alu((nir_instr *)instr)->def;
+   bool any = false;
+
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_intrinsic)
+         return 4;
+      any = true;
+   }
+   return any ? 1 : 4;
+}
+
+/* registers have four components: a wider phi (an OpenCL float8 carried
+ * around a loop that isn't unrolled) is split into phis of four */
+static uint8_t
+phi_width_cb(UNUSED const nir_instr *instr, UNUSED const void *data)
+{
+   return 4;
+}
+
+/* the copies that keep the segments of etna_nir_fold_workgroup() apart from
+ * CSE, once no CSE runs any more */
+static bool
+lower_opaque_copy(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_opaque_copy_etna)
+      return false;
+
+   nir_def_replace(&intr->def, intr->src[0].ssa);
+   return true;
+}
+
+/* nir_lower_frexp() emits fisfinite, which only nir_opt_algebraic_late
+ * lowers, after the bool lowering has turned it into fisfinite32. Test the
+ * exponent bits: a float compare against infinity doesn't work here. */
+static bool
+lower_fisfinite(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_fisfinite)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   uint64_t exp_mask = x->bit_size == 16 ? 0x7c00 : 0x7f800000;
+   nir_def *mask = nir_imm_intN_t(b, exp_mask, x->bit_size);
+   nir_def_replace(&alu->def, nir_ine(b, nir_iand(b, x, mask), mask));
+   return true;
+}
+
+/* SELECT tests its sources itself: SELECT.NZ x, a, b is x != 0 ? a : b, and
+ * SELECT.EQ x, x, y is y where x is NaN. So b32csel(ine32(x, 0), a, b) needs
+ * no CMP (ieq32 swaps a and b), and neither does b32csel(feq32(x, x), x, y)
+ * (fneu32 swaps): fsel_ord_etna(x, y). */
+static uint32_t
+demand_prefix(uint32_t d)
+{
+   return d ? 0xffffffffu >> __builtin_clz(d) : 0;
+}
+
+static uint32_t
+demand_lanes(uint32_t d, unsigned lane_bits)
+{
+   const uint32_t lane = lane_bits == 8 ? 0xffu : 0xffffu;
+   uint32_t m = 0;
+   for (unsigned i = 0; i < 32; i += lane_bits) {
+      if (d & (lane << i))
+         m |= lane << i;
+   }
+   return m;
+}
+
+static bool
+const_shift(nir_alu_instr *alu, unsigned comp, unsigned *k)
+{
+   if (!nir_src_is_const(alu->src[1].src))
+      return false;
+   *k = nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[comp]) & 31;
+   return true;
+}
+
+/* the bits of source src of alu that a need d of result component comp needs */
+static uint32_t
+alu_src_demand(nir_alu_instr *alu, unsigned src, unsigned comp, uint32_t d)
+{
+   if (alu->def.bit_size != 32 || nir_src_bit_size(alu->src[src].src) != 32 ||
+       nir_op_infos[alu->op].output_size || nir_op_infos[alu->op].input_sizes[src])
+      return ~0u;
+
+   unsigned k;
+   switch (alu->op) {
+   case nir_op_mov:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_inot:
+      return d;
+   case nir_op_iadd:
+   case nir_op_isub:
+   case nir_op_ineg:
+   case nir_op_imul:
+   case nir_op_imad:
+      return demand_prefix(d);
+   case nir_op_imul8x4_etna:
+   case nir_op_imad8x4_etna:
+      return demand_lanes(d, 8);
+   case nir_op_imul16x2_etna:
+   case nir_op_imad16x2_etna:
+      return demand_lanes(d, 16);
+   case nir_op_iand:
+      if (nir_src_is_const(alu->src[1 - src].src))
+         return d & nir_src_comp_as_uint(alu->src[1 - src].src, alu->src[1 - src].swizzle[comp]);
+      return d;
+   case nir_op_bcsel:
+      return src ? d : ~0u;
+   case nir_op_ishl:
+      if (src || !const_shift(alu, comp, &k))
+         return ~0u;
+      return d >> k;
+   case nir_op_ushr:
+      if (src || !const_shift(alu, comp, &k))
+         return ~0u;
+      return d << k;
+   case nir_op_ishr:
+      if (src || !const_shift(alu, comp, &k))
+         return ~0u;
+      return (d << k) | ((d & ~(0xffffffffu >> k)) ? 0x80000000u : 0);
+   default:
+      return ~0u;
+   }
+}
+
+struct demand_state {
+   uint32_t *dm; /* 4 per SSA def */
+   bool changed;
+};
+
+static void
+demand_add(struct demand_state *st, nir_def *def, unsigned comp, uint32_t d)
+{
+   if (def->num_components > 4)
+      return;
+   uint32_t *m = &st->dm[def->index * 4 + comp];
+   if ((*m | d) != *m) {
+      *m |= d;
+      st->changed = true;
+   }
+}
+
+static void
+demand_all(struct demand_state *st, nir_src *src)
+{
+   for (unsigned c = 0; c < MIN2(src->ssa->num_components, 4); c++)
+      demand_add(st, src->ssa, c, ~0u);
+}
+
+static bool
+demand_other_src(nir_src *src, void *data)
+{
+   demand_all(data, src);
+   return true;
+}
+
+static uint32_t
+def_demand(struct demand_state *st, nir_def *def, unsigned comp)
+{
+   return def->num_components > 4 ? ~0u : st->dm[def->index * 4 + comp];
+}
+
+static void
+demand_instr(struct demand_state *st, nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (nir_op_is_vec(alu->op)) {
+         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+            demand_add(st, alu->src[i].src.ssa, alu->src[i].swizzle[0],
+                       alu->def.bit_size == 32 ? def_demand(st, &alu->def, i) : ~0u);
+         return;
+      }
+      for (unsigned s = 0; s < nir_op_infos[alu->op].num_inputs; s++) {
+         const unsigned n = nir_ssa_alu_instr_src_components(alu, s);
+         if (nir_op_infos[alu->op].input_sizes[s] || nir_op_infos[alu->op].output_size ||
+             alu->def.num_components > 4) {
+            for (unsigned c = 0; c < n; c++)
+               demand_add(st, alu->src[s].src.ssa, alu->src[s].swizzle[c], ~0u);
+            continue;
+         }
+         for (unsigned c = 0; c < alu->def.num_components; c++)
+            demand_add(st, alu->src[s].src.ssa, alu->src[s].swizzle[c],
+                       alu_src_demand(alu, s, c, def_demand(st, &alu->def, c)));
+      }
+      return;
+   }
+   case nir_instr_type_phi: {
+      nir_phi_instr *phi = nir_instr_as_phi(instr);
+      nir_foreach_phi_src(src, phi) {
+         for (unsigned c = 0; c < phi->def.num_components; c++)
+            demand_add(st, src->src.ssa, c, phi->def.bit_size == 32 ? def_demand(st, &phi->def, c) : ~0u);
+      }
+      return;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_store_global_etna) {
+         const unsigned bits = nir_alu_type_get_type_size(nir_intrinsic_src_type(intr));
+         for (unsigned c = 0; c < intr->src[0].ssa->num_components; c++)
+            demand_add(st, intr->src[0].ssa, c,
+                       bits == 8 ? 0xffu : bits == 16 ? 0xffffu : ~0u);
+         for (unsigned s = 1; s < nir_intrinsic_infos[intr->intrinsic].num_srcs; s++)
+            demand_all(st, &intr->src[s]);
+         return;
+      }
+      nir_foreach_src(instr, demand_other_src, st);
+      return;
+   }
+   default:
+      nir_foreach_src(instr, demand_other_src, st);
+      return;
+   }
+}
+
+/* x where alu is (x << k) >> k (ishl or imul by 2^k, then ishr or ushr) in
+ * every component, and *swiz its swizzle */
+static nir_def *
+shifted_back(nir_alu_instr *alu, unsigned *k_out, unsigned *swiz)
+{
+   if ((alu->op != nir_op_ishr && alu->op != nir_op_ushr) || !nir_src_is_const(alu->src[1].src) ||
+       !nir_def_is_alu(alu->src[0].src.ssa))
+      return NULL;
+   nir_alu_instr *shl = nir_def_as_alu(alu->src[0].src.ssa);
+   if (shl->op != nir_op_ishl && shl->op != nir_op_imul)
+      return NULL;
+
+   int xs = -1;
+   unsigned k = 0;
+   for (unsigned c = 0; c < alu->def.num_components; c++) {
+      const unsigned kc = nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[c]) & 31;
+      const unsigned yc = alu->src[0].swizzle[c];
+      int this_xs = -1;
+      for (unsigned s = 0; s < 2 && this_xs < 0; s++) {
+         if (!nir_src_is_const(shl->src[1 - s].src) || (shl->op == nir_op_ishl && s != 0))
+            continue;
+         const uint32_t v = nir_src_comp_as_uint(shl->src[1 - s].src, shl->src[1 - s].swizzle[yc]);
+         if (shl->op == nir_op_ishl ? (v & 31) == kc : v == (1u << kc))
+            this_xs = s;
+      }
+      if (this_xs < 0 || (xs >= 0 && this_xs != xs) || (c && kc != k) || !kc)
+         return NULL;
+      xs = this_xs;
+      k = kc;
+      swiz[c] = shl->src[xs].swizzle[yc];
+   }
+   *k_out = k;
+   return shl->src[xs].src.ssa;
+}
+
+static bool
+etna_drop_unused_high_bits(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_index_ssa_defs(impl);
+      struct demand_state st = { .dm = calloc(impl->ssa_alloc * 4, sizeof(uint32_t)) };
+      if (!st.dm)
+         continue;
+
+      do {
+         st.changed = false;
+         nir_foreach_block_reverse(block, impl) {
+            nir_if *nif = nir_block_get_following_if(block);
+            if (nif)
+               demand_all(&st, &nif->condition);
+            nir_foreach_instr_reverse(instr, block)
+               demand_instr(&st, instr);
+         }
+      } while (st.changed);
+
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->def.bit_size != 32 || alu->def.num_components > 4)
+               continue;
+
+            nir_def *x = NULL;
+            unsigned swiz[4];
+            if (alu->op == nir_op_iand) {
+               for (unsigned s = 0; s < 2 && !x; s++) {
+                  if (!nir_src_is_const(alu->src[1 - s].src) || nir_src_bit_size(alu->src[s].src) != 32)
+                     continue;
+                  bool covered = true;
+                  for (unsigned c = 0; c < alu->def.num_components; c++) {
+                     const uint32_t mask = nir_src_comp_as_uint(alu->src[1 - s].src, alu->src[1 - s].swizzle[c]);
+                     covered &= !(def_demand(&st, &alu->def, c) & ~mask);
+                     swiz[c] = alu->src[s].swizzle[c];
+                  }
+                  if (covered)
+                     x = alu->src[s].src.ssa;
+               }
+            } else {
+               unsigned k;
+               x = shifted_back(alu, &k, swiz);
+               for (unsigned c = 0; x && c < alu->def.num_components; c++) {
+                  if (def_demand(&st, &alu->def, c) & ~(0xffffffffu >> k))
+                     x = NULL;
+               }
+               if (x && x->bit_size != 32)
+                  x = NULL;
+            }
+            if (!x)
+               continue;
+
+            b.cursor = nir_before_instr(instr);
+            nir_def_replace(&alu->def, nir_swizzle(&b, x, swiz, alu->def.num_components));
+            impl_progress = true;
+         }
+      }
+      free(st.dm);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+static bool
+fold_select_test(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_b32csel)
+      return false;
+
+   nir_instr *ci = nir_def_instr(alu->src[0].src.ssa);
+   if (ci->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *cmp = nir_instr_as_alu(ci);
+   const unsigned n = alu->def.num_components;
+
+   if (cmp->op == nir_op_feq32 || cmp->op == nir_op_fneu32) {
+      /* the value selected where x == x must be x itself */
+      const unsigned keep = cmp->op == nir_op_feq32 ? 1 : 2;
+      if (cmp->src[0].src.ssa != cmp->src[1].src.ssa ||
+          cmp->src[0].src.ssa != alu->src[keep].src.ssa || alu->def.bit_size != 32)
+         return false;
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned c = alu->src[0].swizzle[i];
+         if (cmp->src[0].swizzle[c] != alu->src[keep].swizzle[i] ||
+             cmp->src[1].swizzle[c] != alu->src[keep].swizzle[i])
+            return false;
+      }
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def_replace(&alu->def, nir_fsel_ord_etna(b, nir_ssa_for_alu_src(b, alu, keep),
+                                                   nir_ssa_for_alu_src(b, alu, 3 - keep)));
+      return true;
+   }
+
+   if (cmp->op != nir_op_ine32 && cmp->op != nir_op_ieq32)
+      return false;
+
+   int zero = -1;
+   for (unsigned s = 0; s < 2 && zero < 0; s++) {
+      if (!nir_src_is_const(cmp->src[s].src))
+         continue;
+      bool all = true;
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned c = cmp->src[s].swizzle[alu->src[0].swizzle[i]];
+         all = all && nir_src_comp_as_uint(cmp->src[s].src, c) == 0;
+      }
+      if (all)
+         zero = s;
+   }
+   if (zero < 0 || nir_src_bit_size(cmp->src[1 - zero].src) != 32)
+      return false;
+
+   unsigned swiz[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)
+      swiz[i] = alu->src[0].swizzle[i];
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_swizzle(b, nir_ssa_for_alu_src(b, cmp, 1 - zero), swiz, n);
+   nir_def *t = nir_ssa_for_alu_src(b, alu, 1), *f = nir_ssa_for_alu_src(b, alu, 2);
+   nir_def_replace(&alu->def, cmp->op == nir_op_ine32 ? nir_b32csel(b, x, t, f) : nir_b32csel(b, x, f, t));
+   return true;
+}
+
+/* gl_HelperInvocation: no hardware source is known on GC7000 (the internal
+ * register group gives the front face in .x; no component or register
+ * flags helper lanes). Report every invocation as a covered one: shaders
+ * using it compile and run, but can't tell helper lanes apart. */
+static bool
+lower_helper_invocation(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_helper_invocation &&
+       intr->intrinsic != nir_intrinsic_is_helper_invocation)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_false(b));
+   return true;
+}
+
+/* Dual16 ----------------------------------------------------------------
+ *
+ * In dual16 mode (SH_CONFIG DUAL16) a hardware thread carries two work-items,
+ * T0 and T1. A register component holds two halves, T0's in bits 0-15 and
+ * T1's in bits 16-31, and an instruction without a thread select works on
+ * both: half arithmetic at twice the rate. An instruction with a thread select
+ * (.t0/.t1) runs for one work-item; it reads its half of a component (t) or
+ * the full 32 bits (th), and writes its half (converted to fp16) or, with .hp,
+ * the full 32 bits. The hardware puts id slot s of work-item t in register
+ * 2s + t. Packed instructions round to nearest even and flush half denormals
+ * (RMODE 0; RMODE 1 rounds toward zero). See cl/pk/dual16-notes.md.
+ */
+
+static bool
+dual16_reject(const struct etna_compile *c, const char *why, const char *what)
+{
+   if (DBG_ENABLED(ETNA_DBG_COMPILER_MSGS)) {
+      fprintf(stderr, "etnaviv: dual16: %s not taken: %s %s\n",
+              nir_shader_get_entrypoint(c->nir)->function->name, why, what ? what : "");
+   }
+   return false;
+}
+
+/* 8- and 64-bit values are out; a half is a float, and only the operations
+ * below handle one: arithmetic whose dual16 results were checked (mad is
+ * OpenCL mad() or a contracted x * y + z: unfused, each rounded), moves, and
+ * conversions to half rounding to nearest even. ffma (fma() must be fused),
+ * division, sqrt, compares and the rest stay in single mode. */
+static bool
+dual16_alu_ok(const struct etna_compile *c, const nir_alu_instr *alu, bool *has_half)
+{
+   const char *name = nir_op_infos[alu->op].name;
+   const unsigned n = nir_op_infos[alu->op].num_inputs;
+   bool half = alu->def.bit_size == 16;
+
+   if (alu->def.bit_size == 8 || alu->def.bit_size == 64)
+      return dual16_reject(c, "8- or 64-bit alu", name);
+   for (unsigned i = 0; i < n; i++) {
+      const unsigned b = alu->src[i].src.ssa->bit_size;
+      if (b == 8 || b == 64)
+         return dual16_reject(c, "8- or 64-bit alu source", name);
+      half |= b == 16;
+   }
+   if (!half)
+      return true;
+
+   *has_half = true;
+   switch (alu->op) {
+   case nir_op_fadd:
+   case nir_op_fmul:
+   case nir_op_fmad:
+   case nir_op_mov:
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+   case nir_op_vec5:
+   case nir_op_vec8:
+   case nir_op_vec16:
+   case nir_op_fneg:
+   case nir_op_fabs:
+      for (unsigned i = 0; i < n; i++) {
+         if (alu->src[i].src.ssa->bit_size != 16)
+            return dual16_reject(c, "half op with a wider source", name);
+      }
+      return alu->def.bit_size == 16 || dual16_reject(c, "half op with a wider result", name);
+   case nir_op_f2f16:
+      /* the kernel's rounding of half conversions, which is round to nearest
+       * even unless it asks for round toward zero */
+      if (c->nir->info.float_controls_execution_mode & FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16)
+         return dual16_reject(c, "rounding mode", name);
+      FALLTHROUGH;
+   case nir_op_f2f16_rtne:
+   case nir_op_u2f16:
+   case nir_op_i2f16:
+      return alu->src[0].src.ssa->bit_size == 32 || dual16_reject(c, "conversion", name);
+   case nir_op_f2f32:
+      return alu->src[0].src.ssa->bit_size == 16 || dual16_reject(c, "conversion", name);
+   default:
+      return dual16_reject(c, "half op", name);
+   }
+}
+
+/* values that can differ between the two work-items of a thread: the ids
+ * (the two can even be in different workgroups) and what is computed from
+ * them; the rest comes from constants and arguments */
+static bool
+dual16_varying_intrinsic(nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_uniform:
+   case nir_intrinsic_load_kernel_input:
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_workgroup_size:
+   case nir_intrinsic_load_num_workgroups:
+   case nir_intrinsic_load_base_global_invocation_id:
+   case nir_intrinsic_load_base_workgroup_id:
+   case nir_intrinsic_load_work_dim:
+      return false;
+   default:
+      return true;
+   }
+}
+
+static bool
+dual16_varying_src(nir_src *src, void *data)
+{
+   const BITSET_WORD *varying = data;
+   return !BITSET_TEST(varying, src->ssa->index);
+}
+
+/* every branch condition is the same for both work-items of a thread: one
+ * branch serves both */
+static bool
+dual16_uniform_cf(const struct etna_compile *c, nir_shader *s)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   bool ok = true, progress;
+
+   nir_index_ssa_defs(impl);
+   BITSET_WORD *varying = rzalloc_array(NULL, BITSET_WORD, BITSET_WORDS(impl->ssa_alloc));
+   if (!varying)
+      return false;
+
+   do {
+      progress = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_def *def = nir_instr_def(instr);
+            if (!def || BITSET_TEST(varying, def->index))
+               continue;
+
+            bool v = false;
+            switch (instr->type) {
+            case nir_instr_type_intrinsic:
+               v = dual16_varying_intrinsic(nir_instr_as_intrinsic(instr)) ||
+                   !nir_foreach_src(instr, dual16_varying_src, varying);
+               break;
+            case nir_instr_type_alu:
+            case nir_instr_type_phi:
+               v = !nir_foreach_src(instr, dual16_varying_src, varying);
+               break;
+            default:
+               break;
+            }
+            if (v) {
+               BITSET_SET(varying, def->index);
+               progress = true;
+            }
+         }
+      }
+   } while (progress);
+
+   nir_foreach_block(block, impl) {
+      nir_if *nif = nir_block_get_following_if(block);
+      if (nif && BITSET_TEST(varying, nif->condition.ssa->index)) {
+         ok = dual16_reject(c, "branch that differs between work-items", NULL);
+         break;
+      }
+   }
+
+   ralloc_free(varying);
+   return ok;
+}
+
+/* the NIR rusticl hands over (late: the NIR to emit): an OpenCL kernel with
+ * half arithmetic, no loads, atomics, barrier, shared or private memory, and
+ * uniform control flow */
+static bool
+dual16_check(const struct etna_compile *c, nir_shader *s, bool late)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   bool has_half = false;
+
+   if (s->info.stage != MESA_SHADER_COMPUTE || !s->info.cs.ptr_size ||
+       DBG_ENABLED(ETNA_DBG_NO_DUAL16))
+      return false;
+   if (s->info.uses_control_barrier || s->info.shared_size || s->scratch_size ||
+       s->info.cs.has_variable_shared_mem)
+      return dual16_reject(c, "barrier, shared or private memory", NULL);
+   if (!exec_list_is_singular(&impl->body)) {
+      if (DBG_ENABLED(ETNA_DBG_NO_DUAL16_CF))
+         return dual16_reject(c, "control flow", NULL);
+      if (!dual16_uniform_cf(c, s))
+         return false;
+   }
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_load_const:
+         case nir_instr_type_undef:
+         case nir_instr_type_phi:
+            if (nir_instr_def(instr)->bit_size == 8 || nir_instr_def(instr)->bit_size == 64)
+               return dual16_reject(c, "8- or 64-bit value", NULL);
+            break;
+         case nir_instr_type_jump:
+            if (nir_instr_as_jump(instr)->type != nir_jump_break &&
+                nir_instr_as_jump(instr)->type != nir_jump_continue)
+               return dual16_reject(c, "jump", NULL);
+            break;
+         case nir_instr_type_alu: {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            /* wide vectors are split before emission (as in single mode) */
+            if (late && nir_op_is_vec(alu->op) && alu->def.num_components > 4)
+               return dual16_reject(c, "wide vector", NULL);
+            if (!dual16_alu_ok(c, alu, &has_half))
+               return false;
+            break;
+         }
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const char *name = nir_intrinsic_infos[intr->intrinsic].name;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_global_invocation_id:
+            case nir_intrinsic_load_local_invocation_id:
+            case nir_intrinsic_load_workgroup_id:
+            case nir_intrinsic_load_local_invocation_index:
+            case nir_intrinsic_load_base_global_invocation_id:
+            case nir_intrinsic_load_kernel_input:
+            case nir_intrinsic_load_ubo:
+            case nir_intrinsic_load_work_dim:
+               if (late)
+                  return dual16_reject(c, "intrinsic after lowering", name);
+               break;
+            case nir_intrinsic_load_input:
+               if (!late)
+                  return dual16_reject(c, "intrinsic", name);
+               break;
+            case nir_intrinsic_load_workgroup_size:
+            case nir_intrinsic_load_num_workgroups:
+            case nir_intrinsic_load_base_workgroup_id:
+               break;
+            case nir_intrinsic_load_uniform:
+               if (late && !nir_src_is_const(intr->src[0]))
+                  return dual16_reject(c, "indirect uniform", NULL);
+               break;
+            case nir_intrinsic_store_global:
+            case nir_intrinsic_store_global_etna:
+               if ((intr->intrinsic == nir_intrinsic_store_global_etna) != late)
+                  return dual16_reject(c, "intrinsic", name);
+               if (intr->src[0].ssa->bit_size == 8 || intr->src[0].ssa->bit_size == 64)
+                  return dual16_reject(c, "8- or 64-bit store", NULL);
+               break;
+            default:
+               return dual16_reject(c, "intrinsic", name);
+            }
+            if (nir_intrinsic_infos[intr->intrinsic].has_dest && intr->def.bit_size != 32)
+               return dual16_reject(c, "not 32-bit", name);
+            break;
+         }
+         default:
+            return dual16_reject(c, "instruction type", NULL);
+         }
+      }
+   }
+
+   if (!late && !has_half)
+      return dual16_reject(c, "no half arithmetic", NULL);
+   return true;
+}
+
+static bool
+dual16_early(const struct etna_compile *c, nir_shader *s)
+{
+   if (!dual16_check(c, s, false))
+      return false;
+   if (DBG_ENABLED(ETNA_DBG_COMPILER_MSGS))
+      fprintf(stderr, "etnaviv: dual16: %s taken\n", nir_shader_get_entrypoint(s)->function->name);
+   return true;
+}
+
+/* The single-mode code, with halves in 32-bit register components, becomes
+ * dual16 code. Single-mode register r holds its packed halves in p0(r), its
+ * 32-bit values in p0(r) for T0 and p1(r) for T1; the id registers
+ * (r < cs_input_count) are the hardware's, slot r of T0 in 2r and of T1 in
+ * 2r + 1 (CL_CONFIG value order 3: global id, local id, workgroup id; two
+ * slots at least, as NXP's dual16 dispatches). A single-mode register
+ * component never holds a half and a 32-bit value at the same time, so the
+ * map is the same at every instruction. An instruction runs once (packed) if
+ * its result and register sources are halves, else once per work-item:
+ * 32-bit sources through th, a 32-bit result with .hp. A branch runs once on
+ * T0's condition: a boolean (0 or ~0, alike in both halves) that both
+ * work-items share (dual16_uniform_cf()). Branch targets move with the code. */
+static bool
+dual16_rewrite(struct etna_compile *c, struct etna_shader_variant *v, unsigned num_blocks)
+{
+   const unsigned ic = v->cs_input_count;
+   const unsigned n = MAX2(v->num_temps, ic);
+   const unsigned slots = MAX2(ic, 2);
+   const unsigned base = 2 * slots;
+   const unsigned total = base + 2 * (n - ic);
+   const char *e = getenv("ETNA_DUAL16_RMODE");
+   const unsigned rmode = e ? atoi(e) & 3 : 0;
+
+   if (ic > 3 || total > 63)
+      return dual16_reject(c, "registers", NULL);
+
+#define P0(r) ((r) < ic ? 2 * (r) : base + (r) - ic)
+#define P1(r) ((r) < ic ? 2 * (r) + 1 : base + (n - ic) + (r) - ic)
+#define PT(r, t) ((t) ? P1(r) : P0(r))
+
+   struct etna_inst *out = malloc(2 * (c->inst_ptr + 1) * sizeof(*out));
+   unsigned *at = malloc((c->inst_ptr + 1) * sizeof(*at));
+   unsigned m = 0;
+   const char *why = NULL;
+
+   if (!out || !at) {
+      free(out);
+      free(at);
+      return false;
+   }
+
+   for (int i = 0; i < c->inst_ptr && !why; i++) {
+      const struct etna_inst *in = &c->code[i];
+      const struct etna_d16_inst *d = &c->d16[i];
+      const bool packed_result = d->dst == ETNA_D16_P;
+      bool any_w = false, p_on_dst = false;
+
+      at[i] = m;
+
+      switch (in->opcode) {
+      case ISA_OPC_NOP:
+      case ISA_OPC_BRANCH:
+         out[m++] = *in;
+         continue;
+      case ISA_OPC_BRANCH_UNARY: {
+         struct etna_inst o = *in;
+         if (o.src[0].use && o.src[0].rgroup == ISA_REG_GROUP_TEMP) {
+            if (o.src[0].amode || o.src[0].reg >= n) {
+               why = "branch";
+               break;
+            }
+            o.src[0].reg = P0(in->src[0].reg);
+         }
+         out[m++] = o;
+         continue;
+      }
+      default:
+         break;
+      }
+      if (why)
+         break;
+
+      if (!d->from_nir || in->dst.amode || (in->dst.use && in->dst.reg >= n)) {
+         why = "instruction";
+         break;
+      }
+      for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+         const struct etna_inst_src *src = &in->src[s];
+         if (!src->use)
+            continue;
+         if (src->rgroup == ISA_REG_GROUP_IMMED && (src->imm_type == 0 || src->imm_type == 3)) {
+            why = "float immediate";
+            break;
+         }
+         if (src->rgroup != ISA_REG_GROUP_TEMP)
+            continue;
+         if (src->amode || src->reg >= n ||
+             (d->src[s] != ETNA_D16_P && d->src[s] != ETNA_D16_W)) {
+            why = "register source";
+            break;
+         }
+         any_w |= d->src[s] == ETNA_D16_W;
+         p_on_dst |= d->src[s] == ETNA_D16_P && in->dst.use && src->reg == in->dst.reg;
+      }
+      if (why)
+         break;
+
+      if (packed_result && !any_w && in->opcode != ISA_OPC_STORE) {
+         struct etna_inst o = *in;
+         if (o.dst.use)
+            o.dst.reg = P0(in->dst.reg);
+         for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+            if (o.src[s].use && o.src[s].rgroup == ISA_REG_GROUP_TEMP)
+               o.src[s].reg = P0(in->src[s].reg);
+         }
+         if (!o.rounding)
+            o.rounding = rmode;
+         out[m++] = o;
+         continue;
+      }
+
+      /* a 32-bit result of T0 overwrites both halves of its component: if a
+       * packed source shares the register, T1 goes first */
+      const bool t1_first = !packed_result && p_on_dst;
+      for (unsigned k = 0; k < 2; k++) {
+         const unsigned t = t1_first ? 1 - k : k;
+         struct etna_inst o = *in;
+         o.thread = t ? ISA_THREAD_T1 : ISA_THREAD_T0;
+         if (o.dst.use && in->opcode != ISA_OPC_STORE) {
+            o.dst.reg = packed_result ? P0(in->dst.reg) : PT(in->dst.reg, t);
+            o.dst_full = !packed_result;
+         }
+         for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+            if (!o.src[s].use || o.src[s].rgroup != ISA_REG_GROUP_TEMP)
+               continue;
+            if (d->src[s] == ETNA_D16_W) {
+               o.src[s].rgroup = ISA_REG_GROUP_TH;
+               o.src[s].reg = PT(in->src[s].reg, t);
+            } else {
+               o.src[s].reg = P0(in->src[s].reg);
+            }
+         }
+         out[m++] = o;
+      }
+   }
+
+#undef PT
+#undef P1
+#undef P0
+
+   if (!why && m > ETNA_MAX_SHADER_INSTRUCTIONS)
+      why = "too long";
+   /* Two work-items per thread pay only where the code for both is clearly
+    * shorter than twice the code for one: packed half arithmetic. A kernel
+    * whose work is fp32 (clpeak's mixed precision: half conversions around
+    * fp32 multiply-adds) runs that work once per work-item, which doubles
+    * it for nothing. */
+   if (!why && 4 * m > 7 * (unsigned)c->inst_ptr)
+      why = "not shorter than single mode";
+   /* GC7000UL r6204 hangs on dual16 code longer than about 1024
+    * instructions (see ETNA_DUAL16_MAX_INSTRUCTIONS) */
+   if (!why && m > ETNA_DUAL16_MAX_INSTRUCTIONS)
+      why = "longer than the GPU runs in dual16";
+   if (why) {
+      free(out);
+      free(at);
+      return dual16_reject(c, why, NULL);
+   }
+
+   at[c->inst_ptr] = m;
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if (c->block_ptr[b] <= (unsigned)c->inst_ptr)
+         c->block_ptr[b] = at[c->block_ptr[b]];
+   }
+
+   if (DBG_ENABLED(ETNA_DBG_COMPILER_MSGS))
+      fprintf(stderr, "etnaviv: dual16: %s: %u instructions -> %u, %u temporaries -> %u, %u id slots\n",
+              nir_shader_get_entrypoint(c->nir)->function->name, (unsigned)c->inst_ptr, m,
+              v->num_temps, total, slots);
+
+   free(at);
+   free(c->code);
+   c->code = out;
+   c->code_alloc = 2 * (c->inst_ptr + 1);
+   c->inst_ptr = m;
+   v->num_temps = total;
+   v->dual16_inputs = slots;
+   return true;
+}
+
+/* the value number of component comp of a mov source: a temporary's from
+ * vals, a uniform's or an inline immediate's from its encoding (numbers from
+ * 1 << 30 up, apart from the counter's); 0 for what isn't tracked */
+static uint32_t
+mov_src_value(const struct etna_inst_src *src, unsigned comp, uint32_t (*vals)[4])
+{
+   if (!src->use)
+      return 0;
+   if (src->rgroup == ISA_REG_GROUP_IMMED)
+      return (1u << 30) | (src->imm_type << 20) | src->imm_val;
+   if (src->amode || src->neg || src->abs)
+      return 0;
+
+   const unsigned k = (src->swiz >> (2 * comp)) & 3;
+
+   if (src->rgroup == ISA_REG_GROUP_TEMP)
+      return src->reg < 128 ? vals[src->reg][k] : 0;
+   if (src->rgroup == ISA_REG_GROUP_UNIFORM_0 || src->rgroup == ISA_REG_GROUP_UNIFORM_1)
+      return (1u << 31) | (src->rgroup << 16) | (src->reg << 2) | k;
+   return 0;
+}
+
+/* Drop the plain movs that write values their destination components already
+ * hold (see the value numbers of mov_src_value()), block by block: the vecN of
+ * consecutive image coordinates and values rewrite the components that don't
+ * change. Before the label fixup; block_ptr is remapped. */
+static void
+drop_redundant_movs(struct etna_compile *c, unsigned num_blocks)
+{
+   const unsigned n = c->inst_ptr;
+   uint32_t (*vals)[4] = malloc(128 * sizeof(*vals));
+   unsigned *at = malloc((n + 1) * sizeof(*at));
+   bool *start = calloc(n + 1, sizeof(*start));
+   uint32_t next = 1;
+   unsigned m = 0;
+
+   if (!vals || !at || !start) {
+      free(vals);
+      free(at);
+      free(start);
+      return;
+   }
+
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if (c->block_ptr[b] <= n)
+         start[c->block_ptr[b]] = true;
+   }
+
+   bool forget = true;
+   for (unsigned i = 0; i < n; i++) {
+      const struct etna_inst *in = &c->code[i];
+
+      if (forget || start[i]) {
+         for (unsigned r = 0; r < 128; r++) {
+            for (unsigned k = 0; k < 4; k++)
+               vals[r][k] = next++;
+         }
+         forget = false;
+      }
+      at[i] = m;
+
+      const bool plain_mov = in->opcode == ISA_OPC_MOV && !in->sat && in->dst.use &&
+                             !in->dst.amode && in->dst.reg < 128 && !in->dst_full &&
+                             !in->thread && in->src[0].use && !in->src[1].use &&
+                             !in->src[2].use;
+      uint32_t w[4] = { 0 };
+      bool same = plain_mov;
+
+      if (plain_mov) {
+         for (unsigned k = 0; k < 4; k++) {
+            if (!(in->dst.write_mask & (1 << k)))
+               continue;
+            /* MOV takes its operand in src[0] (the encoding's third slot) */
+            w[k] = mov_src_value(&in->src[0], k, vals);
+            if (!w[k] || w[k] != vals[in->dst.reg][k])
+               same = false;
+         }
+      }
+      if (same)
+         continue;
+
+      c->code[m++] = *in;
+
+      if (in->opcode == ISA_OPC_BRANCH || in->opcode == ISA_OPC_BRANCH_UNARY ||
+          in->opcode == ISA_OPC_BRANCH_BINARY || (in->dst.use && in->dst.amode) ||
+          (in->dst.use && in->dst.reg >= 128)) {
+         forget = true;
+         continue;
+      }
+      if (!in->dst.use)
+         continue;
+      for (unsigned k = 0; k < 4; k++) {
+         if (in->dst.write_mask & (1 << k))
+            vals[in->dst.reg][k] = plain_mov && w[k] ? w[k] : next++;
+      }
+   }
+   at[n] = m;
+
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if (c->block_ptr[b] <= n)
+         c->block_ptr[b] = at[c->block_ptr[b]];
+   }
+   c->inst_ptr = m;
+
+   free(vals);
+   free(at);
+   free(start);
+}
+
+static bool
+compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop);
+
+/* a dual16 compile that fails, or that dual16_rewrite() refuses, is retried
+ * in single mode */
+static bool
+compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop)
+{
+   if (compile_shader_one(v, spill_constants, fold, fold_loop))
+      return true;
+   if (!v || !v->dual16)
+      return false;
+
+   v->dual16_off = true;
+   return compile_shader_one(v, spill_constants, fold, fold_loop);
+}
+
+static bool
+compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop)
 {
    if (unlikely(!v))
       return false;
@@ -1380,6 +5421,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
 
    /* a retry starts from a clean variant */
    memset(VARIANT_CACHE_PTR(v), 0, VARIANT_CACHE_SIZE);
+   v->cs_fold_loop = fold > 1 && fold_loop;
 
    c->variant = v;
    c->info = v->shader->info;
@@ -1388,6 +5430,13 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
 
    nir_shader *s = c->nir;
    const struct etna_specs *specs = c->specs;
+
+   /* a variant for the workgroup size of the dispatch (key cs_block) */
+   if (s->info.stage == MESA_SHADER_COMPUTE && v->key.cs_block[0]) {
+      for (unsigned i = 0; i < 3; i++)
+         s->info.workgroup_size[i] = v->key.cs_block[i];
+      s->info.workgroup_size_variable = false;
+   }
 
    v->stage = s->info.stage;
    v->uses_discard = s->info.fs.uses_discard;
@@ -1412,6 +5461,110 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
     * Remove any dead in variables before we iterate over them
     */
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_shader_in, NULL);
+
+   /* lower_flrp32 only tells the frontend to run nir_lower_flrp(), which
+    * rusticl doesn't (OpenCL mix()): the backend has no flrp */
+   NIR_PASS(_, s, nir_lower_flrp, 16 | 32 | 64, false);
+
+   /* rusticl lowers 64-bit integers before nir_lower_convert_alu_types(),
+    * whose saturating and rounding conversions of OpenCL long make new 64-bit
+    * compares, selects and conversions: lower those too. One component at a
+    * time, so the unpacks of loaded values meet the packs of
+    * nir_lower_mem_access_bit_sizes() per component, and cancel. */
+   NIR_PASS(_, s, nir_lower_alu_to_scalar, is_64bit_alu, NULL);
+   NIR_PASS(_, s, nir_lower_int64);
+
+   if (s->info.stage == MESA_SHADER_COMPUTE) {
+      v->uses_discard = false;
+      v->cs_fold = 1;
+      v->dual16 = fold <= 1 && !v->dual16_off && !v->key.cs_single && dual16_early(c, s);
+
+      if (fold > 1) {
+         if (!etna_nir_fold_workgroup(s, fold, fold_loop, &v->cs_scratch_slots)) {
+            ralloc_free(c->nir);
+            free(c->code);
+            FREE(c);
+            return false;
+         }
+         v->cs_fold = fold;
+
+         bool progress;
+         do {
+            progress = false;
+            NIR_PASS(progress, s, nir_opt_copy_prop);
+            NIR_PASS(progress, s, nir_opt_constant_folding);
+            NIR_PASS(progress, s, nir_opt_algebraic);
+            NIR_PASS(progress, s, nir_opt_cse);
+            NIR_PASS(progress, s, nir_opt_dce);
+         } while (progress);
+      }
+
+      NIR_PASS(_, s, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+               glsl_get_cl_type_size_align);
+      NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_shared,
+               nir_address_format_32bit_offset);
+
+      const nir_lower_mem_access_bit_sizes_options mem_opts = {
+         .callback = etna_mem_access_size_align,
+         .modes = nir_var_mem_ubo | nir_var_mem_global | nir_var_mem_constant |
+                  nir_var_mem_shared | nir_var_mem_ssbo,
+         .may_lower_unaligned_stores_to_atomics = true,
+      };
+      v->cs_private_size = align(s->scratch_size, 16);
+      if (v->cs_private_size)
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_private_access,
+                  nir_metadata_control_flow, &v->cs_private_size);
+
+      {
+         const nir_load_store_vectorize_options lsv_opts = {
+            .callback = etna_vectorize_mem_cb,
+            .modes = nir_var_mem_global | nir_var_mem_shared,
+         };
+         bool vec = false;
+         NIR_PASS(vec, s, nir_opt_load_store_vectorize, &lsv_opts);
+         if (vec) {
+            NIR_PASS(_, s, nir_opt_copy_prop);
+            NIR_PASS(_, s, nir_opt_dce);
+         }
+      }
+
+      bool narrow = false;
+      NIR_PASS(narrow, s, nir_shader_instructions_pass, widen_16bit_image_access,
+               nir_metadata_control_flow, NULL);
+      NIR_PASS(narrow, s, nir_lower_mem_access_bit_sizes, &mem_opts);
+      if (!v->dual16) { /* dual16: halves stay 16-bit */
+         NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
+         NIR_PASS(narrow, s, carry_half_phis_as_float);
+         NIR_PASS(narrow, s, fold_half_round_trips);
+         NIR_PASS(narrow, s, nir_opt_dce);
+         NIR_PASS(narrow, s, nir_shader_alu_pass, gather_half_conversions, nir_metadata_control_flow, NULL);
+         NIR_PASS(narrow, s, nir_shader_alu_pass, lower_fp16_conversion, nir_metadata_none, NULL);
+         NIR_PASS(narrow, s, nir_lower_fp16_casts, nir_lower_fp16_all);
+      }
+      NIR_PASS(narrow, s, nir_shader_alu_pass, fold_narrow_conversion,
+               nir_metadata_control_flow, NULL);
+      if (narrow) {
+         NIR_PASS(_, s, nir_opt_constant_folding);
+         NIR_PASS(_, s, nir_opt_algebraic);
+         NIR_PASS(_, s, nir_opt_dce);
+      }
+      v->cs_shared_size = align(s->info.shared_size, 16);
+      v->cs_uses_barrier = s->info.uses_control_barrier;
+      if (v->cs_shared_size || s->info.cs.has_variable_shared_mem)
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_shared_access,
+                  nir_metadata_none, &v->cs_shared_size);
+
+      NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_cs_intrinsic,
+               nir_metadata_control_flow, &v->cs_input_count);
+   }
+
+   NIR_PASS(_, s, nir_shader_tex_pass, lower_texbuf_to_image, nir_metadata_control_flow, &v->key);
+   if (v->key.cs_tex_wide)
+      remap_tex_slots(s, v);
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_image_access,
+            nir_metadata_control_flow, &v->key);
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,
+            nir_metadata_control_flow, v);
 
    /* setup input linking */
    struct etna_shader_io_file *sf = &v->infile;
@@ -1455,16 +5608,32 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
 
    NIR_PASS(_, s, etna_nir_lower_texture, &v->key, v->shader->info);
    NIR_PASS(_, s, etna_nir_lower_128bit, &v->key);
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_helper_invocation,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, s, nir_lower_frexp);
+   NIR_PASS(_, s, nir_shader_alu_pass, lower_fisfinite, nir_metadata_control_flow, NULL);
+   /* nir_lower_int64() leaves phis 64-bit, joined to their 32-bit halves by
+    * packs (OpenCL: libclc's software fma() in a loop): split them, and the
+    * optimizations cancel the packs */
+   NIR_PASS(_, s, nir_lower_64bit_phis);
+   /* its unpacks of 64-bit vectors (OpenCL long3 lanes merged at an if) one
+    * component at a time too */
+   NIR_PASS(_, s, nir_lower_alu_to_scalar, is_64bit_alu, NULL);
    NIR_PASS(_, s, nir_lower_alu_width, alu_width_cb, NULL);
+   NIR_PASS(_, s, nir_lower_phis_to_scalar, phi_width_cb, NULL);
 
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
    if (c->info->halti >= 2) {
       nir_lower_idiv_options idiv_options = {
          .allow_fp16 = true,
       };
+      /* by a constant: a multiply-high and shifts, before the general case */
+      NIR_PASS(_, s, nir_opt_idiv_const, 32);
       NIR_PASS(_, s, nir_lower_idiv, &idiv_options);
    }
    NIR_PASS(_, s, nir_lower_alu);
+   if (!s->options->no_integers)
+      NIR_PASS(_, s, nir_shader_alu_pass, lower_fminmax_nan, nir_metadata_control_flow, NULL);
 
    etna_optimize_loop(s);
 
@@ -1473,7 +5642,15 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
       etna_optimize_loop(s);
 
    NIR_PASS(_, s, etna_lower_io, v);
+   /* after the optimization loop: there nir_opt_algebraic drops the sign
+    * extensions of a 16-bit sum or product that only its low 16 bits are
+    * needed of (only_lower_16_bits_used), which a BIT_INSERT user would hide
+    * (nir_def_bits_used() doesn't know bitfield_insert) */
+   if (s->info.stage == MESA_SHADER_COMPUTE && !v->dual16)
+      NIR_PASS(_, s, nir_shader_alu_pass, lower_pack_32_2x16, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_pack);
+   /* lowering byte extracts can leave widen(narrow(x)) behind again */
+   NIR_PASS(_, s, nir_shader_alu_pass, fold_narrow_conversion, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_opt_combine_stores, nir_var_shader_out);
    etna_optimize_loop(s);
 
@@ -1492,11 +5669,58 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
       NIR_PASS(_, s, nir_lower_bool_to_int32);
    }
 
-   while( OPT(s, nir_opt_vectorize, NULL, NULL) );
+   /* independent loop-carried chains into one vector (slpchain.py) */
+   if (mesa_shader_stage_is_compute(s->info.stage) && !v->dual16)
+      etna_pack_loop_chains(s, c->info);
+   while( OPT(s, nir_opt_vectorize, etna_vectorize_cb, NULL) );
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
 
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, s, nir_opt_algebraic_late);
+   if (mesa_shader_stage_is_compute(s->info.stage))
+      NIR_PASS(_, s, etna_narrow_products);
+   /* the late rules fuse iadd(imul) into an imad as wide as the iadd, and
+    * IMULLO0 and IMADLO0 are scalar: split the products now (lane products
+    * compute every component) */
+   NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_late_filter_cb, c->info);
+   for (bool chain = true; chain;) {
+      chain = false;
+      NIR_PASS(chain, s, nir_shader_alu_pass, fold_imad_chain, nir_metadata_control_flow, NULL);
+      if (chain)
+         NIR_PASS(_, s, nir_opt_dce);
+   }
+
+   bool folded = false;
+   NIR_PASS(folded, s, nir_shader_intrinsics_pass, fold_offset_shift, nir_metadata_control_flow, NULL);
+   NIR_PASS(folded, s, nir_shader_intrinsics_pass, drop_narrow_store_mask, nir_metadata_control_flow, NULL);
+   NIR_PASS(folded, s, nir_shader_intrinsics_pass, split_load_offset, nir_metadata_control_flow, NULL);
+   if (folded)
+      NIR_PASS(_, s, nir_opt_dce);
+
+   /* private arrays of 8- and 16-bit values (OpenCL) only reach SSA in the
+    * optimization loop: lower the narrow values left, as in compile_shader() */
+   NIR_PASS(_, s, nir_shader_instructions_pass, widen_16bit_image_access,
+            nir_metadata_control_flow, NULL);
+   for (unsigned i = 0; i < 8 && !v->dual16; i++) {
+      bool narrow = false;
+      NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
+      NIR_PASS(narrow, s, carry_half_phis_as_float);
+      NIR_PASS(narrow, s, fold_half_round_trips);
+      NIR_PASS(narrow, s, nir_opt_dce);
+      NIR_PASS(narrow, s, nir_shader_alu_pass, lower_fp16_conversion, nir_metadata_none, NULL);
+      NIR_PASS(narrow, s, nir_lower_fp16_casts, nir_lower_fp16_all);
+      NIR_PASS(narrow, s, nir_shader_alu_pass, fold_narrow_conversion, nir_metadata_control_flow, NULL);
+      if (!narrow)
+         break;
+      NIR_PASS(_, s, nir_opt_constant_folding);
+      NIR_PASS(_, s, nir_opt_copy_prop);
+      NIR_PASS(_, s, nir_opt_dce);
+   }
+
+   /* a char or short carried through a loop, masked or sign-extended in
+    * every iteration where only its low lanes are read (lanemask.py) */
+   if (mesa_shader_stage_is_compute(s->info.stage) && !v->dual16)
+      NIR_PASS(_, s, etna_drop_unused_high_bits);
 
    NIR_PASS(_, s, nir_move_vec_src_uses_to_dest, false);
    NIR_PASS(_, s, nir_opt_copy_prop);
@@ -1507,26 +5731,64 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    NIR_PASS(_, s, nir_opt_dce);
    NIR_PASS(_, s, nir_opt_cse);
 
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_opaque_copy, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, etna_nir_lower_bitfield_insert);
    NIR_PASS(_, s, nir_lower_bool_to_int32);
    NIR_PASS(_, s, etna_lower_alu, etna_core_has_feature(c->info, ETNA_FEATURE_HAS_FAST_TRANSCENDENTALS));
+   if (c->info->halti >= 2) {
+      bool sel = false;
+      NIR_PASS(sel, s, nir_shader_alu_pass, fold_select_test, nir_metadata_control_flow, NULL);
+      if (sel)
+         NIR_PASS(_, s, nir_opt_dce);
+   }
 
    if (spill_constants)
       NIR_PASS(_, s, etna_nir_spill_constants);
 
+   /* compare-and-branch: single-mode compute code (dual16_rewrite() maps
+    * unary branches only; vertex and fragment shaders keep theirs), not
+    * folded by unrolling (OpenCV's GaussianBlur filters were slower with it
+    * on the board) */
+   if (s->info.stage == MESA_SHADER_COMPUTE && !v->dual16 && !(v->cs_fold > 1 && !v->cs_fold_loop))
+      NIR_PASS(_, s, split_branch_compares);
+
    /* needs to be the last pass that touches pass_flags! */
    NIR_PASS(_, s, etna_nir_lower_to_source_mods);
+
+   if (v->dual16) {
+      if (!dual16_check(c, s, true)) {
+         ralloc_free(c->nir);
+         free(c->code);
+         FREE(c);
+         return false;
+      }
+      c->d16 = rzalloc_array(c->nir, struct etna_d16_inst, ETNA_MAX_SHADER_INSTRUCTIONS);
+   }
 
    if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS))
       nir_print_shader(s, stdout);
 
+   /* block_ptr is indexed by block->index at emission: index the blocks
+    * now, split_branch_compares() added some after the last indexing (a
+    * stale num_blocks sized this array too small: the emission wrote past
+    * it on the stack, unless something such as the NIR printer of
+    * dump_shaders had indexed the blocks again) */
+   nir_metadata_require(nir_shader_get_entrypoint(s), nir_metadata_block_index);
    unsigned block_ptr[nir_shader_get_entrypoint(s)->num_blocks];
    c->block_ptr = block_ptr;
 
    unsigned num_consts;
    bool ok = emit_shader(c, &v->num_temps, &num_consts);
+   if (ok && !v->dual16)
+      drop_redundant_movs(c, ARRAY_SIZE(block_ptr));
+   if (ok && v->dual16)
+      ok = dual16_rewrite(c, v, ARRAY_SIZE(block_ptr));
+   /* a loop that ends in "if (c) break;" branches back on c (loopclose.py) */
+   if (ok && !v->dual16 && s->info.stage == MESA_SHADER_COMPUTE)
+      loop_branches(c, ARRAY_SIZE(block_ptr));
    if (!ok || num_consts > max_uniforms(v)) {
       ralloc_free(c->nir);
+      free(c->code);
       FREE(c);
       return false;
    }
@@ -1538,10 +5800,13 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    /* assemble instructions, fixing up labels */
    const bool has_no_oneconst_limit = etna_core_has_feature(c->info, ETNA_FEATURE_SH_NO_ONECONST_LIMIT);
    uint32_t *code = MALLOC(c->inst_ptr * 16);
+   v->cs_has_loops = false;
    for (unsigned i = 0; i < c->inst_ptr; i++) {
       struct etna_inst *inst = &c->code[i];
-      if (inst->opcode == ISA_OPC_BRANCH || inst->opcode == ISA_OPC_BRANCH_UNARY || inst->opcode == ISA_OPC_BRANCH_BINARY)
+      if (inst->opcode == ISA_OPC_BRANCH || inst->opcode == ISA_OPC_BRANCH_UNARY || inst->opcode == ISA_OPC_BRANCH_BINARY) {
          inst->imm = block_ptr[inst->imm];
+         v->cs_has_loops |= inst->imm <= i;
+      }
 
       etna_assemble(&code[i * 4], inst, has_no_oneconst_limit);
    }
@@ -1555,7 +5820,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
       v->input_count_unk8 = 31; /* XXX what is this */
       assert(v->ps_depth_out_reg <= 0);
-   } else {
+   } else if (s->info.stage == MESA_SHADER_VERTEX) {
       fill_vs_mystery(v);
    }
 
@@ -1567,21 +5832,117 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants)
 
    bool result = etna_compile_check_limits(v);
    ralloc_free(c->nir);
+   free(c->code);
    FREE(c);
    return result;
 }
 
-bool
-etna_compile_shader(struct etna_shader_variant *v)
+static bool
+compile_shader_spill(struct etna_shader_variant *v, unsigned fold, bool fold_loop)
 {
-   if (compile_shader(v, false))
+   if (compile_shader(v, false, fold, fold_loop))
       return true;
 
    /* the spilled constants are read with LOAD, which needs halti2 */
    if (!v || v->shader->info->halti < 2)
       return false;
 
-   return compile_shader(v, true);
+   return compile_shader(v, true, fold, fold_loop);
+}
+
+/* A compute workgroup with barrier() must be resident in full: invocations x
+ * temporaries <= 512 per shader core (GC7000 r6204). The boundary itself
+ * passes alone but hangs under load (four dEQP processes), counting the
+ * temporaries in pairs: 64 x 16 and 16 x 62 hung. So did 168 x 6 = 1008 for
+ * an OpenCL copy kernel with two barriers, even with 100 workgroups, while
+ * 160 x 6 passed with 1749: stay at 480 per core or below
+ * (etna_cs_barrier_capacity()).
+ * If it does not fit, run the workgroup with fewer hardware threads, several
+ * invocations each (see etna_nir_fold_workgroup()). ETNA_CS_FOLD sets a
+ * smallest fold factor, for testing. */
+static bool
+fits(const struct etna_shader_variant *v, unsigned invocations)
+{
+   const unsigned temps = align(MAX2(v->num_temps, v->cs_input_count), 2);
+
+   return DIV_ROUND_UP(invocations, v->cs_fold) * temps <= etna_cs_barrier_capacity(v->shader->info);
+}
+
+bool
+etna_compile_shader(struct etna_shader_variant *v)
+{
+   if (!v)
+      return false;
+
+   const struct shader_info *info = &v->shader->nir->info;
+   /* a kernel of variable workgroup size is folded in a variant for the
+    * dispatch's size (key cs_block) */
+   const uint16_t *wg = v->key.cs_block[0] ? v->key.cs_block : info->workgroup_size;
+   const unsigned n = wg[0] * wg[1] * wg[2];
+   const unsigned min_fold = info->stage == MESA_SHADER_COMPUTE ? debug_get_num_option("ETNA_CS_FOLD", 1) : 1;
+
+   const bool foldable = info->stage == MESA_SHADER_COMPUTE && info->uses_control_barrier &&
+                         (!info->workgroup_size_variable || v->key.cs_block[0]);
+
+   unsigned unfolded_size = 0;
+
+   if (!foldable || min_fold <= 1) {
+      if (!compile_shader_spill(v, 1, false))
+         return false;
+      if (!foldable || fits(v, n))
+         return true;
+      unfolded_size = v->code_size / 4;
+   }
+
+   /* At least 32 threads: the folded code grows with the fold factor, in
+    * size and in temporaries, and a 16-thread variant of 2600 instructions
+    * still hung under load. A fixed workgroup size (OpenGL ES) takes the
+    * powers of two that divide it.
+    * A variant for the workgroup size of a dispatch (key cs_block) has to
+    * run any size up to the one etna_get_compute_state_info() reports:
+    * any fold factor, from the estimate of the temporaries of the last
+    * compile, and down to 16 threads (a workgroup just above what fits
+    * unfolded folds by 2). */
+   const bool any_fold = v->key.cs_block[0] != 0;
+   const unsigned capacity = etna_cs_barrier_capacity(v->shader->info);
+   const unsigned min_threads = any_fold ? 16 : 32;
+   unsigned fold = MAX2(min_fold, 2);
+
+   if (any_fold && v->num_temps)
+      fold = MAX2(fold, DIV_ROUND_UP(n * align(MAX2(v->num_temps, v->cs_input_count), 2), capacity));
+
+   while (fold <= n / min_threads) {
+      if (!any_fold && n % fold)
+         break;
+
+      /* Unrolled, the copies make the code F times as large, and
+       * past the instruction cache (512 instructions on GC7000 r6204) every
+       * thread streams it from memory: run them in a loop instead when the
+       * unrolled code would be over twice that. Below, the unrolled copies
+       * are faster, as they share the work that doesn't depend on the
+       * invocation (OpenCV's GaussianBlur row filter, 184 instructions folded
+       * by 3: 431 ms unrolled, 459 ms in a loop; Canny's stage1_with_sobel,
+       * 438 instructions folded by 8: 810 ms unrolled, 618 ms in a loop,
+       * folded by 4). */
+      bool compiled = compile_shader_spill(v, fold, fold * unfolded_size > 1024);
+      /* the copies come out larger than F times the unfolded code (each has
+       * its own setup): unrolled code over twice the cache runs in a loop
+       * after all */
+      if (compiled && fold * unfolded_size <= 1024 && v->code_size / 4 > 1024)
+         compiled = compile_shader_spill(v, fold, true);
+      if (compiled && fits(v, n))
+         return true;
+
+      if (!any_fold)
+         fold *= 2;
+      else if (!compiled)
+         break; /* more copies only make it larger */
+      else
+         fold = MAX2(fold + 1, DIV_ROUND_UP(n * align(MAX2(v->num_temps, v->cs_input_count), 2), capacity));
+   }
+
+   /* nothing fits: the dispatch refuses it, see etna_launch_grid() */
+   return compile_shader_spill(v, 1, false);
 }
 
 static const struct etna_shader_inout *

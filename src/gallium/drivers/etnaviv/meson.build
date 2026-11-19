@@ -16,6 +16,7 @@ files_etnaviv = files(
   'etnaviv_compiler_nir_emit.c',
   'etnaviv_compiler_nir_liveness.c',
   'etnaviv_compiler_nir_ra.c',
+  'etnaviv_compute.c',
   'etnaviv_context.c',
   'etnaviv_context.h',
   'etnaviv_debug.h',
@@ -42,6 +43,7 @@ files_etnaviv = files(
   'etnaviv_ml_tp.h',
   'etnaviv_nir_lower_128bit.c',
   'etnaviv_nir_lower_source_mods.c',
+  'etnaviv_nir_fold_workgroup.c',
   'etnaviv_nir_lower_texture.c',
   'etnaviv_nir_lower_ubo_to_uniform.c',
   'etnaviv_nir_lower_xfb.c',
@@ -58,6 +60,7 @@ files_etnaviv = files(
   'etnaviv_query_acc.h',
   'etnaviv_query_sw.c',
   'etnaviv_query_sw.h',
+  'etnaviv_query_time.c',
   'etnaviv_rasterizer.c',
   'etnaviv_rasterizer.h',
   'etnaviv_resource.c',
@@ -92,7 +95,7 @@ files_etnaviv = files(
 
 libetnaviv = static_library(
   'etnaviv',
-  files_etnaviv, etnaviv_enums_h,
+  files_etnaviv, etnaviv_enums_h, sha1_h,
   gnu_symbol_visibility : 'hidden',
   include_directories : [
     inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_etnaviv,

@@ -1231,7 +1231,9 @@ struct etna_state_updater {
    uint32_t dirty;
 };
 
-static void
+/* Shaders read constant buffers they index indirectly as UBOs, from memory:
+ * upload the user buffers among them. */
+void
 etna_upload_constbufs(struct etna_context *ctx, mesa_shader_stage stage,
                       const struct etna_shader_variant *sobj)
 {

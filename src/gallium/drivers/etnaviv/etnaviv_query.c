@@ -43,6 +43,8 @@ etna_create_query(struct pipe_context *pctx, unsigned query_type,
 
    q = etna_sw_create_query(ctx, query_type);
    if (!q)
+      q = etna_time_create_query(ctx, query_type);
+   if (!q)
       q = etna_acc_create_query(ctx, query_type);
 
    return (struct pipe_query *)q;

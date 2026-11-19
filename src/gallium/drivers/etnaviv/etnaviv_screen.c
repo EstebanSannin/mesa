@@ -42,7 +42,9 @@
 #include "etnaviv_yuv.h"
 
 #include "util/hash_table.h"
+#include "util/mesa-blake3.h"
 #include "util/os_time.h"
+#include "util/u_debug.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
@@ -52,6 +54,8 @@
 #include "frontend/drm_driver.h"
 
 #include "drm-uapi/drm_fourcc.h"
+
+#include "git_sha1.h"
 
 #define ETNA_DRM_VERSION_FENCE_FD      ETNA_DRM_VERSION(1, 1)
 #define ETNA_DRM_VERSION_PERFMON       ETNA_DRM_VERSION(1, 2)
@@ -82,6 +86,9 @@ static const struct debug_named_value etna_debug_options[] = {
    {"shared_ts",      ETNA_DBG_SHARED_TS, "Enable TS sharing"},
    {"perf",           ETNA_DBG_PERF, "Enable performance warnings"},
    {"npu_parallel",   ETNA_DBG_NPU_PARALLEL, "Enable parallelism inside NPU batches (unsafe)"},
+   {"no_dual16",      ETNA_DBG_NO_DUAL16, "OpenCL: never run half kernels in dual16 mode"},
+   {"no_dual16_cf",   ETNA_DBG_NO_DUAL16_CF, "OpenCL: dual16 mode only for kernels without control flow"},
+   {"fast_fma",       ETNA_DBG_FAST_FMA, "OpenCL fma() as an unfused multiply-add: faster, not correctly rounded (not conformant)"},
    {"npu_no_batching",ETNA_DBG_NPU_NO_BATCHING, "Disable batching NPU jobs"},
    {"no_texdesc"     ,ETNA_DBG_NO_TEXDESC, "Disable texture descriptor"},
    {"no_unified_samplers", ETNA_DBG_NO_UNIFIED_SAMPLERS, "Disable unified sampler allocation"},
@@ -135,13 +142,7 @@ etna_screen_destroy(struct pipe_screen *pscreen)
 static const char *
 etna_screen_get_name(struct pipe_screen *pscreen)
 {
-   struct etna_screen *priv = etna_screen(pscreen);
-   static char buffer[128];
-
-   snprintf(buffer, sizeof(buffer), "Vivante GC%x rev %04x", priv->info->model,
-            priv->info->revision);
-
-   return buffer;
+   return etna_screen(pscreen)->name;
 }
 
 static const char *
@@ -154,6 +155,45 @@ static const char *
 etna_screen_get_device_vendor(struct pipe_screen *pscreen)
 {
    return "Vivante";
+}
+
+/* The OpenGL and the OpenCL screens of one GPU core report the same device
+ * UUID: OpenCL shares objects only with the device of the OpenGL context
+ * (cl_khr_gl_sharing). There is one core of a kind per SoC, so the core's
+ * identity serves as the UUID, hashed. */
+static void
+etna_screen_get_device_uuid(struct pipe_screen *pscreen, char *uuid)
+{
+   const struct etna_core_info *info = etna_screen(pscreen)->info;
+   const uint32_t id[] = {
+      info->model, info->revision, info->product_id, info->eco_id, info->customer_id,
+   };
+   static const char name[] = "etnaviv";
+   uint8_t hash[BLAKE3_KEY_LEN];
+   blake3_hasher ctx;
+
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, name, strlen(name));
+   _mesa_blake3_update(&ctx, id, sizeof(id));
+   _mesa_blake3_final(&ctx, hash);
+
+   STATIC_ASSERT(BLAKE3_KEY_LEN >= PIPE_UUID_SIZE);
+   memcpy(uuid, hash, PIPE_UUID_SIZE);
+}
+
+/* Builds of the same Mesa version and commit lay out memory the same way. */
+static void
+etna_screen_get_driver_uuid(struct pipe_screen *pscreen, char *uuid)
+{
+   static const char driver_id[] = PACKAGE_VERSION MESA_GIT_SHA1;
+   uint8_t hash[BLAKE3_KEY_LEN];
+   blake3_hasher ctx;
+
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, driver_id, strlen(driver_id));
+   _mesa_blake3_final(&ctx, hash);
+
+   memcpy(uuid, hash, PIPE_UUID_SIZE);
 }
 
 static void
@@ -204,11 +244,86 @@ etna_init_single_shader_caps(struct etna_screen *screen, mesa_shader_stage shade
       (1 << PIPE_SHADER_IR_NIR);
 }
 
+/* Experimental: compute shaders with SSBOs, no shared memory, images or atomics yet. */
+static bool
+etna_compute_supported(struct etna_screen *screen)
+{
+   return screen->info->halti >= 5 &&
+          debug_get_bool_option("ETNA_EXPERIMENTAL_COMPUTE", false);
+}
+
 static void
 etna_init_shader_caps(struct etna_screen *screen)
 {
    etna_init_single_shader_caps(screen, MESA_SHADER_VERTEX);
    etna_init_single_shader_caps(screen, MESA_SHADER_FRAGMENT);
+
+   if (etna_compute_supported(screen)) {
+      struct pipe_shader_caps *caps =
+         (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_COMPUTE];
+
+      etna_init_single_shader_caps(screen, MESA_SHADER_COMPUTE);
+      caps->max_inputs = 0;
+      caps->max_outputs = 0;
+      caps->max_texture_samplers = screen->specs.fragment_sampler_count;
+      /* OpenCL's read images (rusticl's max_read_images; OpenGL takes its
+       * limits from max_texture_samplers). With unified samplers compute has
+       * the whole array of 32 slots: a dispatch of more than 16 textures
+       * reads 2D textures with img_load where it can, and gives the fragment
+       * slots to the textures the texture unit reads (etna_launch_grid()). */
+      caps->max_sampler_views = screen->specs.unified_samplers
+         ? screen->specs.fragment_sampler_count + screen->specs.vertex_sampler_count
+         : screen->specs.fragment_sampler_count;
+      caps->max_shader_buffers = ETNA_MAX_SHADER_BUFFERS;
+      caps->max_shader_images = ETNA_MAX_SHADER_IMAGES;
+      caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
+   }
+}
+
+static void
+etna_init_compute_caps(struct etna_screen *screen)
+{
+   struct pipe_compute_caps *caps =
+      (struct pipe_compute_caps *)&screen->base.compute_caps;
+   /* Workgroups of up to 512 invocations, as NXP's OpenCL. One that uses
+    * barrier() must be resident in full (etna_cs_barrier_capacity(): a 1-temp
+    * kernel unfolded hung at 512 on GC7000 r6204). Such a workgroup runs
+    * folded onto fewer threads (etna_compile_shader()), and a kernel that
+    * doesn't fit even folded reports a smaller CL_KERNEL_WORK_GROUP_SIZE
+    * (etna_get_compute_state_info()). */
+   const unsigned max_threads = debug_get_num_option("ETNA_CL_MAX_THREADS", 512);
+
+   if (!etna_compute_supported(screen))
+      return;
+
+   caps->address_bits = 32;
+   caps->grid_dimension = 3;
+   caps->max_grid_size[0] =
+   caps->max_grid_size[1] =
+   caps->max_grid_size[2] = 65535;
+   caps->max_block_size[0] = MIN2(max_threads, 1024);
+   caps->max_block_size[1] = MIN2(max_threads, 1024);
+   caps->max_block_size[2] = MIN2(max_threads, 64);
+   caps->max_threads_per_block = max_threads;
+   caps->max_local_size = 32768;
+   caps->max_compute_units = screen->info->gpu.shader_core_count;
+   caps->max_clock_frequency = 1000;
+   caps->subgroup_sizes = 4;
+
+   /* OpenCL half floats (cl_khr_fp16): no 16-bit float ALU, the compiler
+    * widens the arithmetic and converts in software (lower_fp16_conversion()).
+    * Not in the shader caps, where GLSL would move mediump onto that path. */
+   caps->fp16 = true;
+
+   /* OpenCL wants allocations of at least a quarter of the global memory
+    * (up to 1 GB) from a device that isn't CL_DEVICE_TYPE_CUSTOM: report four
+    * times the largest allocation. NXP's OpenCL reports 256 MB, with 128 MB
+    * allocations. */
+   uint64_t system_memory;
+   if (os_get_total_physical_memory(&system_memory)) {
+      caps->max_mem_alloc_size = MIN2(system_memory, 1u << 27);
+      caps->max_global_size = MIN2(system_memory, 4 * caps->max_mem_alloc_size);
+   }
 }
 
 static bool
@@ -292,6 +407,31 @@ etna_init_screen_caps(struct etna_screen *screen)
 
    caps->draw_indirect = VIV_FEATURE(screen, ETNA_FEATURE_HALTI5);
 
+   caps->compute = etna_compute_supported(screen);
+   /* image instructions take the format from the descriptor (OpenCL images) */
+   caps->image_store_formatted = etna_compute_supported(screen);
+   if (caps->compute) {
+      caps->shader_buffer_offset_alignment = 16;
+      caps->max_shader_buffer_size = 1 << 27;
+
+      /* The ISA has no 64-bit integer operations: nir_lower_int64() splits
+       * them all into 32-bit halves (lower_int64_options). OpenCL long and
+       * ulong, cles_khr_int64 on the embedded profile. */
+      caps->int64 = true;
+
+      /* timestamps from the fence of a flush at the query point
+       * (etnaviv_query_time.c): OpenCL profiling, and in GL
+       * EXT_disjoint_timer_query. The fences signal from the interrupt, so
+       * claim a microsecond. */
+      caps->query_timestamp = true;
+      caps->timer_resolution = 1000;
+
+      /* OpenCL images and buffers of OpenGL objects: dma-buf export and
+       * import of buffers and of textures of every target, and a device
+       * UUID (etna_screen_get_device_uuid()). */
+      caps->cl_gl_sharing = true;
+   }
+
    caps->glsl_feature_level =
    caps->glsl_feature_level_compatibility = screen->info->halti >= 2 ? 130 : 120;
 
@@ -306,7 +446,9 @@ etna_init_screen_caps(struct etna_screen *screen)
    caps->max_stream_output_interleaved_components = 64;
 
    caps->max_vertex_attrib_stride = screen->info->halti >= 2 ? 2048 : 128;
-   caps->max_vertex_element_src_offset = 255;
+   /* START is 8 bits in FE_VERTEX_ELEMENT_CONFIG, 11 (at least) in
+    * NFE_GENERIC_ATTRIB_CONFIG0: tested up to 2040 on GC7000 r6204 */
+   caps->max_vertex_element_src_offset = screen->info->halti >= 5 ? 2047 : 255;
    caps->max_vertex_buffers = screen->info->gpu.stream_count;
    caps->vs_instanceid =
    caps->vertex_element_instance_divisor = VIV_FEATURE(screen, ETNA_FEATURE_HALTI2);
@@ -558,7 +700,22 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
          allowed |= PIPE_BIND_DEPTH_STENCIL;
    }
 
-   if (usage & PIPE_BIND_SAMPLER_VIEW) {
+   /* RGBA16 UNORM samples as integers that only compute shaders convert
+    * (OpenCL, which adds PIPE_BIND_OPENCL to every query) */
+   const bool cl_only = format == PIPE_FORMAT_R16G16B16A16_UNORM && !(usage & PIPE_BIND_OPENCL);
+
+   /* OpenCL CL_UNORM_INT_2_101010_EXT (an optional extension): the texture
+    * unit converts the 10-bit channels slightly off */
+   if (format == PIPE_FORMAT_R10G10B10A2_UNORM && (usage & PIPE_BIND_OPENCL))
+      return false;
+
+   /* a buffer texture (OpenCL 1D image buffer) is read with the image
+    * instructions, in the formats they know */
+   const bool texbuf_ok = target != PIPE_BUFFER ||
+                          (pscreen->caps.compute && (usage & PIPE_BIND_OPENCL) &&
+                           etna_format_is_image_format(format));
+
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) && !cl_only && texbuf_ok) {
       uint32_t fmt = ETNA_NO_MATCH;
 
       if (gpu_supports_texture_format(screen, format))
@@ -581,6 +738,11 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
          allowed |= PIPE_BIND_VERTEX_BUFFER;
    }
 
+   /* buffers too: OpenCL 1D image buffers (a linear image of one row) */
+   if ((usage & PIPE_BIND_SHADER_IMAGE) && pscreen->caps.compute && !cl_only &&
+       sample_count <= 1 && etna_format_is_image_format(format))
+      allowed |= PIPE_BIND_SHADER_IMAGE;
+
    if (usage & PIPE_BIND_INDEX_BUFFER) {
       /* must be supported index format */
       if (format == PIPE_FORMAT_R8_UINT || format == PIPE_FORMAT_R16_UINT ||
@@ -593,6 +755,10 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
    /* Always allowed */
    allowed |=
       usage & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT | PIPE_BIND_SHARED);
+
+   /* rusticl adds it to every query: OpenCL uses what the other bits allow */
+   if (pscreen->caps.compute)
+      allowed |= usage & PIPE_BIND_OPENCL;
 
    if (usage != allowed) {
       DBG("not supported: format=%s, target=%d, sample_count=%d, "
@@ -1046,6 +1212,8 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    screen->npu = npu;
    screen->ro = ro;
    screen->info = etna_gpu_get_core_info(gpu);
+   snprintf(screen->name, sizeof(screen->name), "Vivante GC%x rev %04x",
+            screen->info->model, screen->info->revision);
 
    screen->drm_version = etnaviv_device_version(screen->dev);
    etna_mesa_debug = debug_get_option_etna_mesa_debug();
@@ -1095,6 +1263,8 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    pscreen->get_name = etna_screen_get_name;
    pscreen->get_vendor = etna_screen_get_vendor;
    pscreen->get_device_vendor = etna_screen_get_device_vendor;
+   pscreen->get_device_uuid = etna_screen_get_device_uuid;
+   pscreen->get_driver_uuid = etna_screen_get_driver_uuid;
 
    pscreen->context_create = etna_context_create;
    pscreen->is_format_supported = etna_screen_is_format_supported;
@@ -1117,6 +1287,7 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    etna_resource_screen_init(pscreen);
 
    etna_init_shader_caps(screen);
+   etna_init_compute_caps(screen);
    etna_init_screen_caps(screen);
 
    screen->compiler->max_render_targets = screen->base.caps.max_render_targets;

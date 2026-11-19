@@ -82,6 +82,20 @@ struct etna_constbuf_state {
    uint32_t enabled_mask;
 };
 
+#define ETNA_MAX_SHADER_BUFFERS 8
+
+struct etna_shader_buffer_state {
+   struct pipe_shader_buffer sb[ETNA_MAX_SHADER_BUFFERS];
+   uint32_t enabled_mask;
+};
+
+#define ETNA_MAX_SHADER_IMAGES 8
+
+struct etna_shader_image_state {
+   struct pipe_image_view img[ETNA_MAX_SHADER_IMAGES];
+   uint32_t enabled_mask;
+};
+
 struct etna_vertexbuf_state {
    struct pipe_vertex_buffer vb[PIPE_MAX_ATTRIBS];
    struct compiled_set_vertex_buffer cvb[PIPE_MAX_ATTRIBS];
@@ -90,8 +104,8 @@ struct etna_vertexbuf_state {
 };
 
 struct etna_shader_state {
-   void *bind_vs, *bind_fs;
-   struct etna_shader_variant *vs, *fs;
+   void *bind_vs, *bind_fs, *bind_cs;
+   struct etna_shader_variant *vs, *fs, *cs;
    struct etna_shader_key key;
 };
 
@@ -141,6 +155,26 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_XFB_ADDR,
    ETNA_UNIFORM_XFB_NUM_VERTICES,
    ETNA_UNIFORM_XFB_FIRST_VERTEX,
+   ETNA_UNIFORM_SSBO_ADDR,
+   ETNA_UNIFORM_SSBO_SIZE,
+   ETNA_UNIFORM_NUM_WORKGROUPS,
+   ETNA_UNIFORM_WORKGROUP_SIZE,
+   ETNA_UNIFORM_BASE_WORKGROUP_ID,
+   ETNA_UNIFORM_SHARED_ADDR,
+   ETNA_UNIFORM_SHARED_SLICE,
+   /* image parameters, in the order of the BASE of load_image_param_etna */
+   ETNA_UNIFORM_IMAGE_ADDR,
+   ETNA_UNIFORM_IMAGE_STRIDE,
+   ETNA_UNIFORM_IMAGE_LAYER_STRIDE,
+   ETNA_UNIFORM_IMAGE_WIDTH,
+   ETNA_UNIFORM_IMAGE_HEIGHT,
+   ETNA_UNIFORM_IMAGE_DEPTH,
+   ETNA_UNIFORM_IMAGE_TILED,
+   ETNA_UNIFORM_IMAGE_PLANE_OFFSET,
+   /* word of an image descriptor: image | plane << 4 | word << 8 */
+   ETNA_UNIFORM_IMAGE_DESC,
+   ETNA_UNIFORM_SCRATCH_ADDR,
+   ETNA_UNIFORM_PRIVATE_ADDR,
 };
 
 struct etna_shader_uniform_info {
@@ -236,6 +270,12 @@ struct etna_context {
    uint32_t dirty_samplers;
    struct pipe_sampler_view *sampler_view[PIPE_MAX_SAMPLERS];
    struct etna_constbuf_state constant_buffer[MESA_SHADER_STAGES];
+   struct etna_shader_buffer_state shader_buffers[MESA_SHADER_STAGES];
+   struct etna_shader_image_state shader_images[MESA_SHADER_STAGES];
+   /* OpenCL global buffers (set_global_binding): kernels address them by
+    * their GPU address, so they are only referenced by the submit */
+   struct pipe_resource *global_bindings[32];
+   uint32_t global_bindings_mask;
    struct etna_vertexbuf_state vertex_buffer;
    struct etna_index_buffer index_buffer;
    struct etna_shader_state shader;
@@ -271,6 +311,17 @@ struct etna_context {
    bool is_noop;
 
    bool compute_only;
+   /* compute-only contexts (OpenCL): the fence fds of the jobs not known to
+    * have completed, and whether one that completed was killed by the hang
+    * check, or a dispatch was skipped (etna_launch_grid()), since the last
+    * etna_get_device_reset_status() */
+   struct util_dynarray job_fence_fds;
+   bool job_reset;
+   /* compute-only contexts (OpenCL): a dispatch was skipped since the last
+    * flush with a fence, which then fails (etna_flush()) */
+   bool cs_failed;
+   /* the command stream goes to the NPU (machine learning jobs) */
+   bool on_npu;
    bool in_atomic_emit;
    bool in_transfer_blit;
 
@@ -279,6 +330,37 @@ struct etna_context {
     * pipe_blit_info has no driver-private field to carry this through. */
    bool blit_rb_swap;
    bool needs_gpu_state_reset;
+
+   /* experimental compute */
+   uint32_t compute_grid[3];
+   uint32_t compute_block[3];
+   uint32_t compute_shared_slice;
+   struct etna_bo *compute_shared_bo;
+   /* compute textures: bound into the fragment slots for the dispatch only */
+   void *cs_sampler[PIPE_MAX_SAMPLERS];
+   /* for textures read without a sampler (OpenCL), created on first use */
+   void *cs_fetch_sampler;
+   /* per compute texture slot, a copy of its sampler made for the view
+    * (etna_compute_swap_textures): nearest for the textures the shader
+    * filters, the OpenCL border color; and the slots the shader filters */
+   void *cs_sampler_copy[PIPE_MAX_SAMPLERS / 2];
+   struct pipe_sampler_state cs_sampler_copy_state[PIPE_MAX_SAMPLERS / 2];
+   uint16_t cs_shader_linear;
+   /* compute textures read as images 8 + slot: buffers, and the 2D textures
+    * of cs_teximg_mask (see etna_compute_swap_textures()) */
+   uint32_t cs_texbuf_mask;
+   uint32_t cs_teximg_mask;
+   struct pipe_sampler_view *cs_sampler_view[PIPE_MAX_SAMPLERS];
+   unsigned cs_num_samplers, cs_num_sampler_views;
+   uint32_t compute_shared_bo_size;
+   struct etna_bo *compute_scratch_bo;
+   uint32_t compute_scratch_bo_size;
+   /* OpenCL private memory: one slot per invocation of the dispatch */
+   struct etna_bo *compute_private_bo;
+   uint32_t compute_private_bo_size;
+   uint32_t compute_unk924;
+   uint32_t compute_thread_alloc;
+   uint32_t compute_min_temps;
    bool mag_switchover_half;
    bool alpha_coverage_dither_emitted;
 
@@ -338,6 +420,20 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
 bool
 etna_render_condition_check(struct pipe_context *pctx);
 
+void
+etna_reset_gpu_state(struct etna_context *ctx);
+
+struct etna_shader_key;
+void
+etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key *key,
+                                uint16_t lod_samplers, uint16_t tg4_shadow_samplers);
+
+void
+etna_compute_init(struct pipe_context *pctx);
+
+void
+etna_compute_fini(struct pipe_context *pctx);
+
 #ifndef NDEBUG
 static inline void clear_atomic_emit_flag(struct etna_context **ctx_ptr) {
    (*ctx_ptr)->in_atomic_emit = false;
@@ -349,5 +445,8 @@ static inline void clear_atomic_emit_flag(struct etna_context **ctx_ptr) {
 #else
 #define ETNA_CONTEXT_ATOMIC_EMIT(_ctx)
 #endif
+
+void
+etna_context_use_npu(struct etna_context *ctx);
 
 #endif

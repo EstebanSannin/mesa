@@ -196,7 +196,9 @@ static struct etna_format formats[PIPE_FORMAT_COUNT] = {
    V_(R16G16B16_FLOAT,   HALF_FLOAT,     NONE),
 
    /* 64-bit */
-   V_(R16G16B16A16_UNORM,   UNSIGNED_SHORT, NONE),
+   /* no 16-bit normalized texture format: sampled as 16-bit integers and
+    * converted in compute shaders (OpenCL only, see etna_screen_is_format_supported) */
+   VT(R16G16B16A16_UNORM,   UNSIGNED_SHORT, EXT_A16B16G16R16I | EXT_FORMAT, NONE),
    V_(R16G16B16A16_SNORM,   SHORT,          NONE),
    VT(R16G16B16A16_UINT,    SHORT_I,        EXT_A16B16G16R16I | EXT_FORMAT, A16B16G16R16I),
    VT(R16G16B16A16_SINT,    SHORT_I,        EXT_A16B16G16R16I | EXT_FORMAT, A16B16G16R16I),
@@ -322,6 +324,10 @@ texture_use_int_filter(const struct pipe_sampler_view *sv,
 
    /* only unorm formats can use int filter */
    if (!util_format_is_unorm(sv->format))
+      return false;
+
+   /* RGBA16 UNORM is sampled as 16-bit integers (OpenCL) */
+   if (sv->format == PIPE_FORMAT_R16G16B16A16_UNORM)
       return false;
 
    if (util_format_is_srgb(sv->format))

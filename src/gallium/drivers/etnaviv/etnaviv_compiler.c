@@ -40,11 +40,33 @@ etna_compiler_create(const struct etna_core_info *info)
       .has_texture_scaling = true,
       .lower_fpow = true,
       .lower_fround_even = true,
+      /* F2IRND converts with round to nearest even (.rtne) */
+      .has_f2i32_rtne = info->halti >= 2,
+      /* no instruction for it (OpenCL isnormal()) */
+      .lower_fisnormal = true,
       .lower_ftrunc = true,
       .float_mul_add16 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
       .float_mul_add32 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
       .float_mul_add64 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
-      .lower_mul_high = true,
+      /* IMULHI0 gives the high half of a 32-bit product */
+      .lower_mul_high = info->halti < 2,
+      /* IMADLO0: a * b + c in one instruction, where IMULLO0 and ADD take two */
+      .has_imad32 = true,
+      /* no fused multiply-add, an unfused MAD, and no fp32 denormals: vtn
+       * emulates OpenCL fma() inline, where libclc takes about twice the
+       * instructions and scalarizes vectors */
+      .emulate_ffma32_ftz = info->halti >= 2,
+      .lower_hadd = true,
+      .lower_uadd_sat = true,
+      .lower_usub_sat = true,
+      .lower_iadd_sat = true,
+      /* no 64-bit integers: OpenCL builtins and conversions can still bring
+       * some (u2u64), split them into 32-bit halves */
+      .lower_int64_options = (nir_lower_int64_options)~0,
+      /* lowered in etna_compile_shader(), one component at a time: rusticl
+       * would lower a long16 division as a vector, all lanes live at once */
+      .late_lower_int64 = true,
+      .lower_mul_2x32_64 = true,
       .lower_bitops = true,
       .lower_bitfield_insert = info->halti < 5,
       .lower_flrp32 = true,
@@ -65,13 +87,15 @@ etna_compiler_create(const struct etna_core_info *info)
       .max_unroll_iterations = 32,
       .max_samples = ETNA_MAX_SAMPLES,
       .lower_pack_32_2x16_split = true,
-      .lower_pack_64_2x32_split = true,
+      /* the 64-bit packs stay: nir_lower_int64() splits 64-bit values into
+       * them, and the optimizations cancel them out. Lowered, they turned
+       * back into 64-bit arithmetic (u2u64) after the frontend's int64
+       * lowering had run (OpenCL: libclc's software fma()) */
       .lower_pack_half_2x16 = true,
       .lower_pack_snorm_2x16 = true,
       .lower_pack_split = true,
       .lower_pack_unorm_2x16 = true,
       .lower_unpack_32_2x16_split = true,
-      .lower_unpack_64_2x32_split = true,
       .lower_unpack_half_2x16 = true,
       .lower_unpack_snorm_2x16 = true,
       .lower_unpack_unorm_2x16 = true,
@@ -79,8 +103,21 @@ etna_compiler_create(const struct etna_core_info *info)
       .lower_ifind_msb = true,
       .lower_ufind_msb = true,
       .has_uclz = true,
+      .has_cs_global_id = true,
       .no_integers = info->halti < 2,
    };
+
+   /* ETNA_MESA_DEBUG=fast_fma, experimental and not conformant: claim a fused
+    * multiply-add, so that OpenCL's fma() becomes the hardware's unfused
+    * multiply-add instead of the exact software emulation (dozens of
+    * instructions). libclc's own math then takes its hardware fma path too,
+    * and rusticl reports CL_FP_FMA. fma() is no longer correctly rounded and
+    * its product can overflow on its own: CTS bruteforce fma fails, for
+    * example fma(-FLT_MAX, -FLT_MAX, -inf) is NaN, not -inf. For image work
+    * where a difference in the last bit doesn't matter (OpenCV's warpAffine:
+    * 13 fma() per pixel). */
+   if (DBG_ENABLED(ETNA_DBG_FAST_FMA))
+      compiler->options.float_mul_add32 |= nir_float_muladd_support_has_ffma;
 
    compiler->regs = etna_ra_setup(compiler);
    if (!compiler->regs) {

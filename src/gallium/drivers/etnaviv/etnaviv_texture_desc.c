@@ -166,9 +166,8 @@ etna_texture_desc_fill(struct etna_context *ctx,
       target_hw = TEXTURE_TYPE_2D;
       break;
    case PIPE_TEXTURE_1D_ARRAY:
-      is_array = true;
-      base_height = res->base.array_size;
-      break;
+      /* a 2D array texture of one row: the layers are layer_stride apart,
+       * not the rows of a 2D texture */
    case PIPE_TEXTURE_2D_ARRAY:
       is_array = true;
       base_depth = res->base.array_size;
@@ -227,6 +226,17 @@ etna_create_sampler_view_desc(struct pipe_context *pctx, struct pipe_resource *p
    if (!sv)
       return NULL;
 
+   /* a buffer (OpenCL 1D image buffer): read with the image instructions,
+    * never bound to the texture unit (etna_compute_swap_textures) */
+   if (so->target == PIPE_BUFFER) {
+      sv->base = *so;
+      pipe_reference_init(&sv->base.reference, 1);
+      sv->base.texture = NULL;
+      pipe_resource_reference(&sv->base.texture, prsc);
+      sv->base.context = pctx;
+      return &sv->base;
+   }
+
    /* Determine whether target supported */
    if (translate_texture_target(so->target) == ETNA_NO_MATCH) {
       BUG("Unhandled texture target");
@@ -257,7 +267,7 @@ etna_create_sampler_view_desc(struct pipe_context *pctx, struct pipe_resource *p
    if (util_format_is_srgb(so->format))
       sv->SAMP_CTRL1 |= VIVS_NTE_DESCRIPTOR_SAMP_CTRL1_SRGB;
 
-   if (sv->base.target == PIPE_TEXTURE_1D) {
+   if (sv->base.target == PIPE_TEXTURE_1D || sv->base.target == PIPE_TEXTURE_1D_ARRAY) {
       sv->SAMP_CTRL0_MASK = ~VIVS_NTE_DESCRIPTOR_SAMP_CTRL0_VWRAP__MASK;
       sv->SAMP_CTRL0 = VIVS_NTE_DESCRIPTOR_SAMP_CTRL0_VWRAP(TEXTURE_WRAPMODE_REPEAT);
    }

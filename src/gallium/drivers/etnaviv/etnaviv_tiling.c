@@ -29,6 +29,11 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* a 16-byte texel (the interleaved layout of 128-bit formats) */
+typedef struct {
+   uint64_t lo, hi;
+} etna_tile_texel128;
+
 #define TEX_TILE_WIDTH (4)
 #define TEX_TILE_HEIGHT (4)
 #define TEX_TILE_WORDS (TEX_TILE_WIDTH * TEX_TILE_HEIGHT)
@@ -68,7 +73,9 @@ etna_texture_tile(void *dest, void *src, unsigned basex, unsigned basey,
                   unsigned dst_stride, unsigned width, unsigned height,
                   unsigned src_stride, unsigned elmtsize)
 {
-   if (elmtsize == 8) {
+   if (elmtsize == 16) {
+      DO_TILE(etna_tile_texel128)
+   } else if (elmtsize == 8) {
       DO_TILE(uint64_t)
    } else if (elmtsize == 4) {
       DO_TILE(uint32_t)
@@ -86,7 +93,9 @@ etna_texture_untile(void *dest, void *src, unsigned basex, unsigned basey,
                     unsigned src_stride, unsigned width, unsigned height,
                     unsigned dst_stride, unsigned elmtsize)
 {
-   if (elmtsize == 8) {
+   if (elmtsize == 16) {
+      DO_UNTILE(etna_tile_texel128);
+   } else if (elmtsize == 8) {
       DO_UNTILE(uint64_t)
    } else if (elmtsize == 4) {
       DO_UNTILE(uint32_t);

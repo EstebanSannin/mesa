@@ -68,4 +68,29 @@ resolve_copies_one_sample(enum pipe_format format)
    return util_format_is_pure_integer(format);
 }
 
+/* the image formats of OpenGL ES 3.1 (format layout qualifiers) */
+static inline bool
+etna_format_is_image_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R16G16B16A16_SINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   case PIPE_FORMAT_R32_SINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 #endif /* ETNAVIV_FORMAT_H_ */

@@ -51,7 +51,9 @@
 #include "nir/nir_xfb_info.h"
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
+#include "util/os_file.h"
 #include "util/hash_table.h"
+#include "util/log.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_blitter.h"
 #include "util/u_draw.h"
@@ -113,6 +115,8 @@ etna_context_destroy(struct pipe_context *pctx)
 
    util_dynarray_fini(&ctx->pending_status);
 
+   etna_compute_fini(pctx);
+
    if (ctx->updated_resources)
       _mesa_set_destroy(ctx->updated_resources, NULL);
 
@@ -136,6 +140,10 @@ etna_context_destroy(struct pipe_context *pctx)
 
    if (ctx->in_fence_fd >= 0)
       close(ctx->in_fence_fd);
+
+   util_dynarray_foreach(&ctx->job_fence_fds, int, fd)
+      close(*fd);
+   util_dynarray_fini(&ctx->job_fence_fds);
 
    FREE(pctx);
 }
@@ -221,35 +229,56 @@ etna_get_vs(struct etna_context *ctx, struct etna_shader_key* const key)
    return true;
 }
 
-static bool
-etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
+/* Texture part of the key of a shader that samples through the fragment
+ * slots: fragment shaders, and compute shaders, whose textures are bound
+ * there for the dispatch. */
+void
+etna_shader_key_set_fs_textures(struct etna_context *ctx, struct etna_shader_key *key,
+                                uint16_t lod_samplers, uint16_t tg4_shadow_samplers)
 {
-   const struct etna_shader_variant *old = ctx->shader.fs;
-   struct etna_shader *fs = ctx->shader.bind_fs;
-
-   key->use_xfb_emu = false;
-   key->rt_pack_rgba16 = ctx->framebuffer_s.rt_pack_rgba16;
-
    /* update the key if we need to run nir_lower_sample_tex_compare(..).
     * halti < 2 has no HW shadow compare. halti >= 2 has it, but depth32f is
     * emulated as D24S8 and the float compare ref must not be clamped to the
-    * D24 range, so it must compare in the shader (and not clamp the ref). */
+    * D24 range, so it must compare in the shader (and not clamp the ref).
+    * Shadow gathers always compare in the shader: TG4 doesn't compare. */
    for (unsigned int i = 0; i < ctx->num_fragment_sampler_views; i++) {
       if (!ctx->sampler[i] || !ctx->sampler_view[i])
          continue;
+
+      if (ctx->sampler[i]->unnormalized_coords)
+         key->tex_unnormalized |= BITFIELD_BIT(i);
 
       if (ctx->sampler[i]->compare_mode == PIPE_TEX_COMPARE_NONE)
          continue;
 
       const bool emulated_z32f = eil_format_is_emulated_z32f(ctx->sampler_view[i]->format);
 
-      if (ctx->screen->info->halti >= 2 && !emulated_z32f)
+      const bool tg4_compare = tg4_shadow_samplers & BITFIELD_BIT(i);
+
+      if (ctx->screen->info->halti >= 2 && !emulated_z32f && !tg4_compare)
          continue;
 
       if (emulated_z32f)
          key->shadow_compare_no_clamp = 1;
 
-      key->has_sample_tex_compare = 1;
+      /* a float depth border keeps values outside [0, 1] (+-inf in dEQP),
+       * which the D24 storage can't hold: the shader substitutes it */
+      const struct pipe_sampler_state *ss = ctx->sampler[i];
+      const float border = ss->border_color.f[0];
+
+      if (emulated_z32f && etna_sampler_uses_border(ss) &&
+          !(border >= 0.0f && border <= 1.0f)) {
+         if (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER)
+            key->tex_float_border_s |= BITFIELD_BIT(i);
+         if (ss->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER)
+            key->tex_float_border_t |= BITFIELD_BIT(i);
+         key->tex_border_depth[i] = border;
+      }
+
+      if (ctx->screen->info->halti < 2 || emulated_z32f)
+         key->has_sample_tex_compare = 1;
+      else
+         key->has_tg4_compare = 1;
       key->num_texture_states = ctx->num_fragment_sampler_views;
 
       etna_shader_key_set_tex_swizzle(key, i, ctx->sampler_view[i]);
@@ -267,7 +296,20 @@ etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
          etna_shader_key_set_tex_swizzle(key, i, ctx->sampler_view[i]);
    }
 
-   key->tex_mag_switchover = etna_tex_mag_switchover(ctx, fs->tex_lod_samplers, 0);
+   key->tex_mag_switchover = etna_tex_mag_switchover(ctx, lod_samplers, 0);
+}
+
+static bool
+etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
+{
+   const struct etna_shader_variant *old = ctx->shader.fs;
+   struct etna_shader *fs = ctx->shader.bind_fs;
+
+   key->use_xfb_emu = false;
+   key->rt_pack_rgba16 = ctx->framebuffer_s.rt_pack_rgba16;
+
+   etna_shader_key_set_fs_textures(ctx, key, fs->tex_lod_samplers,
+                                   fs->tg4_shadow_samplers);
 
    ctx->shader.fs = etna_shader_variant(fs, key, &ctx->base.debug, true);
 
@@ -280,7 +322,7 @@ etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
    return true;
 }
 
-static void
+void
 etna_reset_gpu_state(struct etna_context *ctx)
 {
    struct etna_cmd_stream *stream = ctx->stream;
@@ -316,6 +358,23 @@ etna_reset_gpu_state(struct etna_context *ctx)
          etna_set_state(stream, VIVS_VS_SAMPLER_BASE, 0x00000020);
 
       etna_set_state(stream, VIVS_SH_CONFIG, VIVS_SH_CONFIG_RTNE_ROUNDING);
+
+      /* The split of the unified shader cache that
+       * etna_core_usc_attrib_size() assumes, with UNK16 = 2, as the Vivante
+       * kernel sets it. At the reset value, global loads of 16 bytes or more
+       * run at two thirds of the speed.
+       *
+       * A compute-only context (OpenCL) has no vertex attributes, and its
+       * shared memory is a buffer: like the Vivante kernel on a compute-only
+       * core, give the whole cache to the L1. */
+      if (screen->info->gpu.usc_size) {
+         const unsigned l1_ratio =
+            ctx->compute_only ? 0 : etna_core_usc_l1_cache_ratio(screen->info);
+
+         etna_set_state(stream, VIVS_GL_USC_CONTROL,
+                        VIVS_GL_USC_CONTROL_L1_CACHE_RATIO(l1_ratio) |
+                        VIVS_GL_USC_CONTROL_UNK16(2));
+      }
    }
 
    if (VIV_FEATURE(screen, ETNA_FEATURE_BUG_FIXES18))
@@ -708,6 +767,31 @@ etna_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       pipe_resource_reference(&indexbuf, NULL);
 }
 
+/* Close the fence fds of the compute-only context's jobs that completed, and
+ * remember one that the hang check killed. Done at every flush with a fence
+ * fd, so that only the jobs in flight keep one: rusticl asks only its queue
+ * contexts for their reset status, never the helper context of its uploads
+ * and maps. */
+static void
+etna_prune_job_fences(struct etna_context *ctx)
+{
+   unsigned pending = 0;
+
+   util_dynarray_foreach(&ctx->job_fence_fds, int, fd) {
+      const int s = etna_fence_fd_status(*fd);
+
+      if (s == 0) {
+         *util_dynarray_element(&ctx->job_fence_fds, int, pending++) = *fd;
+         continue;
+      }
+
+      if (s < 0)
+         ctx->job_reset = true;
+      close(*fd);
+   }
+   util_dynarray_resize(&ctx->job_fence_fds, int, pending);
+}
+
 void
 etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
            enum pipe_flush_flags flags, bool internal)
@@ -749,8 +833,12 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
       _mesa_set_clear(ctx->updated_resources, NULL);
    }
 
+   /* A compute-only context (OpenCL) gets a fence fd with every fence: its
+    * status tells a job the hang check killed (etna_screen_fence_finish()). */
+   const bool fence_fd = (flags & PIPE_FLUSH_FENCE_FD) || (fence && ctx->compute_only);
+
    etna_cmd_stream_flush(ctx->stream, ctx->in_fence_fd,
-                          (flags & PIPE_FLUSH_FENCE_FD) ? &out_fence_fd : NULL,
+                          fence_fd ? &out_fence_fd : NULL,
                           ctx->is_noop);
 
    if (ctx->in_fence_fd >= 0) {
@@ -758,8 +846,25 @@ etna_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
       ctx->in_fence_fd = -1;
    }
 
-   if (fence)
+   /* a copy of the job's fence fd for etna_get_device_reset_status() */
+   if (ctx->compute_only && out_fence_fd >= 0) {
+      int fd;
+
+      etna_prune_job_fences(ctx);
+      fd = os_dupfd_cloexec(out_fence_fd);
+      if (fd >= 0)
+         util_dynarray_append_typed(&ctx->job_fence_fds, int, fd);
+   }
+
+   if (fence) {
       *fence = etna_fence_create(pctx, out_fence_fd);
+
+      /* a dispatch since the last fence was skipped (OpenCL): this fence
+       * fails, and rusticl fails its events (etna_screen_fence_finish()) */
+      if (*fence && ctx->cs_failed)
+         etna_fence_set_failed(*fence);
+      ctx->cs_failed = false;
+   }
 
    util_dynarray_clear(&ctx->pending_status);
 
@@ -774,6 +879,24 @@ etna_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
                    enum pipe_flush_flags flags)
 {
    etna_flush(pctx, fence, flags, false);
+}
+
+/* OpenCL: a job of this context that the kernel's hang check killed (its fence
+ * completed with an error), or a dispatch the driver skipped, is a reset this
+ * context caused. The job's events already failed (etna_screen_fence_finish());
+ * rusticl then fails the events of the queue from there on, so a later read
+ * doesn't return incomplete results as if they were valid. */
+static enum pipe_reset_status
+etna_get_device_reset_status(struct pipe_context *pctx)
+{
+   struct etna_context *ctx = etna_context(pctx);
+   enum pipe_reset_status status;
+
+   etna_prune_job_fences(ctx);
+   status = ctx->job_reset ? PIPE_GUILTY_CONTEXT_RESET : PIPE_NO_RESET;
+   ctx->job_reset = false;
+
+   return status;
 }
 
 static void
@@ -830,7 +953,12 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->const_uploader = pctx->stream_uploader;
 
    screen = etna_screen(pscreen);
-   pipe = (compute_only && screen->pipe_nn) ? screen->pipe_nn : screen->pipe;
+   /* Compute-only contexts run machine learning jobs (Teflon) on the NPU.
+    * With compute shaders they also run OpenCL kernels (rusticl), which need
+    * the GPU: then they start on the GPU and move to the NPU at their first
+    * machine learning job (etna_context_use_npu). */
+   ctx->on_npu = compute_only && screen->pipe_nn && !pscreen->caps.compute;
+   pipe = ctx->on_npu ? screen->pipe_nn : screen->pipe;
    ctx->stream = etna_cmd_stream_new(pipe, 0x2000,
                                      &etna_context_force_flush, pctx);
    if (ctx->stream == NULL)
@@ -858,6 +986,7 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    ctx->needs_gpu_state_reset = true;
 
    ctx->in_fence_fd = -1;
+   util_dynarray_init(&ctx->job_fence_fds, NULL);
 
    pctx->destroy = etna_context_destroy;
    pctx->draw_vbo = etna_draw_vbo;
@@ -868,6 +997,8 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->set_debug_callback = etna_set_debug_callback;
    pctx->create_fence_fd = etna_create_fence_fd;
    pctx->fence_server_sync = etna_fence_server_sync;
+   if (ctx->compute_only)
+      pctx->get_device_reset_status = etna_get_device_reset_status;
    pctx->emit_string_marker = etna_emit_string_marker;
    pctx->set_frontend_noop = etna_set_frontend_noop;
    pctx->set_context_param = etna_set_context_param;
@@ -885,6 +1016,7 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    etna_shader_init(pctx);
    etna_texture_init(pctx);
    etna_transfer_init(pctx);
+   etna_compute_init(pctx);
 
    if (!ctx->compute_only) {
       ctx->blitter = util_blitter_create(pctx);
@@ -911,6 +1043,28 @@ fail:
    pctx->destroy(pctx);
 
    return NULL;
+}
+
+/* Move the context's command stream to the NPU, for machine learning jobs */
+void
+etna_context_use_npu(struct etna_context *ctx)
+{
+   struct etna_cmd_stream *stream;
+
+   if (ctx->on_npu || !ctx->screen->pipe_nn)
+      return;
+
+   stream = etna_cmd_stream_new(ctx->screen->pipe_nn, 0x2000,
+                                &etna_context_force_flush, &ctx->base);
+   if (!stream) {
+      mesa_loge("etnaviv: could not create the NPU command stream");
+      return;
+   }
+
+   etna_flush(&ctx->base, NULL, 0, true);
+   etna_cmd_stream_del(ctx->stream);
+   ctx->stream = stream;
+   ctx->on_npu = true;
 }
 
 bool

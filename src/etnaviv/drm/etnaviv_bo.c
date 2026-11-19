@@ -24,6 +24,7 @@
  *    Christian Gmeiner <christian.gmeiner@gmail.com>
  */
 
+#include <errno.h>
 #include "util/os_mman.h"
 #include "util/hash_table.h"
 #include "util/perf/cpu_trace.h"
@@ -422,11 +423,19 @@ int etna_bo_cpu_prep(struct etna_bo *bo, uint32_t op)
 		.handle = bo->handle,
 		.op = op,
 	};
+	int ret;
 
-	get_abs_timeout(&req.timeout, 5000000000);
+	/* The GPU may keep a buffer for longer than one wait of 5 s (an OpenCL
+	 * kernel of several seconds): wait on, unless the caller doesn't wait at
+	 * all. A job that doesn't end is reset by the kernel's hang check, which
+	 * completes it, so this ends. */
+	do {
+		get_abs_timeout(&req.timeout, 5000000000);
+		ret = drmCommandWrite(bo->dev->fd, DRM_ETNAVIV_GEM_CPU_PREP,
+				&req, sizeof(req));
+	} while (ret == -ETIMEDOUT && !(op & DRM_ETNA_PREP_NOSYNC));
 
-	return drmCommandWrite(bo->dev->fd, DRM_ETNAVIV_GEM_CPU_PREP,
-			&req, sizeof(req));
+	return ret;
 }
 
 void etna_bo_cpu_fini(struct etna_bo *bo)

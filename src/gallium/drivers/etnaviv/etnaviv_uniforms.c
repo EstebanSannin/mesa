@@ -33,6 +33,8 @@
 #include "pipe/p_defines.h"
 #include "util/u_math.h"
 
+#include <string.h>
+
 static unsigned
 get_const_idx(const struct etna_context *ctx, bool frag, unsigned samp_id)
 {
@@ -129,6 +131,96 @@ get_sampler_lod(const struct etna_context *ctx, bool frag,
    }
 }
 
+/* Format word of an image descriptor, from NXP's driver for the formats it
+ * was seen with (r32ui, r32f, rgba8, rgba8ui, rgba16f, rg32f, rg32ui), and
+ * measured on GC7000 r6204:
+ *   bits 0-2   log2(bytes per texel), for the address
+ *   bits 4-5   2 for one 32-bit component, 1 otherwise (what fills register
+ *              lanes the format does not have: 0 zero, 2 ones, 3 a copy)
+ *   bits 6-9   type: 0 f32, 1 f16, 5 u32, 6 u16?, 7 u8, 2 s32?, 3 s16?,
+ *              4 s8?, plus 8 for normalized (no effect seen on GC7000 r6204)
+ *   bits 10-11 layout: 0 linear, 1 4x4 tiled, 2 super tiled (NXP's
+ *              textures; not tested here)
+ *   bit 12     set; bits 14-15 number of components (4 as 0)
+ *   bits 16-31 swizzle: 4 bits per channel, 0-3 source, 4 zero, 5 one
+ * 128-bit formats are two planes of 64-bit texels, each with its own
+ * descriptor, except in buffers and in the interleaved layout of OpenCL 2D
+ * textures (whole), which hold them as 16-byte texels.
+ * Returns 0 for formats without a hardware image path. */
+/* Image descriptors 0-7 are the shader images, 8-39 the compute textures
+ * 0-31 read with the image instructions: buffers (OpenCL 1D image buffers)
+ * and the OpenCL 2D textures of etna_compute_swap_textures() (textures 0-7,
+ * or all in a wide dispatch, see etna_compute_probe_wide()). */
+static const struct pipe_image_view *
+etna_uniform_image(const struct etna_context *ctx, mesa_shader_stage stage, unsigned index,
+                   struct pipe_image_view *tmp)
+{
+   if (index < ETNA_MAX_SHADER_IMAGES)
+      return &ctx->shader_images[stage].img[index];
+
+   const struct pipe_sampler_view *sv = ctx->cs_sampler_view[index - ETNA_MAX_SHADER_IMAGES];
+
+   memset(tmp, 0, sizeof(*tmp));
+   if (sv) {
+      tmp->resource = sv->texture;
+      tmp->format = sv->format;
+      tmp->access = PIPE_IMAGE_ACCESS_READ;
+      if (sv->target == PIPE_BUFFER) {
+         tmp->u.buf.offset = sv->u.buf.offset;
+         tmp->u.buf.size = sv->u.buf.size;
+      } else {
+         tmp->u.tex.level = sv->u.tex.first_level;
+         tmp->u.tex.first_layer = sv->u.tex.first_layer;
+         tmp->u.tex.last_layer = sv->u.tex.last_layer;
+      }
+   }
+   return tmp;
+}
+
+static uint32_t
+etna_image_format_word(enum pipe_format format, enum etna_surface_layout layout, bool read_only,
+                       bool whole)
+{
+   unsigned log2_bpp, cls, type, comps;
+
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT: log2_bpp = 3; cls = 1; type = 0;  comps = 2; break;
+   case PIPE_FORMAT_R32G32B32A32_UINT:  log2_bpp = 3; cls = 1; type = 5;  comps = 2; break;
+   case PIPE_FORMAT_R32G32B32A32_SINT:  log2_bpp = 3; cls = 1; type = 2;  comps = 2; break;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT: log2_bpp = 3; cls = 1; type = 1;  comps = 4; break;
+   case PIPE_FORMAT_R16G16B16A16_UINT:  log2_bpp = 3; cls = 1; type = 6;  comps = 4; break;
+   case PIPE_FORMAT_R16G16B16A16_SINT:  log2_bpp = 3; cls = 1; type = 3;  comps = 4; break;
+   /* type from NXP's OpenCL (RGBA UNORM_INT16 images) */
+   case PIPE_FORMAT_R16G16B16A16_UNORM: log2_bpp = 3; cls = 1; type = 14; comps = 4; break;
+   case PIPE_FORMAT_R32_FLOAT:          log2_bpp = 2; cls = 2; type = 0;  comps = 1; break;
+   case PIPE_FORMAT_R32_UINT:           log2_bpp = 2; cls = 2; type = 5;  comps = 1; break;
+   case PIPE_FORMAT_R32_SINT:           log2_bpp = 2; cls = 2; type = 2;  comps = 1; break;
+   case PIPE_FORMAT_R8G8B8A8_UNORM:     log2_bpp = 2; cls = 1; type = 15; comps = 4; break;
+   case PIPE_FORMAT_R8G8B8A8_SNORM:     log2_bpp = 2; cls = 1; type = 12; comps = 4; break;
+   case PIPE_FORMAT_R8G8B8A8_UINT:      log2_bpp = 2; cls = 1; type = 7;  comps = 4; break;
+   case PIPE_FORMAT_R8G8B8A8_SINT:      log2_bpp = 2; cls = 1; type = 4;  comps = 4; break;
+   default:
+      return 0;
+   }
+
+   /* NXP's OpenCL reads normalized images with class 3 (exact conversion,
+    * where class 1 gave UNORM8 values slightly off), and writes with 0 */
+   if (read_only && (type == 12 || type == 14 || type == 15))
+      cls = 3;
+
+   if (whole && util_format_get_blocksize(format) == 16) {
+      log2_bpp = 4;
+      comps = 4;
+   }
+
+   static const uint32_t swizzle[] = { 0, 0x5440, 0x5410, 0x5210, 0x3210 };
+
+   const unsigned tiling = layout == ETNA_LAYOUT_TILED ? 1 : layout == ETNA_LAYOUT_SUPER_TILED ? 2 : 0;
+
+   return log2_bpp | cls << 4 | type << 6 | tiling << 10 | 1 << 12 |
+          (comps & 3) << 14 | swizzle[comps] << 16;
+}
+
 void
 etna_uniforms_write(const struct etna_context *ctx,
                     const struct etna_shader_variant *sobj,
@@ -137,10 +229,11 @@ etna_uniforms_write(const struct etna_context *ctx,
    struct etna_screen *screen = ctx->screen;
    struct etna_cmd_stream *stream = ctx->stream;
    const struct etna_shader_uniform_info *uinfo = &sobj->uniforms;
-   bool frag = (sobj == ctx->shader.fs);
+   /* compute shaders run on the pixel shader unit, with PS_UNIFORM_BASE 0 */
+   bool frag = (sobj == ctx->shader.fs) || sobj->stage == MESA_SHADER_COMPUTE;
    uint32_t base = frag ? screen->specs.ps_uniforms_offset : screen->specs.vs_uniforms_offset;
 
-   if (screen->specs.has_unified_uniforms && frag)
+   if (screen->specs.has_unified_uniforms && sobj == ctx->shader.fs)
       base += ctx->shader.vs->uniforms.count * 4;
 
    if (!uinfo->count)
@@ -157,10 +250,15 @@ etna_uniforms_write(const struct etna_context *ctx,
          etna_cmd_stream_emit(stream, val);
          break;
 
-      case ETNA_UNIFORM_UNIFORM:
+      case ETNA_UNIFORM_UNIFORM: {
          assert(cb->user_buffer && val * 4 < cb->buffer_size);
-         etna_cmd_stream_emit(stream, ((uint32_t*) cb->user_buffer)[val]);
+         /* the last word can be partial (OpenCL arguments ending in a char
+          * or a short): read only the bytes the buffer has */
+         uint32_t word = 0;
+         memcpy(&word, (const uint8_t *)cb->user_buffer + val * 4, MIN2(4, cb->buffer_size - val * 4));
+         etna_cmd_stream_emit(stream, word);
          break;
+      }
 
       case ETNA_UNIFORM_TEXRECT_SCALE_X:
       case ETNA_UNIFORM_TEXRECT_SCALE_Y:
@@ -213,6 +311,179 @@ etna_uniforms_write(const struct etna_context *ctx,
 
       case ETNA_UNIFORM_XFB_FIRST_VERTEX:
          etna_cmd_stream_emit(stream, ctx->streamout.first_vertex);
+         break;
+
+      case ETNA_UNIFORM_SSBO_ADDR: {
+         const struct pipe_shader_buffer *sb = &ctx->shader_buffers[sobj->stage].sb[val];
+
+         if (sb->buffer) {
+            etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+               .bo = etna_buffer_resource(sb->buffer)->bo,
+               .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+               .offset = sb->buffer_offset,
+            });
+         } else {
+            etna_cmd_stream_emit(stream, 0);
+         }
+      } break;
+
+      case ETNA_UNIFORM_SSBO_SIZE:
+         etna_cmd_stream_emit(stream, ctx->shader_buffers[sobj->stage].sb[val].buffer_size);
+         break;
+
+      case ETNA_UNIFORM_NUM_WORKGROUPS:
+         etna_cmd_stream_emit(stream, ctx->compute_grid[val]);
+         break;
+
+      case ETNA_UNIFORM_WORKGROUP_SIZE:
+         etna_cmd_stream_emit(stream, ctx->compute_block[val]);
+         break;
+
+      case ETNA_UNIFORM_BASE_WORKGROUP_ID:
+         /* the first part of a dispatch; etna_launch_grid() writes the
+          * others' */
+         etna_cmd_stream_emit(stream, 0);
+         break;
+
+      case ETNA_UNIFORM_SHARED_SLICE:
+         etna_cmd_stream_emit(stream, ctx->compute_shared_slice);
+         break;
+
+      case ETNA_UNIFORM_IMAGE_ADDR: {
+         struct pipe_image_view tmp;
+         const struct pipe_image_view *img = etna_uniform_image(ctx, sobj->stage, val, &tmp);
+
+         if (img->resource && img->resource->target == PIPE_BUFFER) {
+            etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+               .bo = etna_buffer_resource(img->resource)->bo,
+               .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+               .offset = img->u.buf.offset,
+            });
+            break;
+         }
+
+         const struct etna_resource *rsc = etna_resource(img->resource);
+         const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
+
+         etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+            .bo = rsc->bo,
+            .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+            .offset = lev->offset + img->u.tex.first_layer * lev->layer_stride,
+         });
+      } break;
+
+      case ETNA_UNIFORM_IMAGE_STRIDE:
+      case ETNA_UNIFORM_IMAGE_LAYER_STRIDE:
+      case ETNA_UNIFORM_IMAGE_WIDTH:
+      case ETNA_UNIFORM_IMAGE_HEIGHT:
+      case ETNA_UNIFORM_IMAGE_DEPTH:
+      case ETNA_UNIFORM_IMAGE_TILED:
+      case ETNA_UNIFORM_IMAGE_PLANE_OFFSET: {
+         struct pipe_image_view tmp;
+         const struct pipe_image_view *img = etna_uniform_image(ctx, sobj->stage, val, &tmp);
+
+         if (img->resource && img->resource->target == PIPE_BUFFER) {
+            /* a linear image of one row */
+            const uint32_t width = img->u.buf.size / util_format_get_blocksize(img->format);
+            const uint32_t v[] = { img->u.buf.size, img->u.buf.size, width, 1, 1, 0, 0 };
+
+            etna_cmd_stream_emit(stream, v[uinfo->contents[i] - ETNA_UNIFORM_IMAGE_STRIDE]);
+            break;
+         }
+
+         const struct etna_resource *rsc = etna_resource(img->resource);
+         const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
+         const uint32_t v[] = {
+            lev->stride, lev->layer_stride, lev->width, lev->height,
+            img->resource->target == PIPE_TEXTURE_3D ? lev->depth
+               : img->u.tex.last_layer - img->u.tex.first_layer + 1,
+            rsc->layout == ETNA_LAYOUT_TILED,
+            etna_resource_level_second_plane_offset(lev),
+         };
+
+         etna_cmd_stream_emit(stream, v[uinfo->contents[i] - ETNA_UNIFORM_IMAGE_STRIDE]);
+      } break;
+
+      case ETNA_UNIFORM_IMAGE_DESC: {
+         const unsigned index = val & 0x3f, plane = (val >> 6) & 0x3, word = val >> 8;
+         struct pipe_image_view tmp;
+         const struct pipe_image_view *img = etna_uniform_image(ctx, sobj->stage, index, &tmp);
+         const struct etna_resource *rsc = etna_resource(img->resource);
+
+         if (!rsc) {
+            etna_cmd_stream_emit(stream, 0);
+            break;
+         }
+
+         if (img->resource->target == PIPE_BUFFER) {
+            /* a linear image of one row, of up to 65536 texels
+             * (max_texel_buffer_elements): the width field has 16 bits,
+             * and the hardware reads 0 as 65536 */
+            const uint32_t bpp = util_format_get_blocksize(img->format);
+            const uint32_t width = MIN2(img->u.buf.size / bpp, 0x10000);
+
+            if (word == 0) {
+               etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+                  .bo = etna_buffer_resource(img->resource)->bo,
+                  .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+                  .offset = img->u.buf.offset,
+               });
+            } else {
+               const uint32_t v[4] = {
+                  0, width * bpp, 1 << 16 | (width & 0xffff),
+                  etna_image_format_word(img->format, ETNA_LAYOUT_LINEAR,
+                                         !(img->access & PIPE_IMAGE_ACCESS_WRITE), true),
+               };
+               etna_cmd_stream_emit(stream, v[word & 3]);
+            }
+            break;
+         }
+
+         const struct etna_resource_level *lev = &rsc->levels[img->u.tex.level];
+
+         if (word == 0) {
+            etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+               .bo = rsc->bo,
+               .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+               .offset = lev->offset + img->u.tex.first_layer * lev->layer_stride +
+                         plane * etna_resource_level_second_plane_offset(lev),
+            });
+            break;
+         }
+
+         /* stride: of a row of texels, also for tiled images. NXP's driver
+          * writes its interleaved RGBA images with class 0. */
+         const bool write_class0 = rsc->interleaved && (img->access & PIPE_IMAGE_ACCESS_WRITE);
+         const uint32_t v[4] = {
+            0,
+            lev->stride,
+            lev->height << 16 | lev->width,
+            etna_image_format_word(img->format, rsc->layout, !(img->access & PIPE_IMAGE_ACCESS_WRITE),
+                                   rsc->interleaved) & ~(write_class0 ? 3u << 4 : 0),
+         };
+
+         etna_cmd_stream_emit(stream, v[word & 3]);
+      } break;
+
+      case ETNA_UNIFORM_SCRATCH_ADDR:
+         etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+            .bo = ctx->compute_scratch_bo,
+            .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+         });
+         break;
+
+      case ETNA_UNIFORM_PRIVATE_ADDR:
+         etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+            .bo = ctx->compute_private_bo,
+            .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+         });
+         break;
+
+      case ETNA_UNIFORM_SHARED_ADDR:
+         etna_cmd_stream_reloc(stream, &(struct etna_reloc) {
+            .bo = ctx->compute_shared_bo,
+            .flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE,
+         });
          break;
 
       case ETNA_UNIFORM_UNUSED:

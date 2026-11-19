@@ -42,20 +42,28 @@
 #include "util/u_math.h"
 #include "util/u_memory.h"
 
+/* Shader variants are shared by the contexts of a screen, which can run in
+ * several threads (the queues of an OpenCL application): a bo another context
+ * can see must be filled already, or that context may submit a dispatch with
+ * code that isn't there yet. */
 static inline bool
 upload_bo(struct etna_context *ctx, struct etna_bo **bo, const void *data, uint32_t size)
 {
-   if (*bo)
+   if (p_atomic_read(bo))
       return true;
 
-   *bo = etna_bo_new(ctx->screen->dev, size, DRM_ETNA_GEM_CACHE_WC);
-   if (!*bo)
+   struct etna_bo *new_bo = etna_bo_new(ctx->screen->dev, size, DRM_ETNA_GEM_CACHE_WC);
+   if (!new_bo)
       return false;
 
-   void *buf = etna_bo_map(*bo);
-   etna_bo_cpu_prep(*bo, DRM_ETNA_PREP_WRITE);
+   void *buf = etna_bo_map(new_bo);
+   etna_bo_cpu_prep(new_bo, DRM_ETNA_PREP_WRITE);
    memcpy(buf, data, size);
-   etna_bo_cpu_fini(*bo);
+   etna_bo_cpu_fini(new_bo);
+
+   /* another context may have uploaded it meanwhile: keep that one */
+   if (p_atomic_cmpxchg(bo, NULL, new_bo) != NULL)
+      etna_bo_del(new_bo);
 
    return true;
 }
@@ -80,6 +88,8 @@ etna_dump_shader(const struct etna_shader_variant *shader)
    etna_disasm(shader->code, shader->code_size, PRINT_RAW);
 
    printf("num temps: %i\n", shader->num_temps);
+   if (shader->dual16)
+      printf("dual16: %u id slots (2 registers each)\n", (unsigned)shader->dual16_inputs);
    printf("immediates:\n");
    for (int idx = 0; idx < shader->uniforms.count; ++idx) {
       printf(" [%i].%c = %f (0x%08x) (%d)\n",
@@ -407,6 +417,18 @@ etna_upload_constant_data(struct etna_context *ctx, struct etna_shader_variant *
 }
 
 bool
+etna_shader_upload_code(struct etna_context *ctx, struct etna_shader_variant *v)
+{
+   return etna_icache_upload_shader(ctx, v);
+}
+
+bool
+etna_shader_upload_constant_data(struct etna_context *ctx, struct etna_shader_variant *v)
+{
+   return etna_upload_constant_data(ctx, v);
+}
+
+bool
 etna_shader_link(struct etna_context *ctx)
 {
    MESA_TRACE_FUNC();
@@ -678,6 +700,68 @@ gather_tex_lod_samplers(const nir_shader *nir, uint16_t *mask)
    }
 }
 
+static uint16_t
+gather_tg4_shadow_samplers(const nir_shader *nir)
+{
+   uint16_t mask = 0;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+
+            const nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+            if (tex->op == nir_texop_tg4 && tex->is_shadow) {
+               assert(tex->sampler_index < 16);
+               mask |= BITFIELD_BIT(tex->sampler_index);
+            }
+         }
+      }
+   }
+
+   return mask;
+}
+
+/* Sample each texture slot with that slot's sampler state: record which
+ * sampler a texture is used with when it isn't its own (OpenCL). A texture
+ * used with two different samplers keeps the first. The texture instruction
+ * addresses the slot by the sampler index, so an op without a sampler
+ * (OpenCL's texel fetches) gets its texture's: rusticl leaves it at 0. */
+static void
+remap_samplers(struct etna_shader *shader)
+{
+   nir_foreach_function_impl(impl, shader->nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            const unsigned t = tex->texture_index, s = tex->sampler_index;
+
+            if (t == s || t >= 32)
+               continue;
+
+            if (!nir_tex_instr_need_sampler(tex)) {
+               tex->sampler_index = t;
+               continue;
+            }
+
+            if (!(shader->sampler_remap & BITFIELD_BIT(t))) {
+               shader->sampler_remap |= BITFIELD_BIT(t);
+               shader->sampler_for_texture[t] = s;
+            } else if (shader->sampler_for_texture[t] != s) {
+               mesa_loge("etnaviv: texture %u used with samplers %u and %u", t,
+                         shader->sampler_for_texture[t], s);
+            }
+            tex->sampler_index = t;
+         }
+      }
+   }
+}
+
 static void *
 etna_create_shader_state(struct pipe_context *pctx,
                          const struct pipe_shader_state *pss)
@@ -705,6 +789,8 @@ etna_create_shader_state(struct pipe_context *pctx,
    if (ctx->mag_switchover_half)
       gather_tex_lod_samplers(shader->nir, &shader->tex_lod_samplers);
 
+   remap_samplers(shader);
+   shader->tg4_shadow_samplers = gather_tg4_shadow_samplers(shader->nir);
    shader->textures_used = shader->nir->info.textures_used[0];
 
    etna_disk_cache_init_shader_key(screen, shader);

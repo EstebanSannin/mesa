@@ -237,6 +237,12 @@ etna_clear_render_target(struct pipe_context *pctx, struct pipe_surface *dst,
 {
    struct etna_context *ctx = etna_context(pctx);
 
+   /* compute-only contexts (OpenCL image fills) have no blitter */
+   if (!ctx->blitter) {
+      util_clear_render_target(pctx, dst, color, dstx, dsty, width, height);
+      return;
+   }
+
    /* XXX could fall back to RS when target area is full screen / resolveable
     * and no TS. */
    etna_blit_save_state(ctx, false);
@@ -250,6 +256,11 @@ etna_clear_depth_stencil(struct pipe_context *pctx, struct pipe_surface *dst,
                          unsigned height, bool render_condition_enabled)
 {
    struct etna_context *ctx = etna_context(pctx);
+
+   if (!ctx->blitter) {
+      util_clear_depth_stencil(pctx, dst, clear_flags, depth, stencil, dstx, dsty, width, height);
+      return;
+   }
 
    /* XXX could fall back to RS when target area is full screen / resolveable
     * and no TS. */
@@ -267,7 +278,11 @@ etna_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
    MESA_TRACE_FUNC();
    struct etna_context *ctx = etna_context(pctx);
 
-   if (src->target != PIPE_BUFFER && dst->target != PIPE_BUFFER &&
+   /* compute-only contexts (OpenCL image copies) have no blitter, and the
+    * texture unit can't read the interleaved 128-bit layout
+    * (etna_resource_create()): copy through CPU maps */
+   if (ctx->blitter && src->target != PIPE_BUFFER && dst->target != PIPE_BUFFER &&
+       !etna_resource(src)->interleaved && !etna_resource(dst)->interleaved &&
        util_blitter_is_copy_supported(ctx->blitter, dst, src)) {
       etna_blit_save_state(ctx, false);
       util_blitter_copy_texture(ctx->blitter, dst, dst_level, dstx, dsty, dstz,
@@ -283,6 +298,12 @@ static void
 etna_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
 {
    MESA_TRACE_FUNC();
+
+   /* A buffer has no render copy and no tile status to resolve: OpenCL
+    * flushes the OpenGL buffers it uses (cl_khr_gl_sharing). */
+   if (prsc->target == PIPE_BUFFER)
+      return;
+
    struct etna_context *ctx = etna_context(pctx);
    struct etna_resource *rsc = etna_resource(prsc);
 

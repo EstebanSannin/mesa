@@ -255,6 +255,11 @@ struct etna_resource {
    /* shared buffer has standard byte order (RGBA for R8G8B8A8_UNORM).
     * false when PE has written BGRA directly to the shared buffer. */
    bool shared_native_order;
+   /* an OpenCL-only 2D texture of a 128-bit format in the interleaved
+    * layout: 16-byte texels, 4x4 tiled or linear, instead of the two 64-bit
+    * planes of the emulated format (see etna_resource_create()). Only the
+    * image instructions read it. */
+   bool interleaved;
 
    struct pipe_box *damage;
    unsigned num_damage;
@@ -365,6 +370,9 @@ etna_buffer_resource(struct pipe_resource *p)
 void
 etna_resource_used(struct etna_context *ctx, struct pipe_resource *prsc,
                    enum etna_resource_status status);
+
+bool
+etna_buffer_is_cached(const struct pipe_resource *prsc);
 
 bool
 etna_buffer_resource_realloc(struct etna_context *ctx,

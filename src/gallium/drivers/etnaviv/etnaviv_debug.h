@@ -45,6 +45,13 @@ enum etna_dbg {
    ETNA_DBG_PERF            = BITFIELD_BIT(7),
    ETNA_DBG_ML_MSGS         = BITFIELD_BIT(8),
 
+   /* OpenCL dual16 mode (half kernels) */
+   ETNA_DBG_NO_DUAL16       = BITFIELD_BIT(9),  /* never compile in dual16 */
+   ETNA_DBG_NO_DUAL16_CF    = BITFIELD_BIT(10), /* dual16 only without control flow */
+
+   /* Not conformant */
+   ETNA_DBG_FAST_FMA        = BITFIELD_BIT(11), /* fma() as an unfused multiply-add */
+
    /* Bypasses */
    ETNA_DBG_NO_TS           = BITFIELD_BIT(12), /* Disable TS */
    ETNA_DBG_NO_AUTODISABLE  = BITFIELD_BIT(13), /* Disable autodisable */

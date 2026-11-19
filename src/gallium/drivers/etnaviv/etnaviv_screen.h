@@ -64,6 +64,9 @@ struct etna_screen {
 
    struct etna_core_info *info;
 
+   /* returned by get_name, which any thread may call */
+   char name[32];
+
    struct etna_specs specs;
 
    uint32_t drm_version;

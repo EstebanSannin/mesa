@@ -35,6 +35,16 @@
 #include "util/log.h"
 #include "util/macros.h"
 
+/* dual16: what a register component holds (dual16_rewrite()) */
+#define ETNA_D16_P 1 /* a half per work-item, packed: work-item 0 in bits 0-15 */
+#define ETNA_D16_W 2 /* a 32-bit value per work-item */
+
+struct etna_d16_inst {
+   uint8_t dst;                /* kind of the result */
+   uint8_t src[ETNA_NUM_SRC];  /* kinds of the register sources (0: not known) */
+   bool from_nir;              /* emitted for an ALU instruction or a store */
+};
+
 struct etna_compile {
    nir_shader *nir;
    nir_function_impl *impl;
@@ -46,9 +56,11 @@ struct etna_compile {
    /* block # to instr index */
    unsigned *block_ptr;
 
-   /* Code generation */
+   /* Code generation: HALTI5 fetches shaders from memory, so the code grows
+    * as needed, up to ETNA_MAX_SHADER_INSTRUCTIONS */
    int inst_ptr; /* current instruction pointer */
-   struct etna_inst code[ETNA_MAX_INSTRUCTIONS * ETNA_INST_SIZE];
+   struct etna_inst *code;
+   unsigned code_alloc;
 
    /* constants */
    uint64_t consts[ETNA_MAX_IMM];
@@ -61,6 +73,17 @@ struct etna_compile {
 
    /* There was an error during compilation */
    bool error;
+
+   /* dual16: per emitted instruction, what its result and register sources
+    * hold, from the registers of the NIR sources of the instruction being
+    * emitted (dual16_record()) */
+   struct etna_d16_inst *d16;
+   uint8_t d16_dst;
+   bool d16_from_nir;
+   unsigned d16_nrec;
+   struct {
+      uint8_t reg, mask, kind;
+   } d16_rec[8];
 };
 
 #define compile_error(ctx, args...) ({ \
@@ -207,6 +230,11 @@ real_def(nir_def *def, unsigned *swiz, unsigned *mask)
    bool can_bypass_src = !nir_def_used_by_if(def);
    nir_instr *p_instr = nir_def_instr(def);
 
+   /* an intrinsic result nobody reads (an atomic's old value) is still
+    * written by the instruction, so it needs its own register */
+   if (nir_def_is_unused(def) && p_instr->type == nir_instr_type_intrinsic)
+      return def;
+
    /* if used by a vecN, the "real" destination becomes the vecN destination
     * lower_alu guarantees that values used by a vecN are only used by that vecN
     * we can apply the same logic to movs in a some cases too
@@ -218,6 +246,21 @@ real_def(nir_def *def, unsigned *swiz, unsigned *mask)
        * note: for alu don't bypass mov for multiple uniform sources
        */
       switch (instr->type) {
+      case nir_instr_type_intrinsic: {
+         /* the coordinate of img_load and img_store takes a swizzle too, of
+          * a register: a mov of an ALU result needs no instruction */
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+         if ((intr->intrinsic == nir_intrinsic_load_image_etna ||
+              intr->intrinsic == nir_intrinsic_store_image_etna) &&
+             use_src == &intr->src[1] && p_instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(p_instr)->op == nir_op_mov &&
+             nir_def_instr_type(nir_instr_as_alu(p_instr)->src[0].src.ssa) == nir_instr_type_alu)
+            break;
+
+         can_bypass_src = false;
+         break;
+      }
       case nir_instr_type_tex:
          if (p_instr->type == nir_instr_type_alu &&
              nir_instr_as_alu(p_instr)->op == nir_op_mov) {
@@ -292,6 +335,10 @@ def_for_instr(nir_instr *instr)
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       if (intr->intrinsic == nir_intrinsic_load_uniform ||
           intr->intrinsic == nir_intrinsic_load_ubo ||
+          intr->intrinsic == nir_intrinsic_load_global_etna ||
+          intr->intrinsic == nir_intrinsic_load_image_etna ||
+          intr->intrinsic == nir_intrinsic_global_atomic_etna ||
+          intr->intrinsic == nir_intrinsic_global_atomic_swap_etna ||
           intr->intrinsic == nir_intrinsic_load_constant ||
           intr->intrinsic == nir_intrinsic_load_input ||
           intr->intrinsic == nir_intrinsic_load_instance_id ||
@@ -404,15 +451,64 @@ static inline int reg_get_base(struct etna_compile *c, int virt_reg)
 struct ra_regs *
 etna_ra_setup(void *mem_ctx);
 
-void
+bool
 etna_ra_assign(struct etna_compile *c, nir_shader *shader);
 
 unsigned
 etna_ra_finish(struct etna_compile *c);
 
+/* verified up to about 65400 instructions (cscap long<n>); 65535 keeps the
+ * instruction count and ICACHE_COUNT within 16 bits */
+#define ETNA_MAX_SHADER_INSTRUCTIONS (65535)
+
+/* the longest dual16 code to emit (dual16_rewrite()): on GC7000UL r6204,
+ * dual16 code hangs the GPU above about 1024 instructions (one launch of
+ * straight-line packed half MADs ran at 1011, hung at 1031); 960 keeps a
+ * margin. Single-mode code has no such limit. */
+#define ETNA_DUAL16_MAX_INSTRUCTIONS 960
+
 static inline void
 emit_inst(struct etna_compile *c, struct etna_inst *inst)
 {
+   if (c->error)
+      return;
+
+   if (c->inst_ptr >= (int)c->code_alloc) {
+      struct etna_inst *code = NULL;
+      unsigned alloc = MIN2(MAX2(c->code_alloc * 2, 1024), ETNA_MAX_SHADER_INSTRUCTIONS);
+
+      if (alloc > c->code_alloc)
+         code = realloc(c->code, alloc * sizeof(*code));
+      if (!code) {
+         mesa_loge("etnaviv: shader longer than %u instructions",
+                   ETNA_MAX_SHADER_INSTRUCTIONS);
+         c->error = true;
+         return;
+      }
+      c->code = code;
+      c->code_alloc = alloc;
+   }
+
+   if (c->d16) {
+      struct etna_d16_inst *d = &c->d16[c->inst_ptr];
+
+      d->dst = c->d16_dst;
+      d->from_nir = c->d16_from_nir;
+      for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+         const struct etna_inst_src *src = &inst->src[s];
+         unsigned mask = 0;
+
+         d->src[s] = 0;
+         if (!src->use || src->rgroup != ISA_REG_GROUP_TEMP)
+            continue;
+         for (unsigned j = 0; j < 4; j++)
+            mask |= 1 << ((src->swiz >> (2 * j)) & 3);
+         for (unsigned r = 0; r < c->d16_nrec; r++) {
+            if (c->d16_rec[r].reg == src->reg && (c->d16_rec[r].mask & mask))
+               d->src[s] |= c->d16_rec[r].kind;
+         }
+      }
+   }
    c->code[c->inst_ptr++] = *inst;
 }
 

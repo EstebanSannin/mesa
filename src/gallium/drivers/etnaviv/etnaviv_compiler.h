@@ -82,6 +82,11 @@ struct etna_shader_variant {
    struct etna_bo *bo; /* cached code memory bo handle (for icache) */
    struct etna_bo *constant_bo; /* uploaded copy of constant_data */
 
+   /* compute: compile in single mode (the dual16 compile failed) */
+   bool dual16_off;
+   /* compute: the state of a dual16 dispatch was printed (compiler_msgs) */
+   bool dual16_shown;
+
    /*
     * Below here is serialized when written to disk cache:
     */
@@ -130,11 +135,44 @@ struct etna_shader_variant {
    /* unknown input property (XX_INPUT_COUNT, field UNK8) */
    uint32_t input_count_unk8;
 
+   /* compute: number of work-item ID registers the thread walker fills */
+   uint32_t cs_input_count;
+
+   /* compute: bytes of shared memory per workgroup (one DDR slice each) */
+   uint32_t cs_shared_size;
+
+   /* compute: barrier() synchronizes the workgroup */
+   bool cs_uses_barrier;
+   /* the code branches back: the cost estimate of a dispatch, see
+    * etna_compute_parts() */
+   bool cs_has_loops;
+
+   /* compute: invocations run by each hardware thread (1, or the fold factor
+    * of etna_nir_fold_workgroup()), and the scratch slots of 16 bytes per
+    * invocation that this needs */
+   uint32_t cs_fold;
+   uint32_t cs_scratch_slots;
+   /* the fold runs the copies in a loop, not unrolled */
+   bool cs_fold_loop;
+   /* OpenCL private memory per invocation, bytes (scratch) */
+   uint32_t cs_private_size;
+   /* a wide compute dispatch (key cs_tex_wide): the fragment slot of each
+    * texture the texture unit reads (0xff: none), and their number, see
+    * remap_tex_slots() */
+   uint8_t cs_tex_slot[32];
+   uint8_t cs_tex_slots;
+
    /* shader is larger than GPU instruction limit, thus needs icache */
    bool needs_icache;
 
    /* shader uses pixel kill/discard */
    bool uses_discard;
+
+   /* compute: two work-items per hardware thread, their halves packed
+    * (SH_CONFIG DUAL16, see dual16_rewrite()), and the id slots the hardware
+    * fills, two registers each */
+   bool dual16;
+   uint8_t dual16_inputs;
 };
 
 struct etna_varying {
@@ -163,6 +201,15 @@ etna_compiler_get_options(struct etna_compiler *compiler);
 
 bool
 etna_compile_shader(struct etna_shader_variant *shader);
+
+/* Invocations x temporaries (counted in pairs) that a compute workgroup with
+ * barrier() may use: it must be resident in full. See fits() in
+ * etnaviv_compiler_nir.c. */
+static inline unsigned
+etna_cs_barrier_capacity(const struct etna_core_info *info)
+{
+   return 480 * info->gpu.shader_core_count;
+}
 
 void
 etna_dump_shader(const struct etna_shader_variant *shader);

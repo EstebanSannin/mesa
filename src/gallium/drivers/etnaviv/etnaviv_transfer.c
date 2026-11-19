@@ -40,6 +40,12 @@
 #include "util/format/u_format.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_inlines.h"
+#include "util/cache_ops.h"
+#include "util/simple_mtx.h"
+
+/* the CPU_PREP and CPU_FINI of a cached buffer's synchronized map, which
+ * threads of a process must not interleave on one BO (etna_buffer_map()) */
+static simple_mtx_t cached_prep_lock = SIMPLE_MTX_INITIALIZER;
 #include "util/u_memory.h"
 #include "util/u_surface.h"
 #include "util/u_transfer.h"
@@ -116,8 +122,26 @@ etna_buffer_map(struct pipe_context *pctx, struct pipe_resource *prsc,
       if (usage & PIPE_MAP_WRITE)
          prep_flags |= DRM_ETNA_PREP_WRITE;
 
-      if (etna_bo_cpu_prep(rsc->bo, prep_flags))
+      /* CPU_PREP doesn't nest, and CTS maps a buffer twice, also from
+       * several threads: for a cached buffer, take its wait and cache
+       * maintenance and end it at once, one thread at a time; the unmap
+       * writes the CPU's data out (etna_buffer_unmap()) */
+      if (etna_buffer_is_cached(prsc)) {
+         simple_mtx_lock(&cached_prep_lock);
+         const int ret = etna_bo_cpu_prep(rsc->bo, prep_flags);
+         if (!ret)
+            etna_bo_cpu_fini(rsc->bo);
+         simple_mtx_unlock(&cached_prep_lock);
+         if (ret)
+            goto free_trans;
+      } else if (etna_bo_cpu_prep(rsc->bo, prep_flags)) {
          goto free_trans;
+      }
+   } else if ((usage & PIPE_MAP_READ) && etna_buffer_is_cached(prsc)) {
+      /* the caller synchronized with the GPU already: drop the CPU's stale
+       * cache lines of the range before it reads. Not with CPU_PREP, which
+       * doesn't nest (rusticl keeps several maps of a buffer). */
+      util_flush_inval_range(trans->mapped + box->x, box->width);
    }
 
    *out_transfer = &trans->base;
@@ -155,8 +179,13 @@ etna_buffer_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
    struct etna_transfer *trans = etna_transfer(ptrans);
    struct etna_context *ctx = etna_context(pctx);
 
-   if (!(ptrans->usage & PIPE_MAP_UNSYNCHRONIZED))
+   if (etna_buffer_is_cached(ptrans->resource)) {
+      /* write the CPU's data out for the GPU */
+      if (ptrans->usage & PIPE_MAP_WRITE)
+         util_flush_range(trans->mapped + ptrans->box.x, ptrans->box.width);
+   } else if (!(ptrans->usage & PIPE_MAP_UNSYNCHRONIZED)) {
       etna_bo_cpu_fini(rsc->bo);
+   }
 
    if ((ptrans->usage & PIPE_MAP_WRITE) &&
        !(ptrans->usage & PIPE_MAP_FLUSH_EXPLICIT))
@@ -277,7 +306,7 @@ etna_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
          /* map buffer object */
          if (rsc->layout == ETNA_LAYOUT_TILED) {
             for (unsigned z = 0; z < ptrans->box.depth; z++) {
-               if (eil_format_is_emulated_128bit(rsc->base.format)) {
+               if (eil_format_is_emulated_128bit(rsc->base.format) && !rsc->interleaved) {
                   etna_texture_tile_rgba32f(
                      trans->mapped + (ptrans->box.z + z) * res_level->layer_stride,
                      trans->staging + z * ptrans->layer_stride,
@@ -554,7 +583,7 @@ etna_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc,
       if (usage & PIPE_MAP_READ) {
          if (rsc->layout == ETNA_LAYOUT_TILED) {
             for (unsigned z = 0; z < ptrans->box.depth; z++) {
-               if (eil_format_is_emulated_128bit(rsc->base.format)) {
+               if (eil_format_is_emulated_128bit(rsc->base.format) && !rsc->interleaved) {
                   etna_texture_untile_rgba32f(trans->staging + z * ptrans->layer_stride,
                                     trans->mapped + (ptrans->box.z + z) * res_level->layer_stride,
                                     ptrans->box.x, ptrans->box.y, res_level->stride,
