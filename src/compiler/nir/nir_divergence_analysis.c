@@ -653,6 +653,12 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
                      (state->options & nir_divergence_across_subgroups);
       break;
 
+   case nir_intrinsic_load_ssbo_address_etna:
+   case nir_intrinsic_load_image_param_etna:
+   case nir_intrinsic_opaque_copy_etna:
+      is_divergent = src_divergent(instr->src[0], state);
+      break;
+
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_ubo_vec4:
    case nir_intrinsic_ldc_nv:
@@ -993,6 +999,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_ssbo_atomic_swap:
    case nir_intrinsic_ssbo_atomic_ir3:
    case nir_intrinsic_ssbo_atomic_swap_ir3:
+   case nir_intrinsic_global_atomic_etna:
+   case nir_intrinsic_global_atomic_swap_etna:
    case nir_intrinsic_image_deref_atomic:
    case nir_intrinsic_image_deref_atomic_swap:
    case nir_intrinsic_image_atomic:
@@ -1149,6 +1157,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_deref_transpose_amd:
    case nir_intrinsic_load_global_tr_amd:
    case nir_intrinsic_trace_ray_intel:
+   case nir_intrinsic_load_image_etna:
       is_divergent = true;
       break;
 

@@ -1104,6 +1104,9 @@ system_value("aa_line_width", 1)
 system_value("scratch_base_ptr", 0, bit_sizes=[32,64], indices=[BASE])
 system_value("constant_base_ptr", 0, bit_sizes=[32,64])
 system_value("shared_base_ptr", 0, bit_sizes=[32,64])
+# etnaviv: bytes of shared memory per workgroup of the dispatch (OpenCL kernels
+# with __local arguments, whose size is set at launch)
+system_value("shared_slice_etna", 1)
 system_value("global_base_ptr", 0, bit_sizes=[32,64])
 # Address and size of a transform feedback buffer, indexed by BASE
 system_value("xfb_address", 1, bit_sizes=[32,64], indices=[BASE])
@@ -1689,9 +1692,35 @@ load("shared_ir3", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 # Etnaviv-specific load/glboal intrinsics. They take a 32-bit base address and
 # a 32-bit offset, which doesn't need to be an immediate.
 # src[] = { value, address, 32-bit offset }.
-store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
+# src_type: the type stored, nir_type_uint8/16 for a narrow store of a 32-bit
+# value (0: 32 bits).
+store("global_etna", [1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET, SRC_TYPE, OFFSET_SHIFT])
 # src[] = { address, 32-bit offset }.
-load("global_etna", [1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+load("global_etna", [1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET, OFFSET_SHIFT, DEST_TYPE], [CAN_ELIMINATE])
+# Atomics on the same address + offset form. src[] = { address, 32-bit offset, data }.
+intrinsic("global_atomic_etna", src_comp=[1, 1, 1], dest_comp=1, indices=[ATOMIC_OP])
+# Compare-and-swap takes the new and the compared value as one vec2.
+# src[] = { address, 32-bit offset, vec2(new value, compared value) }.
+intrinsic("global_atomic_swap_etna", src_comp=[1, 1, 2], dest_comp=1, indices=[ATOMIC_OP])
+# GPU address of a bound SSBO. src[] = { buffer index }.
+intrinsic("load_ssbo_address_etna", src_comp=[1], dest_comp=1, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+# Parameter of a bound image (address, strides, size), selected by BASE.
+# src[] = { image index }.
+intrinsic("load_image_param_etna", src_comp=[1], dest_comp=1, bit_sizes=[32],
+          indices=[BASE], flags=[CAN_ELIMINATE, CAN_REORDER])
+# Hardware image load/store (img_load/img_store) through the descriptor of
+# the image in uniforms; COMPONENT is the plane of a 128-bit format. The
+# coordinate is (x, y), or (x, y, address of the layer) for the 3D form.
+# src[] = { image index, coordinate }.
+intrinsic("load_image_etna", src_comp=[1, 0], dest_comp=4, bit_sizes=[32],
+          indices=[COMPONENT, IMAGE_DIM, IMAGE_ARRAY, FORMAT], flags=[CAN_ELIMINATE])
+# src[] = { image index, coordinate, value }.
+intrinsic("store_image_etna", src_comp=[1, 0, 4],
+          indices=[COMPONENT, IMAGE_DIM, IMAGE_ARRAY, FORMAT])
+# Copy that CSE does not merge (no CAN_REORDER): keeps values derived from
+# it apart from equal values elsewhere. The driver lowers it to its source.
+intrinsic("opaque_copy_etna", src_comp=[0], dest_comp=0, bit_sizes=src0, flags=[CAN_ELIMINATE])
 
 # IR3-specific bindless handle specifier. Similar to vulkan_resource_index, but
 # without the binding because the hardware expects a single flattened index
