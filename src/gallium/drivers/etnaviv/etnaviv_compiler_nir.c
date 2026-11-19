@@ -4137,6 +4137,280 @@ lower_fisfinite(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
  * SELECT.EQ x, x, y is y where x is NaN. So b32csel(ine32(x, 0), a, b) needs
  * no CMP (ieq32 swaps a and b), and neither does b32csel(feq32(x, x), x, y)
  * (fneu32 swaps): fsel_ord_etna(x, y). */
+static uint32_t
+demand_prefix(uint32_t d)
+{
+   return d ? 0xffffffffu >> __builtin_clz(d) : 0;
+}
+
+static uint32_t
+demand_lanes(uint32_t d, unsigned lane_bits)
+{
+   const uint32_t lane = lane_bits == 8 ? 0xffu : 0xffffu;
+   uint32_t m = 0;
+   for (unsigned i = 0; i < 32; i += lane_bits) {
+      if (d & (lane << i))
+         m |= lane << i;
+   }
+   return m;
+}
+
+static bool
+const_shift(nir_alu_instr *alu, unsigned comp, unsigned *k)
+{
+   if (!nir_src_is_const(alu->src[1].src))
+      return false;
+   *k = nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[comp]) & 31;
+   return true;
+}
+
+/* the bits of source src of alu that a need d of result component comp needs */
+static uint32_t
+alu_src_demand(nir_alu_instr *alu, unsigned src, unsigned comp, uint32_t d)
+{
+   if (alu->def.bit_size != 32 || nir_src_bit_size(alu->src[src].src) != 32 ||
+       nir_op_infos[alu->op].output_size || nir_op_infos[alu->op].input_sizes[src])
+      return ~0u;
+
+   unsigned k;
+   switch (alu->op) {
+   case nir_op_mov:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_inot:
+      return d;
+   case nir_op_iadd:
+   case nir_op_isub:
+   case nir_op_ineg:
+   case nir_op_imul:
+   case nir_op_imad:
+      return demand_prefix(d);
+   case nir_op_imul8x4_etna:
+   case nir_op_imad8x4_etna:
+      return demand_lanes(d, 8);
+   case nir_op_imul16x2_etna:
+   case nir_op_imad16x2_etna:
+      return demand_lanes(d, 16);
+   case nir_op_iand:
+      if (nir_src_is_const(alu->src[1 - src].src))
+         return d & nir_src_comp_as_uint(alu->src[1 - src].src, alu->src[1 - src].swizzle[comp]);
+      return d;
+   case nir_op_bcsel:
+      return src ? d : ~0u;
+   case nir_op_ishl:
+      if (src || !const_shift(alu, comp, &k))
+         return ~0u;
+      return d >> k;
+   case nir_op_ushr:
+      if (src || !const_shift(alu, comp, &k))
+         return ~0u;
+      return d << k;
+   case nir_op_ishr:
+      if (src || !const_shift(alu, comp, &k))
+         return ~0u;
+      return (d << k) | ((d & ~(0xffffffffu >> k)) ? 0x80000000u : 0);
+   default:
+      return ~0u;
+   }
+}
+
+struct demand_state {
+   uint32_t *dm; /* 4 per SSA def */
+   bool changed;
+};
+
+static void
+demand_add(struct demand_state *st, nir_def *def, unsigned comp, uint32_t d)
+{
+   if (def->num_components > 4)
+      return;
+   uint32_t *m = &st->dm[def->index * 4 + comp];
+   if ((*m | d) != *m) {
+      *m |= d;
+      st->changed = true;
+   }
+}
+
+static void
+demand_all(struct demand_state *st, nir_src *src)
+{
+   for (unsigned c = 0; c < MIN2(src->ssa->num_components, 4); c++)
+      demand_add(st, src->ssa, c, ~0u);
+}
+
+static bool
+demand_other_src(nir_src *src, void *data)
+{
+   demand_all(data, src);
+   return true;
+}
+
+static uint32_t
+def_demand(struct demand_state *st, nir_def *def, unsigned comp)
+{
+   return def->num_components > 4 ? ~0u : st->dm[def->index * 4 + comp];
+}
+
+static void
+demand_instr(struct demand_state *st, nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (nir_op_is_vec(alu->op)) {
+         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+            demand_add(st, alu->src[i].src.ssa, alu->src[i].swizzle[0],
+                       alu->def.bit_size == 32 ? def_demand(st, &alu->def, i) : ~0u);
+         return;
+      }
+      for (unsigned s = 0; s < nir_op_infos[alu->op].num_inputs; s++) {
+         const unsigned n = nir_ssa_alu_instr_src_components(alu, s);
+         if (nir_op_infos[alu->op].input_sizes[s] || nir_op_infos[alu->op].output_size ||
+             alu->def.num_components > 4) {
+            for (unsigned c = 0; c < n; c++)
+               demand_add(st, alu->src[s].src.ssa, alu->src[s].swizzle[c], ~0u);
+            continue;
+         }
+         for (unsigned c = 0; c < alu->def.num_components; c++)
+            demand_add(st, alu->src[s].src.ssa, alu->src[s].swizzle[c],
+                       alu_src_demand(alu, s, c, def_demand(st, &alu->def, c)));
+      }
+      return;
+   }
+   case nir_instr_type_phi: {
+      nir_phi_instr *phi = nir_instr_as_phi(instr);
+      nir_foreach_phi_src(src, phi) {
+         for (unsigned c = 0; c < phi->def.num_components; c++)
+            demand_add(st, src->src.ssa, c, phi->def.bit_size == 32 ? def_demand(st, &phi->def, c) : ~0u);
+      }
+      return;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_store_global_etna) {
+         const unsigned bits = nir_alu_type_get_type_size(nir_intrinsic_src_type(intr));
+         for (unsigned c = 0; c < intr->src[0].ssa->num_components; c++)
+            demand_add(st, intr->src[0].ssa, c,
+                       bits == 8 ? 0xffu : bits == 16 ? 0xffffu : ~0u);
+         for (unsigned s = 1; s < nir_intrinsic_infos[intr->intrinsic].num_srcs; s++)
+            demand_all(st, &intr->src[s]);
+         return;
+      }
+      nir_foreach_src(instr, demand_other_src, st);
+      return;
+   }
+   default:
+      nir_foreach_src(instr, demand_other_src, st);
+      return;
+   }
+}
+
+/* x where alu is (x << k) >> k (ishl or imul by 2^k, then ishr or ushr) in
+ * every component, and *swiz its swizzle */
+static nir_def *
+shifted_back(nir_alu_instr *alu, unsigned *k_out, unsigned *swiz)
+{
+   if ((alu->op != nir_op_ishr && alu->op != nir_op_ushr) || !nir_src_is_const(alu->src[1].src) ||
+       !nir_def_is_alu(alu->src[0].src.ssa))
+      return NULL;
+   nir_alu_instr *shl = nir_def_as_alu(alu->src[0].src.ssa);
+   if (shl->op != nir_op_ishl && shl->op != nir_op_imul)
+      return NULL;
+
+   int xs = -1;
+   unsigned k = 0;
+   for (unsigned c = 0; c < alu->def.num_components; c++) {
+      const unsigned kc = nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[c]) & 31;
+      const unsigned yc = alu->src[0].swizzle[c];
+      int this_xs = -1;
+      for (unsigned s = 0; s < 2 && this_xs < 0; s++) {
+         if (!nir_src_is_const(shl->src[1 - s].src) || (shl->op == nir_op_ishl && s != 0))
+            continue;
+         const uint32_t v = nir_src_comp_as_uint(shl->src[1 - s].src, shl->src[1 - s].swizzle[yc]);
+         if (shl->op == nir_op_ishl ? (v & 31) == kc : v == (1u << kc))
+            this_xs = s;
+      }
+      if (this_xs < 0 || (xs >= 0 && this_xs != xs) || (c && kc != k) || !kc)
+         return NULL;
+      xs = this_xs;
+      k = kc;
+      swiz[c] = shl->src[xs].swizzle[yc];
+   }
+   *k_out = k;
+   return shl->src[xs].src.ssa;
+}
+
+static bool
+etna_drop_unused_high_bits(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_index_ssa_defs(impl);
+      struct demand_state st = { .dm = calloc(impl->ssa_alloc * 4, sizeof(uint32_t)) };
+      if (!st.dm)
+         continue;
+
+      do {
+         st.changed = false;
+         nir_foreach_block_reverse(block, impl) {
+            nir_if *nif = nir_block_get_following_if(block);
+            if (nif)
+               demand_all(&st, &nif->condition);
+            nir_foreach_instr_reverse(instr, block)
+               demand_instr(&st, instr);
+         }
+      } while (st.changed);
+
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->def.bit_size != 32 || alu->def.num_components > 4)
+               continue;
+
+            nir_def *x = NULL;
+            unsigned swiz[4];
+            if (alu->op == nir_op_iand) {
+               for (unsigned s = 0; s < 2 && !x; s++) {
+                  if (!nir_src_is_const(alu->src[1 - s].src) || nir_src_bit_size(alu->src[s].src) != 32)
+                     continue;
+                  bool covered = true;
+                  for (unsigned c = 0; c < alu->def.num_components; c++) {
+                     const uint32_t mask = nir_src_comp_as_uint(alu->src[1 - s].src, alu->src[1 - s].swizzle[c]);
+                     covered &= !(def_demand(&st, &alu->def, c) & ~mask);
+                     swiz[c] = alu->src[s].swizzle[c];
+                  }
+                  if (covered)
+                     x = alu->src[s].src.ssa;
+               }
+            } else {
+               unsigned k;
+               x = shifted_back(alu, &k, swiz);
+               for (unsigned c = 0; x && c < alu->def.num_components; c++) {
+                  if (def_demand(&st, &alu->def, c) & ~(0xffffffffu >> k))
+                     x = NULL;
+               }
+               if (x && x->bit_size != 32)
+                  x = NULL;
+            }
+            if (!x)
+               continue;
+
+            b.cursor = nir_before_instr(instr);
+            nir_def_replace(&alu->def, nir_swizzle(&b, x, swiz, alu->def.num_components));
+            impl_progress = true;
+         }
+      }
+      free(st.dm);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static bool
 fold_select_test(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
 {
@@ -5093,6 +5367,11 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
       NIR_PASS(_, s, nir_opt_copy_prop);
       NIR_PASS(_, s, nir_opt_dce);
    }
+
+   /* a char or short carried through a loop, masked or sign-extended in
+    * every iteration where only its low lanes are read (lanemask.py) */
+   if (mesa_shader_stage_is_compute(s->info.stage) && !v->dual16)
+      NIR_PASS(_, s, etna_drop_unused_high_bits);
 
    NIR_PASS(_, s, nir_move_vec_src_uses_to_dest, false);
    NIR_PASS(_, s, nir_opt_copy_prop);
