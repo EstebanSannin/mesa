@@ -2357,54 +2357,212 @@ etna_vectorize_mem_cb(unsigned align_mul, unsigned align_offset, unsigned bit_si
    return nir_combined_align(align_mul, align_offset) >= 4;
 }
 
-/* A 16-bit float as a 32-bit one, exactly: a normal half takes the exponent
- * rebiased, a denormal one scales its integer significand (the ALU flushes
- * f32 denormals, so no bit tricks there), inf and NaN keep their payload. */
+/* The sequences below do half precision in fp32, for every input exactly as
+ * the conversions would: fp32 ops round to nearest even and flush fp32
+ * denormals on inputs and results (half denormals are normal fp32 values),
+ * MAD is unfused (every product here is exact, so fusing wouldn't change a
+ * result), integer ops work on the bits. They are vector code: no shift left
+ * by a constant (lower_bitops makes it a scalar IMULLO0), BIT_INSERT instead.
+ * The hardware CONV to and from f16 would replace them where it is exact. */
+
+/* The 32-bit value whose low 16 bits are the 16-bit scalar s, the upper
+ * bits unknown, and the shift that brings them down: through the widening
+ * and narrowing that nir_lower_bit_size() leaves around a vector of 16-bit
+ * values, to the 32-bit value or the half of a 32-bit word that it comes
+ * from. */
+static bool
+low16_source(nir_scalar s, nir_scalar *word, unsigned *shift)
+{
+   s = nir_scalar_chase_movs(s);
+   while (nir_scalar_is_alu(s)) {
+      const nir_op op = nir_scalar_alu_op(s);
+      if (op == nir_op_unpack_32_2x16 || op == nir_op_unpack_32_2x16_split_x ||
+          op == nir_op_unpack_32_2x16_split_y) {
+         *shift = op == nir_op_unpack_32_2x16_split_y || (op == nir_op_unpack_32_2x16 && s.comp) ? 16 : 0;
+         *word = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+         return true;
+      }
+      if (op != nir_op_u2u16 && op != nir_op_i2i16)
+         return false;
+
+      s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+      if (s.def->bit_size != 32)
+         return false;
+      /* u2u16(u2u32(x)) of a 16-bit x: x again */
+      if (!nir_scalar_is_alu(s) ||
+          (nir_scalar_alu_op(s) != nir_op_u2u32 && nir_scalar_alu_op(s) != nir_op_i2i32) ||
+          nir_scalar_chase_alu_src(s, 0).def->bit_size != 16) {
+         *shift = 0;
+         *word = s;
+         return true;
+      }
+      s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+   }
+   return false;
+}
+
+/* 32-bit values whose low 16 bits are the components of a 16-bit value v,
+ * the upper bits unknown (low16_source(), or u2u32 of the component), for
+ * code that reads only the low 16 bits and then needs no mask. */
+static nir_def *
+low16_bits(nir_builder *b, nir_def *v)
+{
+   nir_scalar words[NIR_MAX_VEC_COMPONENTS];
+   nir_const_value shifts[NIR_MAX_VEC_COMPONENTS];
+   bool shifted = false;
+
+   for (unsigned i = 0; i < v->num_components; i++) {
+      unsigned shift = 0;
+      if (!low16_source(nir_get_scalar(v, i), &words[i], &shift))
+         words[i] = nir_get_scalar(nir_u2u32(b, nir_channel(b, v, i)), 0);
+      shifts[i] = nir_const_value_for_uint(shift, 32);
+      shifted |= shift;
+   }
+
+   nir_def *w = nir_vec_scalars(b, words, v->num_components);
+   return shifted ? nir_ushr(b, w, nir_build_imm(b, v->num_components, 32, shifts)) : w;
+}
+
+/* pack_32_2x16 of two 16-bit values (a 16-bit vector store, from
+ * nir_lower_mem_access_bit_sizes()): one BIT_INSERT of the words they come
+ * from, where the lowered pack masks both and shifts the high one with a
+ * scalar IMULLO0 (lower_bitops). halti5, as the compute shaders that have it. */
+static bool
+lower_pack_32_2x16(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_pack_32_2x16)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *w = low16_bits(b, nir_ssa_for_alu_src(b, alu, 0));
+   nir_def_replace(&alu->def, nir_bitfield_insert(b, nir_channel(b, w, 0), nir_channel(b, w, 1),
+                                                  nir_imm_int(b, 16), nir_imm_int(b, 16)));
+   return true;
+}
+
+/* A 16-bit float as a 32-bit one, exactly. 0x70000000 | (h & 0x7fff) << 13
+ * rebiases the half's exponent by 224: infinity and NaN come out as fp32
+ * infinity and NaN with the payload, a finite half as its value times 2^112.
+ * f = that * 2^-112 is a normal half's value; for a denormal half (exponent
+ * 0) it is 2^-15 + m * 2^-25, and g = 2f - 2^-14 is m * 2^-24 exactly, while
+ * g >= f for a normal half. The smaller of f, g and the rebiased bits (all
+ * non-negative: an unsigned min of their bits) is the value, and for infinity
+ * and NaN the rebiased bits themselves. */
 static nir_def *
 half_to_float(nir_builder *b, nir_def *half)
 {
-   nir_def *h = nir_u2u32(b, half);
-   nir_def *sign = nir_ishl_imm(b, nir_iand_imm(b, h, 0x8000), 16);
-   nir_def *em = nir_iand_imm(b, h, 0x7fff);
-   nir_def *normal = nir_iadd_imm(b, nir_ishl_imm(b, em, 13), (127 - 15) << 23);
-   nir_def *denormal = nir_fmul_imm(b, nir_u2f32(b, em), 0x1p-24);
-   nir_def *inf_nan = nir_ior_imm(b, nir_ishl_imm(b, em, 13), 0x7f800000);
-   nir_def *f = nir_bcsel(b, nir_uge_imm(b, em, 0x7c00), inf_nan,
-                          nir_bcsel(b, nir_uge_imm(b, em, 0x400), normal, denormal));
+   nir_def *h = low16_bits(b, half);
+   nir_def *biased = nir_bitfield_insert(b, nir_imm_int(b, 0x70000000), h,
+                                         nir_imm_int(b, 13), nir_imm_int(b, 15));
 
-   return nir_ior(b, f, sign);
+   const unsigned save_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact;
+   nir_def *f = nir_fmul_imm(b, biased, 0x1p-112);
+   nir_def *g = nir_fmad(b, biased, nir_imm_float(b, 0x1p-111f), nir_imm_float(b, -0x1p-14f));
+   b->fp_math_ctrl = save_math_ctrl;
+
+   nir_def *abs = nir_umin(b, nir_umin(b, f, g), biased);
+   return nir_bitfield_insert(b, abs, nir_ushr_imm(b, h, 15), nir_imm_int(b, 31), nir_imm_int(b, 1));
 }
 
 /* An fp32 value rounded to the nearest half, kept in fp32: f2f32(f2f16(x))
- * without the conversions. A normal half keeps 11 significant bits (round to
- * nearest even on the fp32 bits), a denormal one is a multiple of 2^-24 (an
- * fp32 add rounds to nearest even at 0.75, where the ulp is 2^-24); past the
- * largest half it's infinity, and NaN stays NaN. */
+ * without the conversions. With E the exponent of x clamped to [-14, 15],
+ * 2^(E+13) + |x| rounds |x| to a multiple of 2^(E-10), the half's ulp
+ * (2^-24 below 2^-14, where halves are denormal), to nearest even: 2^(E+13)
+ * is an even multiple of it. Subtracting 2^(E+13) again is exact. A result of
+ * 65536 or more (|x| from 65520 up) times 2^112 overflows to infinity, and
+ * the scale back is exact for every half. The sign comes from x, also for a
+ * zero. Infinity stays infinity, NaN stays NaN. */
 static nir_def *
 round_to_half(nir_builder *b, nir_def *x)
 {
+   nir_def *pow2 = nir_umin_imm(b, nir_umax_imm(b, nir_iand_imm(b, x, 0x7f800000), 0x38800000),
+                                0x47000000);
+
    const unsigned save_math_ctrl = b->fp_math_ctrl;
    b->fp_math_ctrl |= nir_fp_exact;
-
-   nir_def *sign = nir_iand_imm(b, x, 0x80000000);
-   nir_def *abs = nir_iand_imm(b, x, 0x7fffffff);
-   nir_def *lsb = nir_iand_imm(b, nir_ushr_imm(b, abs, 13), 1);
-   nir_def *normal = nir_iand_imm(b, nir_iadd(b, nir_iadd_imm(b, abs, 0xfff), lsb), ~0x1fffu);
-   nir_def *denormal = nir_fadd_imm(b, nir_fadd_imm(b, abs, 0.75), -0.75);
-   nir_def *r = nir_bcsel(b, nir_ult_imm(b, abs, 0x38800000), denormal, normal);
-   r = nir_bcsel(b, nir_uge_imm(b, r, 0x47800000), nir_imm_int(b, 0x7f800000), r);
-   r = nir_bcsel(b, nir_uge_imm(b, abs, 0x7f800001), abs, r);
-
+   nir_def *t = nir_fmad(b, pow2, nir_imm_float(b, 8192.0f), nir_fabs(b, x));
+   nir_def *r = nir_fmad(b, pow2, nir_imm_float(b, -8192.0f), t);
+   r = nir_fmul_imm(b, nir_fmul_imm(b, r, 0x1p112), 0x1p-112);
    b->fp_math_ctrl = save_math_ctrl;
-   return nir_ior(b, r, sign);
+
+   return nir_bitfield_insert(b, x, r, nir_imm_int(b, 0), nir_imm_int(b, 31));
+}
+
+/* An fp32 value to half bits, rounded to nearest even (f2f16, f2f16_rtne),
+ * in the low 16 bits. |x| clamped to 65536 (the top of the rounding to half,
+ * from 65520 on), 2^(E+13) + |x| rounds as in round_to_half(): its bits are
+ * those of 2^(E+13) plus k, |x| in units of the half's ulp, 0 to 2048. k plus
+ * (E + 14) << 10 is the half (k = 2048 carries into the exponent, 65536 into
+ * infinity); 2^(E+13) has no bits in the low 16, (E + 14) << 10 is
+ * 2^E's bits >> 13, plus 0x3c00 in the low 16 bits. A NaN gives 0x7e00, as
+ * nir_lower_fp16_casts(). */
+static nir_def *
+float_to_half_rtne(nir_builder *b, nir_def *x)
+{
+   nir_def *abs = nir_iand_imm(b, x, 0x7fffffff);
+   nir_def *a = nir_umin_imm(b, abs, 0x47800000);
+   nir_def *pow2 = nir_umax_imm(b, nir_iand_imm(b, a, 0x7f800000), 0x38800000);
+
+   const unsigned save_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact;
+   nir_def *t = nir_fmad(b, pow2, nir_imm_float(b, 8192.0f), a);
+   b->fp_math_ctrl = save_math_ctrl;
+
+   nir_def *h = nir_iadd(b, t, nir_iadd_imm(b, nir_ushr_imm(b, pow2, 13), 0x3c00));
+   h = nir_bcsel(b, nir_ult(b, nir_imm_int(b, 0x7f800000), abs), nir_imm_int(b, 0x7e00), h);
+   return nir_bitfield_insert(b, nir_ushr_imm(b, x, 16), h, nir_imm_int(b, 0), nir_imm_int(b, 15));
+}
+
+/* Whether a 32-bit float is the value of a half (or NaN) without rounding: a
+ * half converted, a constant that is one, a value rounded to half before
+ * (in rounded), or what moves, neg, abs, sat, min, max and selects make of
+ * those: each returns one of its operands, negated, or 0 or 1. */
+static bool
+is_half_value(nir_scalar s, struct set *rounded, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s)) {
+      const float v = uif(nir_scalar_as_uint(s));
+      return isnan(v) || fui(_mesa_half_to_float(_mesa_float_to_half(v))) == fui(v);
+   }
+
+   if (!nir_scalar_is_alu(s) || !depth)
+      return false;
+   if (_mesa_set_search(rounded, s.def))
+      return true;
+
+   unsigned first = 0;
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_f2f32:
+      return nir_scalar_chase_alu_src(s, 0).def->bit_size == 16;
+   case nir_op_bcsel:
+      first = 1;
+      FALLTHROUGH;
+   case nir_op_fneg:
+   case nir_op_fabs:
+   case nir_op_fsat:
+   case nir_op_fmin:
+   case nir_op_fmax:
+      for (unsigned i = first; i < nir_op_infos[nir_scalar_alu_op(s)].num_inputs; i++) {
+         if (!is_half_value(nir_scalar_chase_alu_src(s, i), rounded, depth - 1))
+            return false;
+      }
+      return true;
+   default:
+      return false;
+   }
 }
 
 /* f2f32(f2f16(x)) of an fp32 x, which nir_lower_bit_size() leaves between two
- * widened half operations: round x to half precision without leaving fp32.
- * The f2f16 stays for other uses (a store), or goes as dead code. */
+ * widened half operations: round x to half precision without leaving fp32,
+ * all components at once, or keep x where it is a half already. The f2f16
+ * stays for other uses (a store), or goes as dead code. */
 static bool
-fold_half_round_trip(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+fold_half_round_trip(nir_builder *b, nir_alu_instr *alu, void *data)
 {
+   struct set *rounded = data;
+
    if (alu->op != nir_op_f2f32 || alu->src[0].src.ssa->bit_size != 16)
       return false;
 
@@ -2417,19 +2575,190 @@ fold_half_round_trip(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
       return false;
 
    b->cursor = nir_before_instr(&alu->instr);
-   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+   unsigned swizzle[NIR_MAX_VEC_COMPONENTS];
+   bool exact = true;
    for (unsigned i = 0; i < alu->def.num_components; i++) {
-      const unsigned c = narrow->src[0].swizzle[alu->src[0].swizzle[i]];
-      comps[i] = round_to_half(b, nir_channel(b, narrow->src[0].src.ssa, c));
+      swizzle[i] = narrow->src[0].swizzle[alu->src[0].swizzle[i]];
+      exact &= is_half_value(nir_get_scalar(narrow->src[0].src.ssa, swizzle[i]), rounded, 8);
    }
 
-   nir_def_replace(&alu->def, nir_vec(b, comps, alu->def.num_components));
+   nir_def *x = nir_swizzle(b, narrow->src[0].src.ssa, swizzle, alu->def.num_components);
+   nir_def *res = exact ? x : round_to_half(b, x);
+   _mesa_set_add(rounded, res);
+   nir_def_replace(&alu->def, res);
+   return true;
+}
+
+static bool
+in_loop(nir_instr *instr, nir_loop *loop)
+{
+   for (nir_cf_node *n = &instr->block->cf_node; n; n = n->parent) {
+      if (n == &loop->cf_node)
+         return true;
+   }
+   return false;
+}
+
+/* A half carried by a phi, a loop's accumulator for example, is after
+ * nir_lower_bit_size() a 32-bit phi of its bits, which the arithmetic
+ * converts to fp32 at every use, and every iteration converts its new value
+ * to half bits. Carry the fp32 value in a phi of its own instead: its sources
+ * are f2f32 of the half sources, and f2f32(f2f16(x)) folds into
+ * round_to_half(x). Uses of the bits after the loop keep the bits phi, but
+ * its sources that are a conversion to half become 0x10000 (no 16-bit
+ * value): there the bits are f2f16 of the fp32 value, which is what the
+ * conversion gave (f2f16 of x rounded to half is f2f16(x), also for a NaN);
+ * a source that wasn't converted (an initial value) keeps its bits. */
+static bool
+carry_half_phi_as_float(nir_builder *b, nir_phi_instr *phi)
+{
+   if (phi->def.bit_size != 32)
+      return false;
+
+   nir_loop *loop = NULL;
+   nir_cf_node *parent = phi->instr.block->cf_node.parent;
+   if (parent->type == nir_cf_node_loop &&
+       nir_loop_first_block(nir_cf_node_as_loop(parent)) == phi->instr.block)
+      loop = nir_cf_node_as_loop(parent);
+
+   /* the uses: u2u16 of the phi (nir_lower_bit_size()), used by f2f32 or,
+    * after the loop, by anything but a phi */
+   nir_alu_instr *narrow[16];
+   unsigned num_narrow = 0;
+   bool any_float = false, any_bits = false;
+   nir_foreach_use_including_if(src, &phi->def) {
+      if (nir_src_is_if(src) || num_narrow == ARRAY_SIZE(narrow))
+         return false;
+      nir_instr *use = nir_src_use_instr(src);
+      if (use->type != nir_instr_type_alu || nir_instr_as_alu(use)->op != nir_op_u2u16)
+         return false;
+      narrow[num_narrow++] = nir_instr_as_alu(use);
+      nir_foreach_use_including_if(usrc, &nir_instr_as_alu(use)->def) {
+         if (nir_src_is_if(usrc))
+            return false;
+         nir_instr *user = nir_src_use_instr(usrc);
+         if (user->type == nir_instr_type_alu && nir_instr_as_alu(user)->op == nir_op_f2f32) {
+            any_float = true;
+            continue;
+         }
+         if (!loop || user->type == nir_instr_type_phi || in_loop(user, loop))
+            return false;
+         any_bits = true;
+      }
+   }
+   if (!any_float)
+      return false;
+
+   /* the sources: u2u32 of a half, or a constant one (nir_lower_bit_size()
+    * folds u2u32 of a constant) */
+   nir_foreach_phi_src(src, phi) {
+      if (nir_src_is_const(src->src)) {
+         for (unsigned i = 0; i < phi->def.num_components; i++) {
+            if (nir_src_comp_as_uint(src->src, i) > 0xffff)
+               return false;
+         }
+      } else if (!nir_def_is_alu(src->src.ssa) || nir_def_as_alu(src->src.ssa)->op != nir_op_u2u32 ||
+                 nir_def_as_alu(src->src.ssa)->src[0].src.ssa->bit_size != 16) {
+         return false;
+      }
+   }
+
+   nir_const_value marker[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < phi->def.num_components; i++)
+      marker[i] = nir_const_value_for_uint(0x10000, 32);
+
+   nir_phi_instr *fphi = nir_phi_instr_create(b->shader);
+   nir_def_init(&fphi->instr, &fphi->def, phi->def.num_components, 32);
+   bool marked = false;
+   nir_foreach_phi_src(src, phi) {
+      b->cursor = nir_after_block_before_jump(src->pred);
+      nir_def *half = nir_src_is_const(src->src) ? nir_u2u16(b, src->src.ssa) :
+                      nir_ssa_for_alu_src(b, nir_def_as_alu(src->src.ssa), 0);
+      nir_phi_instr_add_src(fphi, src->pred, nir_f2f32(b, half));
+      if (any_bits && nir_def_is_alu(half) &&
+          (nir_def_as_alu(half)->op == nir_op_f2f16 || nir_def_as_alu(half)->op == nir_op_f2f16_rtne)) {
+         nir_src_rewrite(&src->src, nir_build_imm(b, phi->def.num_components, 32, marker));
+         marked = true;
+      }
+   }
+   nir_instr_insert_after(&phi->instr, &fphi->instr);
+
+   for (unsigned n = 0; n < num_narrow; n++) {
+      nir_alu_instr *u = narrow[n];
+      nir_foreach_use_safe(usrc, &u->def) {
+         nir_instr *user = nir_src_use_instr(usrc);
+         b->cursor = nir_before_instr(user);
+         if (user->type == nir_instr_type_alu && nir_instr_as_alu(user)->op == nir_op_f2f32) {
+            nir_alu_instr *cvt = nir_instr_as_alu(user);
+            unsigned swizzle[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < cvt->def.num_components; i++)
+               swizzle[i] = u->src[0].swizzle[cvt->src[0].swizzle[i]];
+            nir_def_replace(&cvt->def, nir_swizzle(b, &fphi->def, swizzle, cvt->def.num_components));
+         } else if (marked) {
+            nir_def *bits = nir_bcsel(b, nir_ieq_imm(b, &phi->def, 0x10000),
+                                      nir_u2u32(b, nir_f2f16(b, &fphi->def)), &phi->def);
+            unsigned swizzle[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < u->def.num_components; i++)
+               swizzle[i] = u->src[0].swizzle[i];
+            nir_src_rewrite(usrc, nir_u2u16(b, nir_swizzle(b, bits, swizzle, u->def.num_components)));
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+carry_half_phis_as_float(nir_shader *s)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, s) {
+      nir_builder b = nir_builder_create(impl);
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_phi_safe(phi, block)
+            impl_progress |= carry_half_phi_as_float(&b, phi);
+      }
+      nir_progress(impl_progress, impl, nir_metadata_control_flow);
+      progress |= impl_progress;
+   }
+   return progress;
+}
+
+static bool
+fold_half_round_trips(nir_shader *s)
+{
+   struct set *rounded = _mesa_pointer_set_create(NULL);
+   bool progress = nir_shader_alu_pass(s, fold_half_round_trip, nir_metadata_control_flow, rounded);
+   _mesa_set_destroy(rounded, NULL);
+   return progress;
+}
+
+/* vecN(f2f32(a), f2f32(b), ...) of 16-bit scalars (vload_halfN with 2-byte
+ * aligned loads): f2f32(vecN(a, b, ...)), one vector conversion */
+static bool
+gather_half_conversions(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (!nir_op_is_vec(alu->op) || alu->def.bit_size != 32)
+      return false;
+
+   nir_scalar halves[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < alu->def.num_components; i++) {
+      nir_def *src = alu->src[i].src.ssa;
+      if (!nir_def_is_alu(src) || nir_def_as_alu(src)->op != nir_op_f2f32 ||
+          nir_def_as_alu(src)->src[0].src.ssa->bit_size != 16 || !list_is_singular(&src->uses))
+         return false;
+      halves[i] = nir_scalar_chase_alu_src(nir_get_scalar(src, alu->src[i].swizzle[0]), 0);
+   }
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def_replace(&alu->def, nir_f2f32(b, nir_vec_scalars(b, halves, alu->def.num_components)));
    return true;
 }
 
 /* No 16-bit float ALU: conversions from a half go through its exact 32-bit
- * value, those to a half from integers through a 32-bit float; those from a
- * 32-bit float stay for nir_lower_fp16_casts(). */
+ * value, those to a half from integers through a 32-bit float, and those
+ * rounding to nearest even from a 32-bit float through float_to_half_rtne();
+ * the other rounding modes stay for nir_lower_fp16_casts(). */
 static bool
 lower_fp16_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
 {
@@ -2441,8 +2770,13 @@ lower_fp16_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    const unsigned src_bits = alu->src[0].src.ssa->bit_size;
    const bool from_half = nir_alu_type_get_base_type(src_type) == nir_type_float && src_bits == 16;
    const bool to_half = nir_alu_type_get_base_type(dst_type) == nir_type_float && alu->def.bit_size == 16;
+   const bool rtne = alu->op == nir_op_f2f16_rtne ||
+                     (alu->op == nir_op_f2f16 &&
+                      !(b->shader->info.float_controls_execution_mode & FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16));
+   const bool from_float32 = nir_alu_type_get_base_type(src_type) == nir_type_float && src_bits == 32;
 
-   if (!from_half && !(to_half && nir_alu_type_get_base_type(src_type) != nir_type_float))
+   if (!from_half && !(to_half && nir_alu_type_get_base_type(src_type) != nir_type_float) &&
+       !(to_half && from_float32 && rtne))
       return false;
 
    b->cursor = nir_before_instr(&alu->instr);
@@ -2456,9 +2790,10 @@ lower_fp16_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
                              nir_alu_type_get_base_type(dst_type) | alu->def.bit_size,
                              nir_rounding_mode_undef);
    } else {
-      nir_def *f = nir_type_convert(b, src, nir_alu_type_get_base_type(src_type) | src_bits,
+      nir_def *f = from_float32 ? src :
+                   nir_type_convert(b, src, nir_alu_type_get_base_type(src_type) | src_bits,
                                     nir_type_float32, nir_rounding_mode_undef);
-      res = nir_f2f16_rtne(b, f);
+      res = nir_u2u16(b, float_to_half_rtne(b, f));
    }
 
    nir_def_replace(&alu->def, res);
@@ -3175,10 +3510,13 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       bool narrow = false;
       NIR_PASS(narrow, s, nir_lower_mem_access_bit_sizes, &mem_opts);
       NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
-      NIR_PASS(narrow, s, nir_shader_alu_pass, fold_half_round_trip, nir_metadata_control_flow, NULL);
+      NIR_PASS(narrow, s, carry_half_phis_as_float);
+      NIR_PASS(narrow, s, fold_half_round_trips);
       NIR_PASS(narrow, s, nir_opt_dce);
+      NIR_PASS(narrow, s, nir_shader_alu_pass, gather_half_conversions, nir_metadata_control_flow, NULL);
       NIR_PASS(narrow, s, nir_shader_alu_pass, lower_fp16_conversion, nir_metadata_none, NULL);
       NIR_PASS(narrow, s, nir_lower_fp16_casts, nir_lower_fp16_all);
+      NIR_PASS(narrow, s, nir_shader_alu_pass, lower_pack_32_2x16, nir_metadata_control_flow, NULL);
       NIR_PASS(narrow, s, nir_shader_alu_pass, fold_narrow_conversion,
                nir_metadata_control_flow, NULL);
       if (narrow) {
@@ -3324,7 +3662,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    for (unsigned i = 0; i < 8; i++) {
       bool narrow = false;
       NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
-      NIR_PASS(narrow, s, nir_shader_alu_pass, fold_half_round_trip, nir_metadata_control_flow, NULL);
+      NIR_PASS(narrow, s, carry_half_phis_as_float);
+      NIR_PASS(narrow, s, fold_half_round_trips);
       NIR_PASS(narrow, s, nir_opt_dce);
       NIR_PASS(narrow, s, nir_shader_alu_pass, lower_fp16_conversion, nir_metadata_none, NULL);
       NIR_PASS(narrow, s, nir_lower_fp16_casts, nir_lower_fp16_all);
