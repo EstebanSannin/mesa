@@ -112,6 +112,81 @@ etna_ra_setup(void *mem_ctx)
    return regs;
 }
 
+/* the values the components of an image coordinate come from: the sources
+ * of its vecN or mov, through the movs that lower_alu() put in front of a
+ * vecN; else the coordinate itself */
+static unsigned
+image_coord_roots(nir_def *coord, nir_def **roots)
+{
+   unsigned n = 0;
+
+   if (nir_def_is_alu(coord)) {
+      nir_alu_instr *alu = nir_def_as_alu(coord);
+
+      if (nir_op_is_vec(alu->op) || alu->op == nir_op_mov) {
+         for (unsigned s = 0; s < nir_op_infos[alu->op].num_inputs && n < 4; s++) {
+            nir_def *d = alu->src[s].src.ssa;
+
+            if (nir_def_is_alu(d) && nir_def_as_alu(d)->op == nir_op_mov)
+               d = nir_def_as_alu(d)->src[0].src.ssa;
+            roots[n++] = d;
+         }
+         return n;
+      }
+   }
+   roots[n++] = coord;
+   return n;
+}
+
+/* img_loads whose coordinate shares a component value with the coordinate
+ * of another image access: their results get no register of the coordinate
+ * (see etna_ra_assign()) */
+static struct set *
+shared_coord_loads(nir_function_impl *impl)
+{
+   struct hash_table *count = _mesa_pointer_hash_table_create(NULL);
+   struct set *loads = _mesa_pointer_set_create(NULL);
+
+   for (unsigned pass = 0; pass < 2; pass++) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_image_etna &&
+                intr->intrinsic != nir_intrinsic_store_image_etna)
+               continue;
+
+            nir_def *roots[4];
+            const unsigned n = image_coord_roots(intr->src[1].ssa, roots);
+
+            for (unsigned i = 0; i < n; i++) {
+               bool dup = false;
+               for (unsigned j = 0; j < i; j++)
+                  dup |= roots[j] == roots[i];
+               if (dup)
+                  continue;
+
+               struct hash_entry *e = _mesa_hash_table_search(count, roots[i]);
+               if (pass == 0) {
+                  if (e)
+                     e->data = (void *)((uintptr_t)e->data + 1);
+                  else
+                     _mesa_hash_table_insert(count, roots[i], (void *)(uintptr_t)1);
+               } else if (intr->intrinsic == nir_intrinsic_load_image_etna && e &&
+                          (uintptr_t)e->data > 1) {
+                  _mesa_set_add(loads, intr);
+               }
+            }
+         }
+      }
+   }
+
+   _mesa_hash_table_destroy(count, NULL);
+   return loads;
+}
+
 bool
 etna_ra_assign(struct etna_compile *c, nir_shader *shader)
 {
@@ -181,6 +256,9 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
       ra_set_node_class(g, i, ra_get_class_from_index(regs, comp));
    }
 
+   struct set *shared_loads = shader->info.stage == MESA_SHADER_COMPUTE ?
+                              shared_coord_loads(impl) : NULL;
+
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
@@ -205,6 +283,15 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
             } else {
                ra_set_node_class(g, index, ra_get_class_from_index(regs, REG_CLASS_VEC4));
             }
+         } continue;
+         case nir_intrinsic_load_image_etna: {
+            /* compute: the result of a load whose coordinate shares a
+             * component with another image access never takes the register
+             * of its coordinate, which the next access can then reuse with
+             * the components that don't change (drop_redundant_movs()) */
+            unsigned index = live_map[def_index(impl, def)];
+            if (shared_loads && _mesa_set_search(shared_loads, intr) && defs[index].live_start)
+               defs[index].live_start--;
          } continue;
          case nir_intrinsic_global_atomic_swap_etna: {
             /* atomic_cmp_xchg reads the new and the compared value from .x
@@ -238,6 +325,9 @@ etna_ra_assign(struct etna_compile *c, nir_shader *shader)
          ra_set_node_reg(g, live_map[def_index(impl, def)], reg);
       }
    }
+
+   if (shared_loads)
+      _mesa_set_destroy(shared_loads, NULL);
 
    /* a def nobody reads (an atomic's old value) is still written: keep its
     * register from overlapping values that are live across that instruction */

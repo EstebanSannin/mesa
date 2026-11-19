@@ -4349,6 +4349,115 @@ dual16_rewrite(struct etna_compile *c, struct etna_shader_variant *v, unsigned n
    return true;
 }
 
+/* the value number of component comp of a mov source: a temporary's from
+ * vals, a uniform's or an inline immediate's from its encoding (numbers from
+ * 1 << 30 up, apart from the counter's); 0 for what isn't tracked */
+static uint32_t
+mov_src_value(const struct etna_inst_src *src, unsigned comp, uint32_t (*vals)[4])
+{
+   if (!src->use)
+      return 0;
+   if (src->rgroup == ISA_REG_GROUP_IMMED)
+      return (1u << 30) | (src->imm_type << 20) | src->imm_val;
+   if (src->amode || src->neg || src->abs)
+      return 0;
+
+   const unsigned k = (src->swiz >> (2 * comp)) & 3;
+
+   if (src->rgroup == ISA_REG_GROUP_TEMP)
+      return src->reg < 128 ? vals[src->reg][k] : 0;
+   if (src->rgroup == ISA_REG_GROUP_UNIFORM_0 || src->rgroup == ISA_REG_GROUP_UNIFORM_1)
+      return (1u << 31) | (src->rgroup << 16) | (src->reg << 2) | k;
+   return 0;
+}
+
+/* Drop the plain movs that write values their destination components already
+ * hold (see the value numbers of mov_src_value()), block by block: the vecN of
+ * consecutive image coordinates and values rewrite the components that don't
+ * change. Before the label fixup; block_ptr is remapped. */
+static void
+drop_redundant_movs(struct etna_compile *c, unsigned num_blocks)
+{
+   const unsigned n = c->inst_ptr;
+   uint32_t (*vals)[4] = malloc(128 * sizeof(*vals));
+   unsigned *at = malloc((n + 1) * sizeof(*at));
+   bool *start = calloc(n + 1, sizeof(*start));
+   uint32_t next = 1;
+   unsigned m = 0;
+
+   if (!vals || !at || !start) {
+      free(vals);
+      free(at);
+      free(start);
+      return;
+   }
+
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if (c->block_ptr[b] <= n)
+         start[c->block_ptr[b]] = true;
+   }
+
+   bool forget = true;
+   for (unsigned i = 0; i < n; i++) {
+      const struct etna_inst *in = &c->code[i];
+
+      if (forget || start[i]) {
+         for (unsigned r = 0; r < 128; r++) {
+            for (unsigned k = 0; k < 4; k++)
+               vals[r][k] = next++;
+         }
+         forget = false;
+      }
+      at[i] = m;
+
+      const bool plain_mov = in->opcode == ISA_OPC_MOV && !in->sat && in->dst.use &&
+                             !in->dst.amode && in->dst.reg < 128 && !in->dst_full &&
+                             !in->thread && in->src[0].use && !in->src[1].use &&
+                             !in->src[2].use;
+      uint32_t w[4] = { 0 };
+      bool same = plain_mov;
+
+      if (plain_mov) {
+         for (unsigned k = 0; k < 4; k++) {
+            if (!(in->dst.write_mask & (1 << k)))
+               continue;
+            /* MOV takes its operand in src[0] (the encoding's third slot) */
+            w[k] = mov_src_value(&in->src[0], k, vals);
+            if (!w[k] || w[k] != vals[in->dst.reg][k])
+               same = false;
+         }
+      }
+      if (same)
+         continue;
+
+      c->code[m++] = *in;
+
+      if (in->opcode == ISA_OPC_BRANCH || in->opcode == ISA_OPC_BRANCH_UNARY ||
+          in->opcode == ISA_OPC_BRANCH_BINARY || (in->dst.use && in->dst.amode) ||
+          (in->dst.use && in->dst.reg >= 128)) {
+         forget = true;
+         continue;
+      }
+      if (!in->dst.use)
+         continue;
+      for (unsigned k = 0; k < 4; k++) {
+         if (in->dst.write_mask & (1 << k))
+            vals[in->dst.reg][k] = plain_mov && w[k] ? w[k] : next++;
+      }
+   }
+   at[n] = m;
+
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if (c->block_ptr[b] <= n)
+         c->block_ptr[b] = at[c->block_ptr[b]];
+   }
+   c->inst_ptr = m;
+
+   free(vals);
+   free(at);
+   free(start);
+}
+
 static bool
 compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop);
 
@@ -4708,6 +4817,8 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
 
    unsigned num_consts;
    bool ok = emit_shader(c, &v->num_temps, &num_consts);
+   if (ok && !v->dual16)
+      drop_redundant_movs(c, ARRAY_SIZE(block_ptr));
    if (ok && v->dual16)
       ok = dual16_rewrite(c, v, ARRAY_SIZE(block_ptr));
    if (!ok || num_consts > max_uniforms(v)) {
