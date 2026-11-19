@@ -314,7 +314,8 @@ impl PipeScreen {
         tmpl.height0 = height;
         tmpl.depth0 = depth;
         tmpl.array_size = array_size;
-        tmpl.bind = PIPE_BIND_SAMPLER_VIEW;
+        // OpenCL's own texture: the driver may lay it out for OpenCL only
+        tmpl.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_OPENCL;
 
         if support_image {
             tmpl.bind |= PIPE_BIND_SHADER_IMAGE;
