@@ -1635,6 +1635,26 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
       c->const_count = indirect_max;
    }
 
+   /* stbase.py: the base address of LOAD and STORE can be a uniform, as
+    * NXP's code has it ("store.denorm.ls2 mem.x___, u2.xxxx, ..."): a mov of
+    * a uniform component (a kernel argument in a vec4) is replaced by that
+    * component as a scalar constant, read from its uniform. STOREs keep the
+    * mov in variants folded by unrolling and in shaders that read images:
+    * there the freed register raised the resident threads of a sampling-bound
+    * kernel (climgcap rd_lin 0.73 -> 0.58 GB/s, 0.74 again with
+    * ETNA_CL_MIN_TEMPS=11) or cost OpenCV's GaussianBlur filters about 0.6%
+    * on the board. */
+   bool reads_images = false;
+   nir_foreach_block(block, c->impl) {
+      nir_foreach_instr(instr, block) {
+         reads_images |= instr->type == nir_instr_type_tex ||
+                         (instr->type == nir_instr_type_intrinsic &&
+                          nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_image_etna);
+      }
+   }
+   const bool store_base_uniform = !reads_images &&
+                                   !(c->variant->cs_fold > 1 && !c->variant->cs_fold_loop);
+
    /* add mov for any store output using sysval/const and for depth stores from intrinsics */
    nir_foreach_block(block, c->impl) {
       nir_foreach_instr_safe(instr, block) {
@@ -1678,6 +1698,25 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
              * Canny), so its constants stay in registers */
             const bool store = intr->intrinsic == nir_intrinsic_store_global_etna;
             const bool load = intr->intrinsic == nir_intrinsic_load_global_etna;
+            nir_src *base = load ? &intr->src[0] : store ? &intr->src[1] : NULL;
+
+            if (base && (load || store_base_uniform) && nir_def_is_alu(base->ssa) &&
+                nir_def_as_alu(base->ssa)->op == nir_op_mov && base->ssa->num_components == 1 &&
+                nir_def_instr_type(nir_def_as_alu(base->ssa)->src[0].src.ssa) == nir_instr_type_load_const) {
+               nir_alu_instr *mov = nir_def_as_alu(base->ssa);
+               const nir_load_const_instr *lc =
+                  nir_instr_as_load_const(nir_def_instr(mov->src[0].src.ssa));
+               const nir_const_value value = lc->value[mov->src[0].swizzle[0]];
+
+               /* a uniform slot, not a constant (STORE faults on immediates) */
+               if (lc->def.bit_size == 32 && value.u64 >> 32 != ETNA_UNIFORM_CONSTANT) {
+                  b.cursor = nir_before_instr(instr);
+                  nir_src_rewrite(base, nir_build_imm(&b, 1, 32, &value));
+                  if (nir_def_is_unused(&mov->def))
+                     nir_instr_remove(&mov->instr);
+               }
+            }
+
             nir_src *srcs[] = { store ? &intr->src[2] : &intr->src[1],
                                 store ? &intr->src[0] : load ? NULL : &intr->src[2] };
 
