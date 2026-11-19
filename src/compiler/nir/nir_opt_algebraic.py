@@ -1256,13 +1256,15 @@ for s in [16, 32, 64]:
        # "the conversion doesn't happen at all."
        (('~i2f{}'.format(s), ('f2i', 'a@{}'.format(s))), ('ftrunc', a)),
 
-       # Ironically, mark these as imprecise because removing the conversions may
-       # preserve more precision than doing the conversions (e.g.,
-       # uint(float(0x81818181u)) == 0x81818200).
-       (('~f2i{}'.format(s), ('i2f', 'a@{}'.format(s))), a),
-       (('~f2i{}'.format(s), ('u2f', 'a@{}'.format(s))), a),
-       (('~f2u{}'.format(s), ('i2f', 'a@{}'.format(s))), a),
-       (('~f2u{}'.format(s), ('u2f', 'a@{}'.format(s))), a),
+       # int -> float -> int ==> int, where the float holds the int exactly
+       # (by its type, or by its range: an image coordinate, an id).
+       # Otherwise the conversion to float rounds (OpenCL's
+       # convert_int(convert_float(16777217)) is 16777216), and dropping it
+       # changes the result.
+       (('~f2i{}'.format(s), ('i2f', 'a@{}(int_fits_float)'.format(s))), a),
+       (('~f2i{}'.format(s), ('u2f', 'a@{}(int_fits_float)'.format(s))), a),
+       (('~f2u{}'.format(s), ('i2f', 'a@{}(int_fits_float)'.format(s))), a),
+       (('~f2u{}'.format(s), ('u2f', 'a@{}(int_fits_float)'.format(s))), a),
 
        (('fadd', ('b2f{}'.format(s), ('flt', 0.0, 'a@{}'.format(s))), ('fneg', ('b2f{}'.format(s), ('flt', 'a@{}'.format(s), 0.0)))), ('fsign', a), match_fsign_cond),
        (('iadd', ('b2i{}'.format(s), ('flt', 0, 'a@{}'.format(s))), ('ineg', ('b2i{}'.format(s), ('flt', 'a@{}'.format(s), 0)))), ('f2i{}'.format(s), ('fsign', a)), match_fsign_cond),
