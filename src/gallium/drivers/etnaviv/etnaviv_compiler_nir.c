@@ -3624,6 +3624,49 @@ fold_offset_shift(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    return true;
 }
 
+/* LOAD at base + (index + k), k a constant LOAD takes inline (20-bit integer):
+ * base + index, which CSE shares between the loads that differ only by k
+ * (a vload3 of uchar), with the immediate offset k. STORE keeps its offset in
+ * a register (immediates faulted). */
+static bool
+split_load_offset(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_etna || nir_intrinsic_offset_shift(intr))
+      return false;
+
+   /* not in kernels with barrier() (OpenCV's separable filters, Canny's
+    * stage 1): there the global loads come in a burst that fills shared
+    * memory before the barrier, and without the per-load adds the loads of
+    * neighbouring pixels ran three in a row; GaussianBlur's row filter got
+    * 1.5% slower on the board for 6 instructions less */
+   if (b->shader->info.uses_control_barrier)
+      return false;
+
+   /* an add that only this load reads: the add moves to the base */
+   nir_scalar off = nir_scalar_resolved(intr->src[1].ssa, 0);
+   if (!nir_scalar_is_alu(off) || nir_scalar_alu_op(off) != nir_op_iadd ||
+       !list_is_singular(&off.def->uses) || nir_def_used_by_if(off.def))
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar k = nir_scalar_chase_alu_src(off, i);
+      nir_scalar index = nir_scalar_chase_alu_src(off, 1 - i);
+
+      if (!nir_scalar_is_const(k) || nir_scalar_is_const(index) || index.def->bit_size != 32)
+         continue;
+
+      const int64_t v = nir_scalar_as_int(k);
+      if (v < -0x80000 || v >= 0x80000)
+         continue;
+
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_src_rewrite(&intr->src[0], nir_iadd(b, intr->src[0].ssa, nir_channel(b, index.def, index.comp)));
+      nir_src_rewrite(&intr->src[1], nir_imm_int(b, v));
+      return true;
+   }
+   return false;
+}
+
 /* STORE.u8/u16 writes the low byte or half of its value: a mask of the
  * value that keeps those bits (the widening of an 8- or 16-bit value) is
  * not needed */
@@ -4759,6 +4802,7 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
    bool folded = false;
    NIR_PASS(folded, s, nir_shader_intrinsics_pass, fold_offset_shift, nir_metadata_control_flow, NULL);
    NIR_PASS(folded, s, nir_shader_intrinsics_pass, drop_narrow_store_mask, nir_metadata_control_flow, NULL);
+   NIR_PASS(folded, s, nir_shader_intrinsics_pass, split_load_offset, nir_metadata_control_flow, NULL);
    if (folded)
       NIR_PASS(_, s, nir_opt_dce);
 
