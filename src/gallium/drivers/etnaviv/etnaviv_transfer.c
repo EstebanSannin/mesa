@@ -306,7 +306,7 @@ etna_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
          /* map buffer object */
          if (rsc->layout == ETNA_LAYOUT_TILED) {
             for (unsigned z = 0; z < ptrans->box.depth; z++) {
-               if (eil_format_is_emulated_128bit(rsc->base.format)) {
+               if (eil_format_is_emulated_128bit(rsc->base.format) && !rsc->interleaved) {
                   etna_texture_tile_rgba32f(
                      trans->mapped + (ptrans->box.z + z) * res_level->layer_stride,
                      trans->staging + z * ptrans->layer_stride,
@@ -583,7 +583,7 @@ etna_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc,
       if (usage & PIPE_MAP_READ) {
          if (rsc->layout == ETNA_LAYOUT_TILED) {
             for (unsigned z = 0; z < ptrans->box.depth; z++) {
-               if (eil_format_is_emulated_128bit(rsc->base.format)) {
+               if (eil_format_is_emulated_128bit(rsc->base.format) && !rsc->interleaved) {
                   etna_texture_untile_rgba32f(trans->staging + z * ptrans->layer_stride,
                                     trans->mapped + (ptrans->box.z + z) * res_level->layer_stride,
                                     ptrans->box.x, ptrans->box.y, res_level->stride,

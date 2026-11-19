@@ -105,6 +105,10 @@ etna_resource_is_render_compatible(struct pipe_screen *pscreen,
    if (rsc->base.format == PIPE_FORMAT_NONE)
       return false;
 
+   /* the PE renders 128-bit formats as two planes */
+   if (rsc->interleaved)
+      return false;
+
    if (etna_resource_needs_rb_swap(screen, rsc))
       return false;
 
@@ -341,7 +345,8 @@ setup_miptree(struct etna_resource *rsc, unsigned paddingX, unsigned paddingY,
               unsigned msaa_xscale, unsigned msaa_yscale)
 {
    struct pipe_resource *prsc = &rsc->base;
-   enum pipe_format fmt = eil_format_emulated(prsc->format);
+   /* the interleaved layout has the 16-byte texels of the format itself */
+   enum pipe_format fmt = rsc->interleaved ? prsc->format : eil_format_emulated(prsc->format);
    unsigned level, size = 0;
    unsigned width = prsc->width0;
    unsigned height = prsc->height0;
@@ -360,7 +365,7 @@ setup_miptree(struct etna_resource *rsc, unsigned paddingX, unsigned paddingY,
       mip->layer_stride = mip->stride * util_format_get_nblocksy(fmt, mip->padded_height);
       mip->size = prsc->array_size * mip->layer_stride;
 
-      if (eil_format_is_emulated_128bit(prsc->format))
+      if (eil_format_is_emulated_128bit(prsc->format) && !rsc->interleaved)
          mip->size *= 2;
 
       /* align levels to 64 bytes to be able to render to them */
@@ -555,7 +560,7 @@ etna_resource_border_tail(const struct etna_resource *rsc)
 static struct pipe_resource *
 etna_resource_alloc_layout(struct pipe_screen *pscreen, unsigned layout,
                            uint64_t modifier, const struct pipe_resource *templat,
-                           bool border_shadow)
+                           bool border_shadow, bool interleaved)
 {
    struct etna_screen *screen = etna_screen(pscreen);
    struct etna_resource *rsc;
@@ -592,12 +597,14 @@ etna_resource_alloc_layout(struct pipe_screen *pscreen, unsigned layout,
    rsc->modifier = modifier;
    rsc->halign = halign;
    rsc->explicit_flush = true;
+   rsc->interleaved = interleaved;
 
    pipe_reference_init(&rsc->base.reference, 1);
 
    size = setup_miptree(rsc, paddingX, paddingY, msaa_xscale, msaa_yscale);
 
-   if (!(templat->bind & PIPE_BIND_SCANOUT) || !screen->ro)
+   /* the texture unit never reads the interleaved layout */
+   if ((!(templat->bind & PIPE_BIND_SCANOUT) || !screen->ro) && !interleaved)
       rsc->border_tail = etna_resource_border_tail(rsc);
 
    if (border_shadow)
@@ -677,7 +684,7 @@ struct pipe_resource *
 etna_resource_alloc(struct pipe_screen *pscreen, unsigned layout,
                     uint64_t modifier, const struct pipe_resource *templat)
 {
-   return etna_resource_alloc_layout(pscreen, layout, modifier, templat, false);
+   return etna_resource_alloc_layout(pscreen, layout, modifier, templat, false, false);
 }
 
 struct etna_resource *
@@ -692,9 +699,47 @@ etna_resource_alloc_border_shadow(struct pipe_context *pctx,
    templat.bind &= ~(PIPE_BIND_SCANOUT | PIPE_BIND_SHARED);
    res->border = etna_resource_alloc_layout(pctx->screen, res->layout,
                                             DRM_FORMAT_MOD_LINEAR, &templat,
-                                            true);
+                                            true, false);
 
    return res->border ? etna_resource(res->border) : NULL;
+}
+
+/* OpenCL's own 2D textures of 128-bit formats get the interleaved layout:
+ * 16-byte texels in 4x4 tiles, no planes and no tile status. rusticl creates
+ * its textures with PIPE_BIND_OPENCL, which OpenGL textures that OpenCL
+ * imports (cl_khr_gl_sharing) don't have. img_load and img_store take a texel
+ * whole, one access instead of two 64-bit ones to the planes, which lie half a
+ * level apart. On GC7000 r6204, 2048x2048 RGBA float: reads 6.19 GB/s (3.45
+ * from the planes), writes 4.54 (3.48). Linear 16-byte texels read at 4.4 but
+ * write at only 3.0: the tiles keep a work-item's rows of four texels
+ * together. A linear request (CL_MEM_ALLOC_HOST_PTR, mapped persistently)
+ * gets linear 16-byte texels.
+ *
+ * The texture unit reads 128-bit formats only as two planes, so it never
+ * gets these textures: the shader reads them with img_load in any texture
+ * slot, and does every OpenCL sampler mode itself (lower_tex2d_il()). CPU
+ * transfers map them as they are; copies and fills (compute-only contexts
+ * have no blitter) go through those, and the RS and the BLT leave them
+ * alone. 1D, array, 3D and mipmapped textures keep the planes. */
+static bool
+etna_resource_wants_interleaved(const struct pipe_screen *pscreen,
+                                const struct pipe_resource *templat)
+{
+   switch (templat->format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+      break;
+   default:
+      return false;
+   }
+
+   return pscreen->caps.compute && (templat->bind & PIPE_BIND_OPENCL) &&
+          !(templat->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL |
+                             PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT |
+                             PIPE_BIND_SHARED)) &&
+          templat->target == PIPE_TEXTURE_2D && templat->last_level == 0 &&
+          templat->array_size == 1 && templat->depth0 == 1 && templat->nr_samples <= 1;
 }
 
 static struct pipe_resource *
@@ -706,6 +751,12 @@ etna_resource_create(struct pipe_screen *pscreen,
 
    if (templat->target == PIPE_BUFFER)
       return etna_buffer_resource_alloc(pscreen, templat);
+
+   if (etna_resource_wants_interleaved(pscreen, templat))
+      return etna_resource_alloc_layout(pscreen,
+                                        (templat->bind & PIPE_BIND_LINEAR) ? ETNA_LAYOUT_LINEAR
+                                                                           : ETNA_LAYOUT_TILED,
+                                        DRM_FORMAT_MOD_LINEAR, templat, false, true);
 
    /* At this point we don't know if the resource will be used as a texture,
     * render target, or both, because gallium sets the bits whenever possible
@@ -1151,6 +1202,11 @@ etna_texture_resource_get_handle(struct pipe_screen *pscreen,
    struct renderonly_scanout *scanout;
    struct etna_resource_level *lvl;
    struct etna_bo *bo;
+
+   /* the interleaved layout is OpenCL's own (etna_resource_create()): an
+    * importer would read the two planes of the emulated format */
+   if (rsc->interleaved)
+      return false;
 
    if (handle->plane && !wants_ts) {
       struct pipe_resource *cur = prsc;

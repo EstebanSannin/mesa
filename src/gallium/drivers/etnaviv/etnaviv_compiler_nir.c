@@ -791,7 +791,12 @@ emit_image(struct etna_compile *c, nir_intrinsic_instr *intr)
                       : (layered ? ISA_OPC_IMG_LOAD_3D : ISA_OPC_IMG_LOAD),
       .type = sint ? ISA_TYPE_S32 : uint ? ISA_TYPE_U32 : ISA_TYPE_F32,
       .pmode = 1,
-      .denorm = sint || uint,
+      /* NXP's img_store.denorm for the interleaved 128-bit layout: a
+       * whole 16-byte texel of a 2D image (planes have a 64-bit format,
+       * buffers the buffer dimension) */
+      .denorm = sint || uint ||
+                (store && !layered && dim == GLSL_SAMPLER_DIM_2D &&
+                 util_format_get_blocksize(format) == 16),
       .sat = store && (sint || uint),
       .src[0] = image_desc_src(c, nir_src_as_uint(intr->src[0]), nir_intrinsic_component(intr)),
       .src[1] = src_swizzle(get_src(c, &intr->src[1]),
@@ -802,10 +807,9 @@ emit_image(struct etna_compile *c, nir_intrinsic_instr *intr)
       inst.dst.write_mask = ISA_WRMASK_XYZW;
       inst.src[2] = get_src(c, &intr->src[2]);
    } else {
-      /* components of the format; 128-bit formats load two per plane,
-       * except from buffers */
-      const unsigned comps = util_format_get_blocksize(format) == 16 && dim != GLSL_SAMPLER_DIM_BUF
-                                ? 2 : util_format_get_nr_components(format);
+      /* components of the format: lower_image_access() gives a plane of a
+       * 128-bit format a format of two 32-bit components */
+      const unsigned comps = util_format_get_nr_components(format);
       unsigned dst_swiz;
 
       inst.dst = ra_def(c, &intr->def, &dst_swiz);
@@ -2084,16 +2088,241 @@ lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shade
    return true;
 }
 
+/* a texel of an OpenCL 2D texture in the interleaved 128-bit layout, image
+ * index: one 16-byte img_load */
+static nir_def *
+il_load(nir_builder *b, nir_def *index, nir_def *x, nir_def *y, nir_alu_type type)
+{
+   nir_def *zero = nir_imm_int(b, 0);
+
+   return nir_image_load(b, 4, 32, index, nir_vec4(b, x, y, zero, zero), zero, zero,
+                         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+                         .format = PIPE_FORMAT_NONE, .access = ACCESS_NON_WRITEABLE,
+                         .dest_type = type);
+}
+
+/* the sampler of an OpenCL texture in the interleaved layout, from the key */
+struct il_sampler {
+   bool normalized, linear, border, repeat, mirror;
+};
+
+/* The integer x of channel c of a sample coordinate that is i2f32(x), or
+ * i2f32(x) + 0.5: vtn moves the integer coordinates of a sampled read
+ * (read_image*(image, sampler, int2)) to the texel centre. floor() of that
+ * is x, for any x of an image. NULL for other coordinates. */
+static nir_def *
+il_int_coord(nir_builder *b, nir_def *coord, unsigned c)
+{
+   nir_scalar f = nir_scalar_resolved(coord, c);
+
+   if (nir_scalar_is_alu(f) && nir_scalar_alu_op(f) == nir_op_fadd) {
+      for (unsigned k = 0; k < 2; k++) {
+         nir_scalar h = nir_scalar_chase_alu_src(f, 1 - k);
+
+         if (nir_scalar_is_const(h) && nir_scalar_as_float(h) == 0.5) {
+            f = nir_scalar_chase_alu_src(f, k);
+            break;
+         }
+      }
+   }
+
+   if (nir_scalar_is_alu(f) && nir_scalar_alu_op(f) == nir_op_i2f32 &&
+       nir_scalar_chase_alu_src(f, 0).def->bit_size == 32)
+      return nir_mov_scalar(b, nir_scalar_chase_alu_src(f, 0));
+
+   return NULL;
+}
+
+/* u, the texel position of sample coordinate s on an axis of size n texels:
+ * s * n (normalized), s (unnormalized), (s - floor(s)) * n (repeat),
+ * |s - 2 rint(s / 2)| * n (mirrored repeat). Repeat and mirrored repeat take
+ * normalized coordinates only (OpenCL leaves the others undefined): those
+ * clamp to the edge. Any number of components. */
+static nir_def *
+il_position(nir_builder *b, const struct il_sampler *sm, nir_def *s, nir_def *n)
+{
+   nir_def *nf = nir_i2f32(b, n);
+
+   if (sm->normalized && sm->repeat)
+      return nir_fmul(b, nir_fsub(b, s, nir_ffloor(b, s)), nf);
+
+   if (sm->normalized && sm->mirror) {
+      nir_def *m = nir_fmul_imm(b, nir_fround_even(b, nir_fmul_imm(b, s, 0.5)), 2.0);
+      return nir_fmul(b, nir_fabs(b, nir_fsub(b, s, m)), nf);
+   }
+
+   return sm->normalized ? nir_fmul(b, s, nf) : s;
+}
+
+/* An OpenCL sample of a 2D texture in the interleaved layout, as the OpenCL C
+ * specification computes it ("Image addressing and filtering"):
+ * - Nearest: texel floor(u) (il_position()), back by the size past the last
+ *   texel (repeat). An integer coordinate (read_image*(image, sampler,
+ *   int2), which takes unnormalized nearest samplers) is taken as it is
+ *   (il_int_coord()). One axis at a time, so that the reads of a loop vectorize
+ *   across samples and the work of an axis that doesn't change leaves it.
+ * - Linear: texels i0 = floor(u - 0.5) and i1 = i0 + 1, i0 forward by the size
+ *   before the first texel and i1 back past the last (repeat), weights
+ *   (1 - a)(1 - b), a(1 - b), (1 - a)b and ab with (a, b) = frac(u - 0.5),
+ *   summed in that order, as lower_shader_linear() does. Both axes and both
+ *   texels of each at once, a vec4 (x0, y0, x1, y1), whose channels the four
+ *   loads take as their coordinates.
+ * - With CLK_ADDRESS_CLAMP a texel outside the image reads as the border,
+ *   (0, 0, 0, 0) for the RGBA formats (one unsigned compare: below 0 or past
+ *   the last). Every texel is clamped into the image for the load, from a NaN
+ *   or infinite coordinate too. */
+static nir_def *
+il_sample(nir_builder *b, const struct il_sampler *sm, nir_def *index, nir_def *coord,
+          nir_alu_type type)
+{
+   nir_def *size = nir_image_size(b, 2, 32, index, nir_imm_int(b, 0),
+                                  .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false);
+   const bool repeat = sm->normalized && sm->repeat;
+
+   if (!sm->linear) {
+      nir_def *texel[2], *out = NULL;
+
+      for (unsigned c = 0; c < 2; c++) {
+         nir_def *n = nir_channel(b, size, c);
+         nir_def *last = nir_iadd_imm(b, n, -1);
+         nir_def *x = sm->normalized ? NULL : il_int_coord(b, coord, c);
+
+         if (!x)
+            x = nir_f2i32(b, nir_ffloor(b, il_position(b, sm, nir_channel(b, coord, c), n)));
+         if (repeat)
+            x = nir_bcsel(b, nir_ilt(b, last, x), nir_isub(b, x, n), x);
+         if (sm->border) {
+            nir_def *o = nir_ult(b, last, x);
+            out = out ? nir_ior(b, out, o) : o;
+         }
+         texel[c] = nir_imin(b, nir_imax_imm(b, x, 0), last);
+      }
+
+      nir_def *v = il_load(b, index, texel[0], texel[1], type);
+
+      return out ? nir_bcsel(b, out, nir_imm_zero(b, 4, 32), v) : v;
+   }
+
+   static const unsigned xyxy[4] = { 0, 1, 0, 1 };
+   /* the texels of the taps: (x0, y0), (x1, y0), (x0, y1), (x1, y1) */
+   static const unsigned tap_x[4] = { 0, 2, 0, 2 }, tap_y[4] = { 1, 1, 3, 3 };
+   nir_def *n = nir_swizzle(b, size, xyxy, 4);
+   nir_def *last = nir_iadd_imm(b, n, -1);
+   nir_def *x = nir_fadd_imm(b, il_position(b, sm, nir_swizzle(b, coord, xyxy, 4), n), -0.5);
+   nir_def *x0 = nir_ffloor(b, x);
+   nir_def *a = nir_fsub(b, x, x0);
+   nir_def *i = nir_iadd(b, nir_f2i32(b, x0), nir_imm_ivec4(b, 0, 0, 1, 1));
+
+   if (repeat) {
+      i = nir_bcsel(b, nir_ilt_imm(b, i, 0), nir_iadd(b, i, n), i);
+      i = nir_bcsel(b, nir_ilt(b, last, i), nir_isub(b, i, n), i);
+   }
+
+   nir_def *out = sm->border ? nir_ult(b, last, i) : NULL;
+   i = nir_imin(b, nir_imax_imm(b, i, 0), last);
+
+   /* (1 - a, 1 - b, a, b), then the weight of each tap */
+   nir_def *w = nir_fadd(b, nir_fmul(b, a, nir_imm_vec4(b, -1.0, -1.0, 1.0, 1.0)),
+                         nir_imm_vec4(b, 1.0, 1.0, 0.0, 0.0));
+   nir_def *weight = nir_fmul(b, nir_swizzle(b, w, tap_x, 4), nir_swizzle(b, w, tap_y, 4));
+   nir_def *tap_out = out ? nir_ior(b, nir_swizzle(b, out, tap_x, 4), nir_swizzle(b, out, tap_y, 4))
+                          : NULL;
+   nir_def *v = NULL;
+
+   for (unsigned m = 0; m < 4; m++) {
+      nir_def *tap = il_load(b, index, nir_channel(b, i, tap_x[m]), nir_channel(b, i, tap_y[m]), type);
+
+      if (tap_out)
+         tap = nir_bcsel(b, nir_channel(b, tap_out, m), nir_imm_zero(b, 4, 32), tap);
+
+      tap = nir_fmul(b, tap, nir_channel(b, weight, m));
+      v = v ? nir_fadd(b, v, tap) : tap;
+   }
+
+   return v;
+}
+
+/* An OpenCL 2D texture in the interleaved 128-bit layout (key tex_il), which
+ * the texture unit can't read: every read with the image instructions, as
+ * image 8 + texture, in any texture slot. Size queries read the descriptor,
+ * fetches (read_image*() without a sampler) load the texel, and samples do
+ * the key's sampler in the shader (il_sample()). The texture has one level.
+ * read_imageh() rounds to the nearest half. */
+static bool
+lower_tex2d_il(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
+{
+   const unsigned t = tex->texture_index;
+   const nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+
+   if (tex->op == nir_texop_txs) {
+      b->cursor = nir_before_instr(&tex->instr);
+      nir_def_replace(&tex->def,
+                      nir_image_size(b, tex->def.num_components, 32, nir_imm_int(b, 8 + t),
+                                     nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                                     .image_array = false));
+      return true;
+   }
+
+   bool supported = (tex->op == nir_texop_txf || tex->op == nir_texop_tex ||
+                     tex->op == nir_texop_txl) && !tex->is_shadow && !tex->is_sparse &&
+                    (tex->def.bit_size == 32 || (tex->def.bit_size == 16 && base == nir_type_float));
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type != nir_tex_src_coord && tex->src[i].src_type != nir_tex_src_lod)
+         supported = false;
+   }
+
+   if (!supported) {
+      mesa_loge("etnaviv: texture op %u of the interleaved 128-bit texture %u isn't supported",
+                tex->op, t);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *index = nir_imm_int(b, 8 + t);
+   nir_def *coord = nir_trim_vector(b, nir_get_tex_src(tex, nir_tex_src_coord), 2);
+   const nir_alu_type type = base | 32;
+   nir_def *v;
+
+   if (tex->op == nir_texop_txf) {
+      v = il_load(b, index, nir_channel(b, coord, 0), nir_channel(b, coord, 1), type);
+   } else {
+      const struct il_sampler sm = {
+         .normalized = key->tex_il_normalized & BITFIELD_BIT(t),
+         /* OpenCL filters float reads only */
+         .linear = (key->tex_il_linear & BITFIELD_BIT(t)) && base == nir_type_float,
+         .border = key->tex_il_border & BITFIELD_BIT(t),
+         .repeat = key->tex_il_repeat & BITFIELD_BIT(t),
+         .mirror = key->tex_il_mirror & BITFIELD_BIT(t),
+      };
+
+      v = il_sample(b, &sm, index, coord, type);
+   }
+
+   if (tex->def.bit_size == 16)
+      v = nir_f2f16_rtne(b, v);
+
+   nir_def_replace(&tex->def, nir_trim_vector(b, v, tex->def.num_components));
+   return true;
+}
+
 /* OpenCL 1D image buffers that are read only come as buffer textures, which
  * the texture unit can't sample, and OpenCL 2D textures are read
  * faster by the image instructions (lower_tex2d_to_image()): read them with
- * those, as images 8 + texture index (see etna_uniform_image()). */
+ * those, as images 8 + texture index (see etna_uniform_image()). 2D textures
+ * in the interleaved 128-bit layout are read that way in any slot, every
+ * read (lower_tex2d_il()). */
 static bool
 lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
 {
    const struct etna_shader_key *key = data;
    /* textures 0-7, or all in a wide dispatch (images 8-39) */
    const unsigned max = key->cs_tex_wide ? 32 : 8;
+
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < 32 &&
+       (key->tex_il & BITFIELD_BIT(tex->texture_index)))
+      return lower_tex2d_il(b, tex, key);
 
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < max &&
        (key->tex_img_read & BITFIELD_BIT(tex->texture_index)))
@@ -2184,11 +2413,28 @@ key_img_bit(const struct etna_shader_key *key, nir_src index, bool comp1)
    return i - 8 < 32 && ((comp1 ? key->tex_img_1comp : key->tex_img_128bit) & BITFIELD_BIT(i - 8));
 }
 
+/* Is image index (as key_img_bit()) a 2D image in the interleaved 128-bit
+ * layout (OpenCL), whose 16-byte texels img_load and img_store take whole? */
+static bool
+key_il_bit(const struct etna_shader_key *key, nir_src index)
+{
+   if (!nir_src_is_const(index))
+      return false;
+
+   const unsigned i = nir_src_as_uint(index);
+
+   if (i < 8)
+      return key->img_il & BITFIELD_BIT(i);
+
+   return i - 8 < 32 && (key->tex_il & BITFIELD_BIT(i - 8));
+}
+
 /* Images are linear or 4x4 tiled (see etna_resource_create()). Loads and
  * stores use img_load/img_store, which address and convert texels through
  * the image descriptor. 128-bit formats are two stacked planes of 64-bit
  * texels (xy, then zw), see etna_resource_level_second_plane_offset(),
- * except in buffers, which hold them as 16-byte texels.
+ * except in buffers and in the interleaved layout of OpenCL 2D images (key
+ * img_il, tex_il), which hold them as 16-byte texels.
  * Atomics (r32ui, r32i) address the texel in the shader and use the atomic
  * instructions: linear base + layer * layer stride + y * stride + x * 4,
  * tiled in tiles of 4x4 texels in rows of stride * 4 bytes. */
@@ -2244,10 +2490,13 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    const enum pipe_format format = nir_intrinsic_format(intr);
    const unsigned bpp = util_format_get_blocksize(format);
+   /* 2D images in the interleaved 128-bit layout (OpenCL) */
+   const bool il = dim == GLSL_SAMPLER_DIM_2D && !array && key_il_bit(key, intr->src[0]);
    /* without a format (OpenCL), the key says which images are 128-bit */
-   const bool is_128bit = bpp == 16 ||
+   const bool is_128bit = il || bpp == 16 ||
                           (format == PIPE_FORMAT_NONE && key_img_bit(key, intr->src[0], false));
-   const bool planes = is_128bit && dim != GLSL_SAMPLER_DIM_BUF;
+   /* two planes, but 16-byte texels in buffers and the interleaved layout */
+   const bool planes = is_128bit && dim != GLSL_SAMPLER_DIM_BUF && !il;
    const unsigned texel_bytes = planes ? 8 : bpp;
    nir_def *coord = intr->src[1].ssa;
 
@@ -2273,6 +2522,13 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       emit_format = stand_in[is_128bit ? 2 : one ? 0 : 1][t];
    }
 
+   /* a plane of a 128-bit format holds two of its 32-bit components, which
+    * is what emit_image() loads */
+   if (planes)
+      emit_format = util_format_is_pure_uint(emit_format) ? PIPE_FORMAT_R32G32_UINT :
+                    util_format_is_pure_sint(emit_format) ? PIPE_FORMAT_R32G32_SINT :
+                                                             PIPE_FORMAT_R32G32_FLOAT;
+
    if (one_row) {
       nir_def *zero = nir_imm_int(b, 0);
       coord = nir_vec4(b, nir_channel(b, coord, 0), zero,
@@ -2293,6 +2549,15 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
             nir_def *layer = nir_iadd(b, base, nir_imul(b, nir_channel(b, coord, 2),
                                                         image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
             hcoord[p] = nir_vec3(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1), layer);
+         } else if (il) {
+            /* channels of one value (the texels of an OpenCL sample): one
+             * swizzle, which the instruction takes without a mov
+             * (real_def()) */
+            nir_scalar x = nir_scalar_resolved(coord, 0), y = nir_scalar_resolved(coord, 1);
+
+            hcoord[p] = x.def == y.def && x.def->bit_size == 32
+                           ? nir_swizzle(b, x.def, (unsigned[]){ x.comp, y.comp }, 2)
+                           : nir_trim_vector(b, coord, 2);
          } else {
             hcoord[p] = nir_trim_vector(b, coord, 2);
          }

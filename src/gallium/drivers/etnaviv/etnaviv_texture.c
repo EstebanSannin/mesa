@@ -311,6 +311,11 @@ etna_texture_handle_incompatible(struct pipe_context *pctx, struct pipe_resource
 {
    struct etna_resource *res = etna_resource(prsc);
 
+   /* the interleaved 128-bit layout is never bound to the texture unit
+    * (etna_compute_swap_textures()): no tiled copy */
+   if (res->interleaved)
+      return res;
+
    if (!etna_resource_sampler_compatible(res)) {
       /* The original resource is not compatible with the sampler.
        * Allocate an appropriately tiled texture. */

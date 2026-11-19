@@ -278,8 +278,11 @@ etna_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
    MESA_TRACE_FUNC();
    struct etna_context *ctx = etna_context(pctx);
 
-   /* compute-only contexts (OpenCL image copies) have no blitter */
+   /* compute-only contexts (OpenCL image copies) have no blitter, and the
+    * texture unit can't read the interleaved 128-bit layout
+    * (etna_resource_create()): copy through CPU maps */
    if (ctx->blitter && src->target != PIPE_BUFFER && dst->target != PIPE_BUFFER &&
+       !etna_resource(src)->interleaved && !etna_resource(dst)->interleaved &&
        util_blitter_is_copy_supported(ctx->blitter, dst, src)) {
       etna_blit_save_state(ctx, false);
       util_blitter_copy_texture(ctx->blitter, dst, dst_level, dstx, dsty, dstz,

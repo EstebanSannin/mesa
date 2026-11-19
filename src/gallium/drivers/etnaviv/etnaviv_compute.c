@@ -262,6 +262,16 @@ etna_compute_view_reads_as_image(const struct pipe_sampler_view *sv)
    return true;
 }
 
+/* An OpenCL 2D texture in the interleaved 128-bit layout (see
+ * etna_resource_create()): the texture unit can't read it, the image
+ * instructions read it in any texture slot, with the sampler in the shader
+ * (lower_tex2d_il()). */
+static bool
+etna_compute_view_is_interleaved(const struct pipe_sampler_view *sv)
+{
+   return sv && sv->texture->target != PIPE_BUFFER && etna_resource(sv->texture)->interleaved;
+}
+
 /* the sampler state compute texture t is read with, NULL for none */
 static void *
 etna_compute_sampler_for(const struct etna_context *ctx, const struct etna_shader *shader,
@@ -272,7 +282,10 @@ etna_compute_sampler_for(const struct etna_context *ctx, const struct etna_shade
 
 /* The key bits of the textures read with img_load (cs_teximg_mask), and of
  * those, the ones whose sampler takes the texel at the coordinates: nearest,
- * unnormalized, clamped to the edge or to OpenCL's border */
+ * unnormalized, clamped to the edge or to OpenCL's border. The textures in
+ * the interleaved 128-bit layout have their whole sampler in the key: an
+ * OpenCL sampler has one addressing mode for every axis, one filter, and the
+ * border color 0 (rusticl's samplers). */
 static void
 etna_compute_key_img_textures(const struct etna_context *ctx, const struct etna_shader *shader,
                               struct etna_shader_key *key)
@@ -282,6 +295,23 @@ etna_compute_key_img_textures(const struct etna_context *ctx, const struct etna_
    key->tex_img_read = ctx->cs_teximg_mask;
    u_foreach_bit(t, ctx->cs_teximg_mask) {
       const struct pipe_sampler_state *ss = etna_compute_sampler_for(ctx, shader, t);
+
+      if (etna_compute_view_is_interleaved(ctx->cs_sampler_view[t])) {
+         key->tex_il |= BITFIELD_BIT(t);
+         if (!ss)
+            continue;
+         if (!ss->unnormalized_coords)
+            key->tex_il_normalized |= BITFIELD_BIT(t);
+         if (ss->min_img_filter == PIPE_TEX_FILTER_LINEAR)
+            key->tex_il_linear |= BITFIELD_BIT(t);
+         if (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER)
+            key->tex_il_border |= BITFIELD_BIT(t);
+         else if (ss->wrap_s == PIPE_TEX_WRAP_REPEAT)
+            key->tex_il_repeat |= BITFIELD_BIT(t);
+         else if (ss->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT)
+            key->tex_il_mirror |= BITFIELD_BIT(t);
+         continue;
+      }
 
       if (!ss || !ss->unnormalized_coords || ss->wrap_s != ss->wrap_t ||
           ss->min_img_filter != PIPE_TEX_FILTER_NEAREST ||
@@ -345,7 +375,7 @@ etna_compute_probe_wide(struct etna_context *ctx, struct etna_shader *shader,
 
       if (sv->target == PIPE_BUFFER) {
          ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
-      } else if (etna_compute_view_reads_as_image(sv)) {
+      } else if (etna_compute_view_is_interleaved(sv) || etna_compute_view_reads_as_image(sv)) {
          ctx->cs_teximg_mask |= BITFIELD_BIT(t);
          ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
       }
@@ -404,9 +434,10 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
          saved->view[i] = NULL;
          pipe_sampler_view_reference(&saved->view[i], ctx->sampler_view[i]);
       }
-      /* the textures the texture unit reads, in their slots */
+      /* the textures the texture unit reads, in their slots: never one in
+       * the interleaved 128-bit layout, which it can't read */
       for (unsigned t = 0; t < PIPE_MAX_SAMPLERS; t++) {
-         if (map[t] == 0xff)
+         if (map[t] == 0xff || etna_compute_view_is_interleaved(ctx->cs_sampler_view[t]))
             continue;
          views[map[t]] = ctx->cs_sampler_view[t];
          samplers[map[t]] = etna_compute_sampler_for(ctx, shader, t);
@@ -447,10 +478,17 @@ etna_compute_swap_textures(struct etna_context *ctx, struct etna_saved_textures 
        * RGBA8 twice as fast. A 128-bit format takes two img_loads, one per
        * plane: 2.5 times as fast as the texture unit's two fetches on images
        * of up to 8 MB, as fast on 64 MB. The views stay bound for the reads
-       * that keep the texture unit (lower_texbuf_to_image()). */
+       * that keep the texture unit (lower_texbuf_to_image()). Textures in the
+       * interleaved 128-bit layout, which the texture unit can't read, are
+       * read with img_load in any slot (a texel in one load), and unbound. */
       ctx->cs_teximg_mask = 0;
-      for (unsigned t = 0; t < MIN2(n, 8); t++) {
-         if (ctx->compute_only && views[t] && etna_compute_view_reads_as_image(views[t])) {
+      for (unsigned t = 0; t < n; t++) {
+         if (etna_compute_view_is_interleaved(views[t])) {
+            ctx->cs_teximg_mask |= BITFIELD_BIT(t);
+            ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
+            views[t] = NULL;
+         } else if (t < 8 && ctx->compute_only && views[t] &&
+                    etna_compute_view_reads_as_image(views[t])) {
             ctx->cs_teximg_mask |= BITFIELD_BIT(t);
             ctx->cs_texbuf_mask |= BITFIELD_BIT(t);
          }
@@ -690,12 +728,16 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          etna_compute_key_img_textures(ctx, shader, &key);
    }
 
-   /* 128-bit images are two planes: access without a format in the shader
-    * (OpenCL) needs to know which */
+   /* 128-bit images are two planes, or 16-byte texels in the interleaved
+    * layout: access without a format in the shader (OpenCL) needs to know
+    * which */
    const struct etna_shader_image_state *bound = &ctx->shader_images[MESA_SHADER_COMPUTE];
    u_foreach_bit(i, bound->enabled_mask) {
       if (util_format_get_blocksize(bound->img[i].format) == 16)
          key.img_128bit |= BITFIELD_BIT(i);
+      if (bound->img[i].resource->target != PIPE_BUFFER &&
+          etna_resource(bound->img[i].resource)->interleaved)
+         key.img_il |= BITFIELD_BIT(i);
       if (util_format_get_nr_components(bound->img[i].format) == 1)
          key.img_1comp |= BITFIELD_BIT(i);
    }

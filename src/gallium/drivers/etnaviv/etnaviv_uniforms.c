@@ -142,7 +142,8 @@ get_sampler_lod(const struct etna_context *ctx, bool frag,
  *   bit 12     set; bits 14-15 number of components (4 as 0)
  *   bits 16-31 swizzle: 4 bits per channel, 0-3 source, 4 zero, 5 one
  * 128-bit formats are two planes of 64-bit texels, each with its own
- * descriptor, except in buffers (whole), which hold them as 16-byte texels.
+ * descriptor, except in buffers and in the interleaved layout of OpenCL 2D
+ * textures (whole), which hold them as 16-byte texels.
  * Returns 0 for formats without a hardware image path. */
 /* Image descriptors 0-7 are the shader images, 8-39 the compute textures
  * 0-31 read with the image instructions: buffers (OpenCL 1D image buffers)
@@ -443,13 +444,15 @@ etna_uniforms_write(const struct etna_context *ctx,
             break;
          }
 
-         /* stride: of a row of texels, also for tiled images */
+         /* stride: of a row of texels, also for tiled images. NXP's driver
+          * writes its interleaved RGBA images with class 0. */
+         const bool write_class0 = rsc->interleaved && (img->access & PIPE_IMAGE_ACCESS_WRITE);
          const uint32_t v[4] = {
             0,
             lev->stride,
             lev->height << 16 | lev->width,
             etna_image_format_word(img->format, rsc->layout, !(img->access & PIPE_IMAGE_ACCESS_WRITE),
-                                   false),
+                                   rsc->interleaved) & ~(write_class0 ? 3u << 4 : 0),
          };
 
          etna_cmd_stream_emit(stream, v[word & 3]);

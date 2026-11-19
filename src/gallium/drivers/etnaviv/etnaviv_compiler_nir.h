@@ -246,6 +246,21 @@ real_def(nir_def *def, unsigned *swiz, unsigned *mask)
        * note: for alu don't bypass mov for multiple uniform sources
        */
       switch (instr->type) {
+      case nir_instr_type_intrinsic: {
+         /* the coordinate of img_load and img_store takes a swizzle too, of
+          * a register: a mov of an ALU result needs no instruction */
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+         if ((intr->intrinsic == nir_intrinsic_load_image_etna ||
+              intr->intrinsic == nir_intrinsic_store_image_etna) &&
+             use_src == &intr->src[1] && p_instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(p_instr)->op == nir_op_mov &&
+             nir_def_instr_type(nir_instr_as_alu(p_instr)->src[0].src.ssa) == nir_instr_type_alu)
+            break;
+
+         can_bypass_src = false;
+         break;
+      }
       case nir_instr_type_tex:
          if (p_instr->type == nir_instr_type_alu &&
              nir_instr_as_alu(p_instr)->op == nir_op_mov) {

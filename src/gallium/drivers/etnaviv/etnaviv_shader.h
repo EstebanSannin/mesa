@@ -117,6 +117,21 @@ struct etna_shader_key
    unsigned cs_single : 1;
    unsigned tex_img_128bit : 32;
    unsigned tex_img_1comp : 32;
+   /* compute-only contexts (OpenCL): 128-bit 2D images and textures in the
+    * interleaved layout (etna_resource_create()), whose 16-byte texels
+    * img_load and img_store take whole: shader images 0-7 (img_il), and
+    * textures (tex_il), which only the image instructions read, in any slot,
+    * as images 8 + texture, with their sampler in the shader
+    * (lower_tex2d_il()): normalized coordinates, linear filtering, and the
+    * addressing mode: clamped to the border, repeated, mirrored, or else
+    * clamped to the edge */
+   unsigned img_il : 8;
+   unsigned tex_il : 32;
+   unsigned tex_il_normalized : 32;
+   unsigned tex_il_linear : 32;
+   unsigned tex_il_border : 32;
+   unsigned tex_il_repeat : 32;
+   unsigned tex_il_mirror : 32;
    /* compute: RGBA16 UNORM textures, sampled as integers and converted, and
     * the textures with a linear sampler that the shader filters
     * (lower_shader_linear) */
@@ -148,6 +163,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
        unlikely(a->tex_unorm8 || b->tex_unorm8 || a->tex_snorm8 || b->tex_snorm8) ||
        unlikely(a->img_128bit || b->img_128bit || a->img_1comp || b->img_1comp) ||
        unlikely(a->tex_img_read || b->tex_img_read) ||
+       unlikely(a->img_il || b->img_il || a->tex_il || b->tex_il) ||
        unlikely(a->cs_tex_wide || b->cs_tex_wide) ||
        unlikely(a->cs_single || b->cs_single) ||
        unlikely(a->tex_unorm16 || b->tex_unorm16) ||
