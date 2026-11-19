@@ -108,6 +108,11 @@ struct etna_shader_key
    unsigned tex_img_sampled : 32;
    unsigned tex_img_border : 32;
    unsigned tex_img_border_a1 : 32;
+   /* of tex_img_read, the textures of one level with an OpenCL sampler but
+    * tex_img_sampled's, whose samples the shader does with that sampler (in
+    * tex_il_*) as for the interleaved layout (lower_tex2d_il()), with the
+    * border alpha 1 of tex_img_border_a1 */
+   unsigned tex_img_sampler : 32;
    /* compute-only contexts (OpenCL): a dispatch of more than 16 textures
     * (etna_compute_probe_wide()), whose textures the texture unit reads take
     * the fragment slots in order (remap_tex_slots()); and the textures 8-31
@@ -124,7 +129,7 @@ struct etna_shader_key
     * as images 8 + texture, with their sampler in the shader
     * (lower_tex2d_il()): normalized coordinates, linear filtering, and the
     * addressing mode: clamped to the border, repeated, mirrored, or else
-    * clamped to the edge */
+    * clamped to the edge; the same for the textures of tex_img_sampler */
    unsigned img_il : 8;
    unsigned tex_il : 32;
    unsigned tex_il_normalized : 32;

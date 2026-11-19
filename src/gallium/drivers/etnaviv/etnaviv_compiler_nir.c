@@ -2012,8 +2012,9 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
  * level 0, and, with a nearest, unnormalized sampler clamped to the edge or
  * to the border (key tex_img_sampled), samples at level 0, whose texel is the
  * floor of the coordinates clamped to the texture; outside it, the border:
- * (0, 0, 0, 0), or (0, 0, 0, 1) for a format without alpha. Other reads keep
- * the texture unit. */
+ * (0, 0, 0, 0), or (0, 0, 0, 1) for a format without alpha. The samples of
+ * textures with the sampler in the key (tex_img_sampler) are
+ * lower_tex2d_il()'s. Other reads keep the texture unit. */
 static bool
 lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
 {
@@ -2101,9 +2102,11 @@ il_load(nir_builder *b, nir_def *index, nir_def *x, nir_def *y, nir_alu_type typ
                          .dest_type = type);
 }
 
-/* the sampler of an OpenCL texture in the interleaved layout, from the key */
+/* the sampler of an OpenCL texture in the interleaved layout, or of another
+ * whose samples the shader does (tex_img_sampler), from the key; border_a1:
+ * the border is (0, 0, 0, 1), for formats without alpha */
 struct il_sampler {
-   bool normalized, linear, border, repeat, mirror;
+   bool normalized, linear, border, repeat, mirror, border_a1;
 };
 
 /* The integer x of channel c of a sample coordinate that is i2f32(x), or
@@ -2168,9 +2171,9 @@ il_position(nir_builder *b, const struct il_sampler *sm, nir_def *s, nir_def *n)
  *   texels of each at once, a vec4 (x0, y0, x1, y1), whose channels the four
  *   loads take as their coordinates.
  * - With CLK_ADDRESS_CLAMP a texel outside the image reads as the border,
- *   (0, 0, 0, 0) for the RGBA formats (one unsigned compare: below 0 or past
- *   the last). Every texel is clamped into the image for the load, from a NaN
- *   or infinite coordinate too. */
+ *   (0, 0, 0, 0), or (0, 0, 0, 1) for formats without alpha (one unsigned
+ *   compare: below 0 or past the last). Every texel is clamped into the image
+ *   for the load, from a NaN or infinite coordinate too. */
 static nir_def *
 il_sample(nir_builder *b, const struct il_sampler *sm, nir_def *index, nir_def *coord,
           nir_alu_type type)
@@ -2178,6 +2181,10 @@ il_sample(nir_builder *b, const struct il_sampler *sm, nir_def *index, nir_def *
    nir_def *size = nir_image_size(b, 2, 32, index, nir_imm_int(b, 0),
                                   .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false);
    const bool repeat = sm->normalized && sm->repeat;
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *one = nir_alu_type_get_base_type(type) == nir_type_float ? nir_imm_float(b, 1.0f)
+                                                                     : nir_imm_int(b, 1);
+   nir_def *border = nir_vec4(b, zero, zero, zero, sm->border_a1 ? one : zero);
 
    if (!sm->linear) {
       nir_def *texel[2], *out = NULL;
@@ -2200,7 +2207,7 @@ il_sample(nir_builder *b, const struct il_sampler *sm, nir_def *index, nir_def *
 
       nir_def *v = il_load(b, index, texel[0], texel[1], type);
 
-      return out ? nir_bcsel(b, out, nir_imm_zero(b, 4, 32), v) : v;
+      return out ? nir_bcsel(b, out, border, v) : v;
    }
 
    static const unsigned xyxy[4] = { 0, 1, 0, 1 };
@@ -2233,7 +2240,7 @@ il_sample(nir_builder *b, const struct il_sampler *sm, nir_def *index, nir_def *
       nir_def *tap = il_load(b, index, nir_channel(b, i, tap_x[m]), nir_channel(b, i, tap_y[m]), type);
 
       if (tap_out)
-         tap = nir_bcsel(b, nir_channel(b, tap_out, m), nir_imm_zero(b, 4, 32), tap);
+         tap = nir_bcsel(b, nir_channel(b, tap_out, m), border, tap);
 
       tap = nir_fmul(b, tap, nir_channel(b, weight, m));
       v = v ? nir_fadd(b, v, tap) : tap;
@@ -2247,7 +2254,9 @@ il_sample(nir_builder *b, const struct il_sampler *sm, nir_def *index, nir_def *
  * image 8 + texture, in any texture slot. Size queries read the descriptor,
  * fetches (read_image*() without a sampler) load the texel, and samples do
  * the key's sampler in the shader (il_sample()). The texture has one level.
- * read_imageh() rounds to the nearest half. */
+ * read_imageh() rounds to the nearest half. The samples of the other textures
+ * read with img_load whose sampler is in the key (tex_img_sampler: one level)
+ * come here too; the texture unit keeps those it can't do. */
 static bool
 lower_tex2d_il(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
 {
@@ -2273,8 +2282,9 @@ lower_tex2d_il(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key 
    }
 
    if (!supported) {
-      mesa_loge("etnaviv: texture op %u of the interleaved 128-bit texture %u isn't supported",
-                tex->op, t);
+      if (key->tex_il & BITFIELD_BIT(t))
+         mesa_loge("etnaviv: texture op %u of the interleaved 128-bit texture %u isn't supported",
+                   tex->op, t);
       return false;
    }
 
@@ -2295,6 +2305,7 @@ lower_tex2d_il(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key 
          .border = key->tex_il_border & BITFIELD_BIT(t),
          .repeat = key->tex_il_repeat & BITFIELD_BIT(t),
          .mirror = key->tex_il_mirror & BITFIELD_BIT(t),
+         .border_a1 = key->tex_img_border_a1 & BITFIELD_BIT(t),
       };
 
       v = il_sample(b, &sm, index, coord, type);
@@ -2312,7 +2323,8 @@ lower_tex2d_il(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key 
  * faster by the image instructions (lower_tex2d_to_image()): read them with
  * those, as images 8 + texture index (see etna_uniform_image()). 2D textures
  * in the interleaved 128-bit layout are read that way in any slot, every
- * read (lower_tex2d_il()). */
+ * read (lower_tex2d_il()), and so are the samples of the textures with the
+ * sampler in the key (tex_img_sampler). */
 static bool
 lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
 {
@@ -2321,7 +2333,9 @@ lower_texbuf_to_image(nir_builder *b, nir_tex_instr *tex, void *data)
    const unsigned max = key->cs_tex_wide ? 32 : 8;
 
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < 32 &&
-       (key->tex_il & BITFIELD_BIT(tex->texture_index)))
+       ((key->tex_il & BITFIELD_BIT(tex->texture_index)) ||
+        ((key->tex_img_sampler & BITFIELD_BIT(tex->texture_index)) &&
+         (tex->op == nir_texop_tex || tex->op == nir_texop_txl))))
       return lower_tex2d_il(b, tex, key);
 
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array && tex->texture_index < max &&
@@ -2427,6 +2441,19 @@ key_il_bit(const struct etna_shader_key *key, nir_src index)
       return key->img_il & BITFIELD_BIT(i);
 
    return i - 8 < 32 && (key->tex_il & BITFIELD_BIT(i - 8));
+}
+
+/* Is image index (as key_img_bit()) a texture with the sampler in the key
+ * (tex_img_sampler), whose loads are the texels of OpenCL samples? */
+static bool
+key_sampler_bit(const struct etna_shader_key *key, nir_src index)
+{
+   if (!nir_src_is_const(index))
+      return false;
+
+   const unsigned i = nir_src_as_uint(index);
+
+   return i >= 8 && i - 8 < 32 && (key->tex_img_sampler & BITFIELD_BIT(i - 8));
 }
 
 /* Images are linear or 4x4 tiled (see etna_resource_create()). Loads and
@@ -2549,10 +2576,10 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
             nir_def *layer = nir_iadd(b, base, nir_imul(b, nir_channel(b, coord, 2),
                                                         image_param(b, index, ETNA_IMAGE_LAYER_STRIDE)));
             hcoord[p] = nir_vec3(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1), layer);
-         } else if (il) {
-            /* channels of one value (the texels of an OpenCL sample): one
-             * swizzle, which the instruction takes without a mov
-             * (real_def()) */
+         } else if (il || key_sampler_bit(key, intr->src[0])) {
+            /* channels of one value (the texels of an OpenCL sample,
+             * il_sample()): one swizzle, which the instruction takes without
+             * a mov (real_def()) */
             nir_scalar x = nir_scalar_resolved(coord, 0), y = nir_scalar_resolved(coord, 1);
 
             hcoord[p] = x.def == y.def && x.def->bit_size == 32

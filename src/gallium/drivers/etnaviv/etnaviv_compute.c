@@ -272,6 +272,43 @@ etna_compute_view_is_interleaved(const struct pipe_sampler_view *sv)
    return sv && sv->texture->target != PIPE_BUFFER && etna_resource(sv->texture)->interleaved;
 }
 
+/* Does the shader do the samples of OpenCL 2D texture sv, read with img_load,
+ * with sampler ss itself (key tex_img_sampler, lower_tex2d_il())? It does for
+ * a view of one level and an OpenCL sampler (rusticl's: one addressing mode
+ * for both axes, one filter, the border color 0), but for the nearest,
+ * unnormalized ones clamped to the edge or to the border, whose texel
+ * lower_tex2d_to_image() takes with less work (tex_img_sampled). img_load
+ * converts 8- and 16-bit normalized texels exactly (etna_image_format_word())
+ * and reads RGBA8 twice as fast as the texture unit, which converts 8-bit
+ * UNORM slightly off and filters with coarse weights: OpenCL's linear samples
+ * there are four nearest taps, each snapped back to the exact value
+ * (lower_shader_linear()), 1282 instructions for a loop of 16 RGBA8 samples
+ * (climgcap), past the 512-instruction cache, against 482 here. */
+static bool
+etna_compute_samples_in_shader(const struct pipe_sampler_view *sv,
+                               const struct pipe_sampler_state *ss)
+{
+   static const union pipe_color_union no_border;
+
+   if (sv->u.tex.first_level != sv->u.tex.last_level || ss->wrap_t != ss->wrap_s ||
+       ss->min_img_filter != ss->mag_img_filter)
+      return false;
+
+   switch (ss->wrap_s) {
+   case PIPE_TEX_WRAP_REPEAT:
+   case PIPE_TEX_WRAP_MIRROR_REPEAT:
+      return true;
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
+      if (memcmp(&ss->border_color, &no_border, sizeof(no_border)))
+         return false;
+      FALLTHROUGH;
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE:
+      return !ss->unnormalized_coords || ss->min_img_filter != PIPE_TEX_FILTER_NEAREST;
+   default:
+      return false;
+   }
+}
+
 /* the sampler state compute texture t is read with, NULL for none */
 static void *
 etna_compute_sampler_for(const struct etna_context *ctx, const struct etna_shader *shader,
@@ -285,7 +322,8 @@ etna_compute_sampler_for(const struct etna_context *ctx, const struct etna_shade
  * unnormalized, clamped to the edge or to OpenCL's border. The textures in
  * the interleaved 128-bit layout have their whole sampler in the key: an
  * OpenCL sampler has one addressing mode for every axis, one filter, and the
- * border color 0 (rusticl's samplers). */
+ * border color 0 (rusticl's samplers). So do the others where the shader can
+ * do their samples (tex_img_sampler, etna_compute_samples_in_shader()). */
 static void
 etna_compute_key_img_textures(const struct etna_context *ctx, const struct etna_shader *shader,
                               struct etna_shader_key *key)
@@ -296,10 +334,20 @@ etna_compute_key_img_textures(const struct etna_context *ctx, const struct etna_
    u_foreach_bit(t, ctx->cs_teximg_mask) {
       const struct pipe_sampler_state *ss = etna_compute_sampler_for(ctx, shader, t);
 
-      if (etna_compute_view_is_interleaved(ctx->cs_sampler_view[t])) {
+      const struct pipe_sampler_view *sv = ctx->cs_sampler_view[t];
+      const bool il = etna_compute_view_is_interleaved(sv);
+
+      if (il)
          key->tex_il |= BITFIELD_BIT(t);
-         if (!ss)
-            continue;
+
+      /* the sampler in the shader: always for the interleaved layout, which
+       * the texture unit can't read */
+      if (ss && (il || etna_compute_samples_in_shader(sv, ss))) {
+         if (!il) {
+            key->tex_img_sampler |= BITFIELD_BIT(t);
+            if (!util_format_has_alpha(sv->format))
+               key->tex_img_border_a1 |= BITFIELD_BIT(t);
+         }
          if (!ss->unnormalized_coords)
             key->tex_il_normalized |= BITFIELD_BIT(t);
          if (ss->min_img_filter == PIPE_TEX_FILTER_LINEAR)
@@ -313,7 +361,7 @@ etna_compute_key_img_textures(const struct etna_context *ctx, const struct etna_
          continue;
       }
 
-      if (!ss || !ss->unnormalized_coords || ss->wrap_s != ss->wrap_t ||
+      if (il || !ss || !ss->unnormalized_coords || ss->wrap_s != ss->wrap_t ||
           ss->min_img_filter != PIPE_TEX_FILTER_NEAREST ||
           ss->mag_img_filter != PIPE_TEX_FILTER_NEAREST)
          continue;
@@ -359,8 +407,8 @@ etna_compute_key_texbuf(const struct etna_context *ctx, struct etna_shader_key *
  * fragment slots in order. The compiler numbers them (remap_tex_slots()), so
  * a first variant, without the slots' state in its key, tells which; the
  * variant of the dispatch has the same. At most 16 textures may need the
- * texture unit: 3D, array, 1D and cube textures, normalized coordinates,
- * filtering, wrapping, formats img_load doesn't read. */
+ * texture unit: 3D, array, 1D and cube textures, mipmapped views, formats
+ * img_load doesn't read. */
 static bool
 etna_compute_probe_wide(struct etna_context *ctx, struct etna_shader *shader,
                         struct etna_shader_key *key, uint8_t *map, unsigned *num_slots)
