@@ -33,6 +33,8 @@
 #include "pipe/p_defines.h"
 #include "util/u_math.h"
 
+#include <string.h>
+
 static unsigned
 get_const_idx(const struct etna_context *ctx, bool frag, unsigned samp_id)
 {
@@ -248,10 +250,15 @@ etna_uniforms_write(const struct etna_context *ctx,
          etna_cmd_stream_emit(stream, val);
          break;
 
-      case ETNA_UNIFORM_UNIFORM:
+      case ETNA_UNIFORM_UNIFORM: {
          assert(cb->user_buffer && val * 4 < cb->buffer_size);
-         etna_cmd_stream_emit(stream, ((uint32_t*) cb->user_buffer)[val]);
+         /* the last word can be partial (OpenCL arguments ending in a char
+          * or a short): read only the bytes the buffer has */
+         uint32_t word = 0;
+         memcpy(&word, (const uint8_t *)cb->user_buffer + val * 4, MIN2(4, cb->buffer_size - val * 4));
+         etna_cmd_stream_emit(stream, word);
          break;
+      }
 
       case ETNA_UNIFORM_TEXRECT_SCALE_X:
       case ETNA_UNIFORM_TEXRECT_SCALE_Y:
