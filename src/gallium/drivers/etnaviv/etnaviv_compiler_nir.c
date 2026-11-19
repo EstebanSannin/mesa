@@ -2730,6 +2730,18 @@ low16_source(nir_scalar s, nir_scalar *word, unsigned *shift)
       s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
       if (s.def->bit_size != 32)
          return false;
+      /* u2u16(iand(x, 0xffff)): x, if nothing else reads the mask
+       * (fold_narrow_conversion() makes u2u32(u2u16(x)) one) */
+      if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iand &&
+          list_is_singular(&s.def->uses)) {
+         for (unsigned i = 0; i < 2; i++) {
+            nir_scalar m = nir_scalar_chase_alu_src(s, i);
+            if (nir_scalar_is_const(m) && (nir_scalar_as_uint(m) & 0xffff) == 0xffff) {
+               s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 1 - i));
+               break;
+            }
+         }
+      }
       /* u2u16(u2u32(x)) of a 16-bit x: x again */
       if (!nir_scalar_is_alu(s) ||
           (nir_scalar_alu_op(s) != nir_op_u2u32 && nir_scalar_alu_op(s) != nir_op_i2i32) ||
@@ -4446,7 +4458,6 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
          NIR_PASS(narrow, s, nir_shader_alu_pass, gather_half_conversions, nir_metadata_control_flow, NULL);
          NIR_PASS(narrow, s, nir_shader_alu_pass, lower_fp16_conversion, nir_metadata_none, NULL);
          NIR_PASS(narrow, s, nir_lower_fp16_casts, nir_lower_fp16_all);
-         NIR_PASS(narrow, s, nir_shader_alu_pass, lower_pack_32_2x16, nir_metadata_control_flow, NULL);
       }
       NIR_PASS(narrow, s, nir_shader_alu_pass, fold_narrow_conversion,
                nir_metadata_control_flow, NULL);
@@ -4549,6 +4560,12 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
       etna_optimize_loop(s);
 
    NIR_PASS(_, s, etna_lower_io, v);
+   /* after the optimization loop: there nir_opt_algebraic drops the sign
+    * extensions of a 16-bit sum or product that only its low 16 bits are
+    * needed of (only_lower_16_bits_used), which a BIT_INSERT user would hide
+    * (nir_def_bits_used() doesn't know bitfield_insert) */
+   if (s->info.stage == MESA_SHADER_COMPUTE && !v->dual16)
+      NIR_PASS(_, s, nir_shader_alu_pass, lower_pack_32_2x16, nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_pack);
    /* lowering byte extracts can leave widen(narrow(x)) behind again */
    NIR_PASS(_, s, nir_shader_alu_pass, fold_narrow_conversion, nir_metadata_control_flow, NULL);
