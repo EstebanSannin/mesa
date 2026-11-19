@@ -1806,6 +1806,69 @@ max_uniforms(const struct etna_shader_variant *v)
 }
 
 static bool
+is_branch_inst(const struct etna_inst *inst)
+{
+   return inst->opcode == ISA_OPC_BRANCH || inst->opcode == ISA_OPC_BRANCH_UNARY ||
+          inst->opcode == ISA_OPC_BRANCH_BINARY;
+}
+
+/* drop instruction p of the code; branch targets are block indices until the
+ * code is assembled, so only the block starts after p move */
+static void
+remove_code_inst(struct etna_compile *c, unsigned num_blocks, int p)
+{
+   memmove(&c->code[p], &c->code[p + 1], (c->inst_ptr - p - 1) * sizeof(c->code[0]));
+   c->inst_ptr--;
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if ((int)c->block_ptr[b] > p)
+         c->block_ptr[b]--;
+   }
+}
+
+/* The end of a loop, "if (c) break;" with nothing after it but the back edge,
+ * is emitted as
+ *    p:   branch.!c -> L          (L = p + 2, the empty else block)
+ *    p+1: branch    -> E          (the break)
+ *    L:   branch    -> H          (the back edge)
+ * With nothing else branching to p + 1 or L, branch on the condition straight
+ * to H and fall through to the break:
+ *    p:   branch.!c -> H
+ *    p+1: branch    -> E          (gone where E follows)
+ * The same control flow, one branch fewer per iteration. */
+static void
+loop_branches(struct etna_compile *c, unsigned num_blocks)
+{
+   for (int p = 0; p + 2 < c->inst_ptr; p++) {
+      const struct etna_inst *a = &c->code[p], *b = &c->code[p + 1], *d = &c->code[p + 2];
+
+      if ((a->opcode != ISA_OPC_BRANCH_UNARY && a->opcode != ISA_OPC_BRANCH_BINARY) ||
+          b->opcode != ISA_OPC_BRANCH || d->opcode != ISA_OPC_BRANCH ||
+          a->imm >= num_blocks || b->imm >= num_blocks || d->imm >= num_blocks ||
+          (int)c->block_ptr[a->imm] != p + 2)
+         continue;
+
+      bool other = false;
+      for (int i = 0; i < c->inst_ptr && !other; i++) {
+         if (i == p || !is_branch_inst(&c->code[i]))
+            continue;
+         if (c->code[i].imm >= num_blocks)
+            other = true;
+         else
+            other = (int)c->block_ptr[c->code[i].imm] == p + 1 ||
+                    (int)c->block_ptr[c->code[i].imm] == p + 2;
+      }
+      if (other)
+         continue;
+
+      const unsigned exit = b->imm;
+      c->code[p].imm = d->imm;
+      remove_code_inst(c, num_blocks, p + 2);
+      if ((int)c->block_ptr[exit] == p + 2)
+         remove_code_inst(c, num_blocks, p + 1);
+   }
+}
+
+static bool
 etna_compile_check_limits(struct etna_shader_variant *v)
 {
    const struct etna_core_info *info = v->shader->info;
@@ -5720,6 +5783,9 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
       drop_redundant_movs(c, ARRAY_SIZE(block_ptr));
    if (ok && v->dual16)
       ok = dual16_rewrite(c, v, ARRAY_SIZE(block_ptr));
+   /* a loop that ends in "if (c) break;" branches back on c (loopclose.py) */
+   if (ok && !v->dual16 && s->info.stage == MESA_SHADER_COMPUTE)
+      loop_branches(c, ARRAY_SIZE(block_ptr));
    if (!ok || num_consts > max_uniforms(v)) {
       ralloc_free(c->nir);
       free(c->code);
