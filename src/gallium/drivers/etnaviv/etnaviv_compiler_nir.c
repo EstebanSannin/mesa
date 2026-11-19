@@ -2135,6 +2135,9 @@ image_type_size_align_1(const struct glsl_type *type, unsigned *size, unsigned *
  * (0, 0, 0, 0), or (0, 0, 0, 1) for a format without alpha. The samples of
  * textures with the sampler in the key (tex_img_sampler) are
  * lower_tex2d_il()'s. Other reads keep the texture unit. */
+static nir_def *
+il_int_coord(nir_builder *b, nir_def *coord, unsigned c);
+
 static bool
 lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shader_key *key)
 {
@@ -2170,15 +2173,12 @@ lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shade
 
    if (tex->op != nir_texop_txf) {
       /* the floor of each coordinate; integer coordinates converted to
-       * float (read_imagef() with int2) are taken as they are */
+       * float (read_imagef() with int2: libclc's float(c) + 0.5, the texel
+       * centre) are taken as they are (il_int_coord()) */
       nir_def *texel[2];
       for (unsigned c = 0; c < 2; c++) {
-         nir_scalar f = nir_scalar_resolved(xy, c);
-
-         if (nir_scalar_is_alu(f) && nir_scalar_alu_op(f) == nir_op_i2f32 &&
-             nir_scalar_chase_alu_src(f, 0).def->bit_size == 32)
-            texel[c] = nir_mov_scalar(b, nir_scalar_chase_alu_src(f, 0));
-         else
+         texel[c] = il_int_coord(b, xy, c);
+         if (!texel[c])
             texel[c] = nir_f2i32(b, nir_ffloor(b, nir_channel(b, xy, c)));
       }
 
