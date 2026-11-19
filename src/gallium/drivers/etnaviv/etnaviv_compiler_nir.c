@@ -664,10 +664,13 @@ emit_alu(struct etna_compile *c, nir_alu_instr * alu)
    }
 
    /* src2 is the packed offset and bit count, not per-component data, so keep
-    * it instead of composing the destination swizzle onto it.
+    * it instead of composing the destination swizzle onto it. Its own swizzle
+    * stays: lower_alu() can merge it with another constant source into one
+    * uniform, with offset and bit count in .yz for example.
     */
    if (alu->op == nir_op_bitfield_insert_etna)
-      srcs[2] = src_swizzle(get_src(c, &alu->src[2].src), SWIZZLE(X, Y, Y, Y));
+      srcs[2] = src_swizzle(src_swizzle(get_src(c, &alu->src[2].src), ALU_SWIZ(&alu->src[2])),
+                            SWIZZLE(X, Y, Y, Y));
 
    etna_emit_alu(c, alu, dst, srcs);
 }
