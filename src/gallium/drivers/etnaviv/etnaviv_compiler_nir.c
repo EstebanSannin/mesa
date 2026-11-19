@@ -5293,7 +5293,12 @@ etna_compile_shader(struct etna_shader_variant *v)
        * by 3: 431 ms unrolled, 459 ms in a loop; Canny's stage1_with_sobel,
        * 438 instructions folded by 8: 810 ms unrolled, 618 ms in a loop,
        * folded by 4). */
-      const bool compiled = compile_shader_spill(v, fold, fold * unfolded_size > 1024);
+      bool compiled = compile_shader_spill(v, fold, fold * unfolded_size > 1024);
+      /* the copies come out larger than F times the unfolded code (each has
+       * its own setup): unrolled code over twice the cache runs in a loop
+       * after all */
+      if (compiled && fold * unfolded_size <= 1024 && v->code_size / 4 > 1024)
+         compiled = compile_shader_spill(v, fold, true);
       if (compiled && fits(v, n))
          return true;
 
