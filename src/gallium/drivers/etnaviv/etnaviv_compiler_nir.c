@@ -3515,6 +3515,69 @@ lower_fisfinite(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+/* SELECT tests its sources itself: SELECT.NZ x, a, b is x != 0 ? a : b, and
+ * SELECT.EQ x, x, y is y where x is NaN. So b32csel(ine32(x, 0), a, b) needs
+ * no CMP (ieq32 swaps a and b), and neither does b32csel(feq32(x, x), x, y)
+ * (fneu32 swaps): fsel_ord_etna(x, y). */
+static bool
+fold_select_test(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_b32csel)
+      return false;
+
+   nir_instr *ci = nir_def_instr(alu->src[0].src.ssa);
+   if (ci->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *cmp = nir_instr_as_alu(ci);
+   const unsigned n = alu->def.num_components;
+
+   if (cmp->op == nir_op_feq32 || cmp->op == nir_op_fneu32) {
+      /* the value selected where x == x must be x itself */
+      const unsigned keep = cmp->op == nir_op_feq32 ? 1 : 2;
+      if (cmp->src[0].src.ssa != cmp->src[1].src.ssa ||
+          cmp->src[0].src.ssa != alu->src[keep].src.ssa || alu->def.bit_size != 32)
+         return false;
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned c = alu->src[0].swizzle[i];
+         if (cmp->src[0].swizzle[c] != alu->src[keep].swizzle[i] ||
+             cmp->src[1].swizzle[c] != alu->src[keep].swizzle[i])
+            return false;
+      }
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def_replace(&alu->def, nir_fsel_ord_etna(b, nir_ssa_for_alu_src(b, alu, keep),
+                                                   nir_ssa_for_alu_src(b, alu, 3 - keep)));
+      return true;
+   }
+
+   if (cmp->op != nir_op_ine32 && cmp->op != nir_op_ieq32)
+      return false;
+
+   int zero = -1;
+   for (unsigned s = 0; s < 2 && zero < 0; s++) {
+      if (!nir_src_is_const(cmp->src[s].src))
+         continue;
+      bool all = true;
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned c = cmp->src[s].swizzle[alu->src[0].swizzle[i]];
+         all = all && nir_src_comp_as_uint(cmp->src[s].src, c) == 0;
+      }
+      if (all)
+         zero = s;
+   }
+   if (zero < 0 || nir_src_bit_size(cmp->src[1 - zero].src) != 32)
+      return false;
+
+   unsigned swiz[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)
+      swiz[i] = alu->src[0].swizzle[i];
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_swizzle(b, nir_ssa_for_alu_src(b, cmp, 1 - zero), swiz, n);
+   nir_def *t = nir_ssa_for_alu_src(b, alu, 1), *f = nir_ssa_for_alu_src(b, alu, 2);
+   nir_def_replace(&alu->def, cmp->op == nir_op_ine32 ? nir_b32csel(b, x, t, f) : nir_b32csel(b, x, f, t));
+   return true;
+}
+
 /* gl_HelperInvocation: no hardware source is known on GC7000 (the internal
  * register group gives the front face in .x; no component or register
  * flags helper lanes). Report every invocation as a covered one: shaders
@@ -4293,6 +4356,12 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
    NIR_PASS(_, s, etna_nir_lower_bitfield_insert);
    NIR_PASS(_, s, nir_lower_bool_to_int32);
    NIR_PASS(_, s, etna_lower_alu, etna_core_has_feature(c->info, ETNA_FEATURE_HAS_FAST_TRANSCENDENTALS));
+   if (c->info->halti >= 2) {
+      bool sel = false;
+      NIR_PASS(sel, s, nir_shader_alu_pass, fold_select_test, nir_metadata_control_flow, NULL);
+      if (sel)
+         NIR_PASS(_, s, nir_opt_dce);
+   }
 
    if (spill_constants)
       NIR_PASS(_, s, etna_nir_spill_constants);

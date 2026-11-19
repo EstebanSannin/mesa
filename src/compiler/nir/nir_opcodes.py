@@ -1403,6 +1403,9 @@ unsigned mask = ((1ull << bits) - 1) << offset;
 dst = (base & ~mask) | ((insert << offset) & mask);
 """)
 
+# Etnaviv SELECT.EQ x, x, y: x, or y where x is NaN
+binop("fsel_ord_etna", tfloat32, "", "src0 == src0 ? src0 : src1")
+
 # Etnaviv-specific lane products. IMULLO0 and IMADLO0 with an 8- or 16-bit
 # type multiply (and add) each byte or half of a 32-bit component on its own,
 # without carries between them, and do so in every component of a vector (with

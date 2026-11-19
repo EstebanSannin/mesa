@@ -101,6 +101,7 @@ static const struct etna_op_info etna_ops[] = {
    OPCT(imul16x2_etna, IMULLO0, TRUE, U16),
    OPCT(imad8x4_etna, IMADLO0, TRUE, U8),
    OPCT(imad16x2_etna, IMADLO0, TRUE, U16),
+   OPC(fsel_ord_etna, SELECT, EQ),
    IOP(ineg, ADD), /* ADD 0, -x */
    IOP(iabs, IABS),
    IOP(isign, SIGN),
@@ -219,6 +220,11 @@ etna_emit_alu(struct etna_compile *c, nir_alu_instr *alu, struct etna_inst_dst d
       inst.src[2] = etna_src_swizzle(src[2], swiz_scalar);
       break;
    /* deal with instructions which don't have 1:1 mapping */
+   case nir_op_fsel_ord_etna:
+      /* SELECT.EQ x, x, y */
+      inst.src[2] = src[1];
+      inst.src[1] = src[0];
+      break;
    case nir_op_fmin:
    case nir_op_fmax:
    case nir_op_imin:
