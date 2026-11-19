@@ -42,6 +42,11 @@ etna_ml_lower_logistic(struct etna_ml_subgraph *subgraph,
                        struct etna_operation *operation);
 
 void
+etna_ml_lower_maxpool(struct etna_ml_subgraph *subgraph,
+                      const struct pipe_ml_operation *pool,
+                      struct etna_operation *operation);
+
+void
 etna_ml_compile_operation_tp(struct etna_ml_subgraph *subgraph,
                              const struct etna_operation *operation,
                              struct etna_vip_instruction *instruction);

@@ -6,6 +6,7 @@
 #ifndef H_ETNA_ML
 #define H_ETNA_ML
 
+#include <stdlib.h>
 #include "pipe/p_state.h"
 #include "util/u_dynarray.h"
 #include "util/macros.h"
@@ -39,6 +40,7 @@ enum etna_ml_tp_type {
    ETNA_ML_TP_RELU,
    ETNA_ML_TP_ABSOLUTE,
    ETNA_ML_TP_LOGISTIC,
+   ETNA_ML_TP_MAXPOOL,
 };
 
 enum etna_ml_tensor_layout {
@@ -53,7 +55,25 @@ struct etna_ml_tensor {
    unsigned size;
    enum etna_ml_tensor_layout exp_layout; /* expected */
    enum etna_ml_tensor_layout act_layout; /* actual */
+   bool in_sram;          /* local experiment: lives in VIP SRAM at sram_offset */
+   unsigned sram_offset;
 };
+
+/* Local experiment: a graph input that the CPU writes transposed (NHWC -> planar) into out_idx */
+struct etna_cpu_transpose {
+   unsigned in_idx, out_idx, h, w, c;
+   unsigned stride, out_w, out_h, pad_x, pad_y; /* stride 2: also destride like the TP reshuffle */
+   uint8_t zp;
+};
+
+/* Local experiment ETNA_CPU_DETRANSPOSE: a graph output that the NPU leaves planar, written back in
+ * NHWC order (out[p * c + ch] = in[ch * pixels + p]) when it is copied out */
+struct etna_cpu_detranspose {
+   unsigned idx, pixels, c;
+};
+
+/* Local experiment: getenv once, for the per-inference paths */
+#define ETNA_ML_ENV(name) ({ static int env_ = -1; if (env_ < 0) env_ = getenv(name) != NULL; env_; })
 
 struct etna_ml_subgraph {
    struct pipe_ml_subgraph base;
@@ -63,6 +83,17 @@ struct etna_ml_subgraph {
 
    /* Indexed by tensor index */
    struct util_dynarray tensors; /* Contains struct etna_ml_tensor */
+
+   struct etna_bo *sram_bo;  /* local experiment: reserves the NPU VA range remapped to VIP SRAM */
+   uint32_t sram_window;
+   bool listed_once; /* local experiment ETNA_ML_LIST_ONCE */
+   struct util_dynarray cpu_transposes; /* local experiment: struct etna_cpu_transpose */
+   struct util_dynarray cpu_detransposes; /* local experiment: struct etna_cpu_detranspose */
+   uint32_t *cmd_cache;       /* local experiment ETNA_ML_CMD_CACHE: recorded job words */
+   unsigned cmd_cache_words;
+   struct util_dynarray cmd_bos; /* BOs a replayed submit still lists (CPU-visible, waited on) */
+   unsigned prefix_iter; /* local experiment ETNA_PREFIX */
+   int prefix_limit;
 };
 
 struct etna_vip_instruction {
@@ -76,6 +107,7 @@ struct etna_vip_instruction {
    unsigned input_offset;
    struct pipe_resource *output;
    unsigned output_offset;
+   bool input_external, output_external; /* local experiment: graph input/output, the CPU touches it */
 
    struct etna_bo *kernel;
 };
@@ -92,10 +124,13 @@ struct etna_operation {
    bool pointwise;
    bool fully_connected;
    bool pooling_first_pixel;
+   bool pooling_max; /* local experiment: 2x2 max instead of first pixel */
    bool padding_same;
    bool relu;
 
    unsigned stride;
+   unsigned sram_cache_base; /* local experiment: first SRAM byte the caches may use, 0 = default */
+   bool cpu_transpose;       /* local experiment: done by the CPU at input time, no job */
 
    unsigned input_tensors[MAX_TENSORS];
    unsigned input_count;
@@ -138,6 +173,12 @@ struct etna_operation {
    unsigned pad_after_y;
    unsigned pad_before_z;
    unsigned pad_after_z;
+};
+
+struct etna_idx_replacement {
+   struct list_head link;
+   unsigned idx_old;
+   unsigned idx_new;
 };
 
 #define ML_DBG(fmt, ...)                                  \
