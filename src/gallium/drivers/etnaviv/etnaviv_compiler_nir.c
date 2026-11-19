@@ -3667,6 +3667,60 @@ split_load_offset(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    return false;
 }
 
+/* the scalar 32-bit imul or imad (op) that only s reads */
+static nir_alu_instr *
+single_use_product(nir_alu_src *s, nir_op op)
+{
+   if (!nir_src_is_alu(s->src) || s->swizzle[0] != 0)
+      return NULL;
+
+   nir_alu_instr *p = nir_def_as_alu(s->src.ssa);
+   if (p->op != op || p->def.num_components != 1 || p->def.bit_size != 32 ||
+       !list_is_singular(&p->def.uses) || nir_def_used_by_if(&p->def))
+      return NULL;
+   return p;
+}
+
+/* iadd(imul(a, b), d) -> imad(a, b, d); iadd(imad(a, b, c), d) ->
+ * imad(a, b, iadd(c, d)) when c or d is a product to fuse next: the products
+ * of a sum become one IMADLO0 chain (integer arithmetic wraps, so the order
+ * doesn't change the bits) */
+static bool
+fold_imad_chain(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_iadd || alu->def.num_components != 1 || alu->def.bit_size != 32)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_alu_instr *mul = single_use_product(&alu->src[i], nir_op_imul);
+      if (!mul)
+         continue;
+
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def_replace(&alu->def, nir_imad(b, nir_ssa_for_alu_src(b, mul, 0), nir_ssa_for_alu_src(b, mul, 1),
+                                          nir_ssa_for_alu_src(b, alu, 1 - i)));
+      return true;
+   }
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_alu_instr *mad = single_use_product(&alu->src[i], nir_op_imad);
+      if (!mad)
+         continue;
+
+      nir_alu_src *d = &alu->src[1 - i];
+      if (!single_use_product(&mad->src[2], nir_op_imul) && !single_use_product(&mad->src[2], nir_op_imad) &&
+          !single_use_product(d, nir_op_imul) && !single_use_product(d, nir_op_imad))
+         continue;
+
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def *sum = nir_iadd(b, nir_ssa_for_alu_src(b, mad, 2), nir_ssa_for_alu_src(b, alu, 1 - i));
+      nir_def_replace(&alu->def, nir_imad(b, nir_ssa_for_alu_src(b, mad, 0), nir_ssa_for_alu_src(b, mad, 1),
+                                          sum));
+      return true;
+   }
+   return false;
+}
+
 /* STORE.u8/u16 writes the low byte or half of its value: a mask of the
  * value that keeps those bits (the widening of an 8- or 16-bit value) is
  * not needed */
@@ -4798,6 +4852,12 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
     * IMULLO0 and IMADLO0 are scalar: split the products now (lane products
     * compute every component) */
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_late_filter_cb, c->info);
+   for (bool chain = true; chain;) {
+      chain = false;
+      NIR_PASS(chain, s, nir_shader_alu_pass, fold_imad_chain, nir_metadata_control_flow, NULL);
+      if (chain)
+         NIR_PASS(_, s, nir_opt_dce);
+   }
 
    bool folded = false;
    NIR_PASS(folded, s, nir_shader_intrinsics_pass, fold_offset_shift, nir_metadata_control_flow, NULL);
