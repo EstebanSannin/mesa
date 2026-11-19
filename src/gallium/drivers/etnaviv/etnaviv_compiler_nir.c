@@ -2064,7 +2064,16 @@ lower_tex2d_to_image(nir_builder *b, nir_tex_instr *tex, const struct etna_shade
       nir_def *size = nir_image_size(b, 2, 32, index, zero, .image_dim = GLSL_SAMPLER_DIM_2D,
                                      .image_array = false);
       nir_def *texel_xy = nir_vec2(b, texel[0], texel[1]);
-      xy = nir_imin(b, nir_imax(b, texel_xy, nir_imm_ivec2(b, 0, 0)), nir_iadd_imm(b, size, -1));
+      /* one axis at a time, as il_sample(): the clamp of an axis that
+       * doesn't change between reads (x down a column) is shared by them,
+       * and the clamps of the other axis vectorize across reads; the last
+       * texel stays a vector, so that reads of several images at the same
+       * coordinates still clamp both axes in one imin */
+      nir_def *last = nir_iadd_imm(b, size, -1);
+      nir_def *clamped[2];
+      for (unsigned c = 0; c < 2; c++)
+         clamped[c] = nir_imin(b, nir_imax_imm(b, texel[c], 0), nir_channel(b, last, c));
+      xy = nir_vec2(b, clamped[0], clamped[1]);
       /* the texel is in the texture where clamping doesn't move it */
       if (border)
          inside = nir_ball_iequal(b, xy, texel_xy);
