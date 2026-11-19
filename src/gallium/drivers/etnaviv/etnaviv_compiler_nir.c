@@ -1418,7 +1418,19 @@ lower_alu(struct etna_compile *c, nir_alu_instr *alu)
          if (num_const == 1)
             continue;
 
-         nir_def *mov = nir_mov(&b, alu->src[i].src.ssa);
+         /* an earlier instruction in this block may already have copied this source */
+         nir_def *src = alu->src[i].src.ssa, *mov = NULL;
+         for (unsigned k = 0; k < c->num_const_movs && !mov; k++) {
+            if (c->const_movs[k].src == src)
+               mov = c->const_movs[k].mov;
+         }
+         if (!mov) {
+            mov = nir_mov(&b, src);
+            if (c->num_const_movs < ARRAY_SIZE(c->const_movs)) {
+               c->const_movs[c->num_const_movs].src = src;
+               c->const_movs[c->num_const_movs++].mov = mov;
+            }
+         }
          nir_src_rewrite(&alu->src[i].src, mov);
       }
       return;
@@ -1499,6 +1511,7 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
 
    /* convert non-dynamic uniform loads to constants, etc */
    nir_foreach_block(block, c->impl) {
+      c->num_const_movs = 0;
       nir_foreach_instr_safe(instr, block) {
          switch(instr->type) {
          case nir_instr_type_alu:
