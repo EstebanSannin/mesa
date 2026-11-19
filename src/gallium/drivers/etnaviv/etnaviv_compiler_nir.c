@@ -2994,7 +2994,7 @@ round_to_half(nir_builder *b, nir_def *x)
    const unsigned save_math_ctrl = b->fp_math_ctrl;
    b->fp_math_ctrl |= nir_fp_exact;
    nir_def *t = nir_fmad(b, pow2, nir_imm_float(b, 8192.0f), nir_fabs(b, x));
-   nir_def *r = nir_fmad(b, pow2, nir_imm_float(b, -8192.0f), t);
+   nir_def *r = nir_fmad(b, nir_fneg(b, pow2), nir_imm_float(b, 8192.0f), t);
    r = nir_fmul_imm(b, nir_fmul_imm(b, r, 0x1p112), 0x1p-112);
    b->fp_math_ctrl = save_math_ctrl;
 
@@ -3030,6 +3030,19 @@ float_to_half_rtne(nir_builder *b, nir_def *x)
  * half converted, a constant that is one, a value rounded to half before
  * (in rounded), or what moves, neg, abs, sat, min, max and selects make of
  * those: each returns one of its operands, negated, or 0 or 1. */
+/* an integer that a half holds exactly: get_local_id() (max_block_size is at
+ * most 1024 in every dimension) or a constant within +-2048 */
+static bool
+is_half_int(nir_scalar s)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s))
+      return nir_scalar_as_int(s) >= -2048 && nir_scalar_as_int(s) <= 2048;
+   if (nir_scalar_is_intrinsic(s))
+      return nir_scalar_intrinsic_op(s) == nir_intrinsic_load_local_invocation_id;
+   return false;
+}
+
 static bool
 is_half_value(nir_scalar s, struct set *rounded, unsigned depth)
 {
@@ -3048,6 +3061,10 @@ is_half_value(nir_scalar s, struct set *rounded, unsigned depth)
    switch (nir_scalar_alu_op(s)) {
    case nir_op_f2f32:
       return nir_scalar_chase_alu_src(s, 0).def->bit_size == 16;
+   case nir_op_u2f32:
+   case nir_op_i2f32:
+      return nir_scalar_chase_alu_src(s, 0).def->bit_size == 32 &&
+             is_half_int(nir_scalar_chase_alu_src(s, 0));
    case nir_op_bcsel:
       first = 1;
       FALLTHROUGH;
@@ -3078,23 +3095,49 @@ fold_half_round_trip(nir_builder *b, nir_alu_instr *alu, void *data)
    if (alu->op != nir_op_f2f32 || alu->src[0].src.ssa->bit_size != 16)
       return false;
 
-   if (!nir_def_is_alu(alu->src[0].src.ssa))
-      return false;
-
-   nir_alu_instr *narrow = nir_instr_as_alu(nir_def_instr(alu->src[0].src.ssa));
-   if ((narrow->op != nir_op_f2f16 && narrow->op != nir_op_f2f16_rtne) ||
-       narrow->src[0].src.ssa->bit_size != 32)
-      return false;
-
-   b->cursor = nir_before_instr(&alu->instr);
-   unsigned swizzle[NIR_MAX_VEC_COMPONENTS];
-   bool exact = true;
+   /* each component: an f2f16 (to nearest even) of an fp32 value, or a
+    * u2f16/i2f16 of a 32-bit integer, through movs, vecs and the
+    * u2u16(u2u32()) that nir_lower_bit_size() puts around 16-bit vecs */
+   const bool rtz = b->shader->info.float_controls_execution_mode & FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16;
+   nir_scalar src[NIR_MAX_VEC_COMPONENTS];
+   nir_op conv[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < alu->def.num_components; i++) {
-      swizzle[i] = narrow->src[0].swizzle[alu->src[0].swizzle[i]];
-      exact &= is_half_value(nir_get_scalar(narrow->src[0].src.ssa, swizzle[i]), rounded, 8);
+      nir_scalar h = nir_get_scalar(alu->src[0].src.ssa, alu->src[0].swizzle[i]);
+      for (;;) {
+         h = nir_scalar_chase_movs(h);
+         if (!nir_scalar_is_alu(h) || h.def->bit_size != 16 || nir_scalar_alu_op(h) != nir_op_u2u16)
+            break;
+         nir_scalar w = nir_scalar_chase_movs(nir_scalar_chase_alu_src(h, 0));
+         if (!nir_scalar_is_alu(w) || nir_scalar_alu_op(w) != nir_op_u2u32 ||
+             nir_scalar_chase_alu_src(w, 0).def->bit_size != 16)
+            break;
+         h = nir_scalar_chase_alu_src(w, 0);
+      }
+      if (!nir_scalar_is_alu(h))
+         return false;
+      conv[i] = nir_scalar_alu_op(h);
+      src[i] = nir_scalar_chase_alu_src(h, 0);
+      if (src[i].def->bit_size != 32 ||
+          !(conv[i] == nir_op_f2f16_rtne || (conv[i] == nir_op_f2f16 && !rtz) ||
+            ((conv[i] == nir_op_u2f16 || conv[i] == nir_op_i2f16) && !rtz)))
+         return false;
    }
 
-   nir_def *x = nir_swizzle(b, narrow->src[0].src.ssa, swizzle, alu->def.num_components);
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_scalar comps[NIR_MAX_VEC_COMPONENTS];
+   bool exact = true;
+   for (unsigned i = 0; i < alu->def.num_components; i++) {
+      if (conv[i] == nir_op_u2f16 || conv[i] == nir_op_i2f16) {
+         nir_def *n = nir_channel(b, src[i].def, src[i].comp);
+         comps[i] = nir_get_scalar(conv[i] == nir_op_u2f16 ? nir_u2f32(b, n) : nir_i2f32(b, n), 0);
+         exact &= is_half_int(src[i]);
+      } else {
+         comps[i] = src[i];
+         exact &= is_half_value(src[i], rounded, 8);
+      }
+   }
+
+   nir_def *x = nir_vec_scalars(b, comps, alu->def.num_components);
    nir_def *res = exact ? x : round_to_half(b, x);
    _mesa_set_add(rounded, res);
    nir_def_replace(&alu->def, res);
