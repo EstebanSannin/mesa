@@ -88,6 +88,8 @@ etna_dump_shader(const struct etna_shader_variant *shader)
    etna_disasm(shader->code, shader->code_size, PRINT_RAW);
 
    printf("num temps: %i\n", shader->num_temps);
+   if (shader->dual16)
+      printf("dual16: %u id slots (2 registers each)\n", (unsigned)shader->dual16_inputs);
    printf("immediates:\n");
    for (int idx = 0; idx < shader->uniforms.count; ++idx) {
       printf(" [%i].%c = %f (0x%08x) (%d)\n",

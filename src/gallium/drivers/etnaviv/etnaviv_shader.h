@@ -113,6 +113,8 @@ struct etna_shader_key
     * the fragment slots in order (remap_tex_slots()); and the textures 8-31
     * it reads as images 16-39 that are 128-bit or have one component */
    unsigned cs_tex_wide : 1;
+   /* compute: no dual16 (a dispatch with an odd workgroup size) */
+   unsigned cs_single : 1;
    unsigned tex_img_128bit : 32;
    unsigned tex_img_1comp : 32;
    /* compute: RGBA16 UNORM textures, sampled as integers and converted, and
@@ -147,6 +149,7 @@ etna_shader_key_equal(const struct etna_shader_key* const a,
        unlikely(a->img_128bit || b->img_128bit || a->img_1comp || b->img_1comp) ||
        unlikely(a->tex_img_read || b->tex_img_read) ||
        unlikely(a->cs_tex_wide || b->cs_tex_wide) ||
+       unlikely(a->cs_single || b->cs_single) ||
        unlikely(a->tex_unorm16 || b->tex_unorm16) ||
        unlikely(a->tex_shader_linear || b->tex_shader_linear) ||
        unlikely(a->tex_layer_rint || b->tex_layer_rint) ||

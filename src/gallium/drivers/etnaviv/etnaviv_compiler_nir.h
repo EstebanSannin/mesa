@@ -35,6 +35,16 @@
 #include "util/log.h"
 #include "util/macros.h"
 
+/* dual16: what a register component holds (dual16_rewrite()) */
+#define ETNA_D16_P 1 /* a half per work-item, packed: work-item 0 in bits 0-15 */
+#define ETNA_D16_W 2 /* a 32-bit value per work-item */
+
+struct etna_d16_inst {
+   uint8_t dst;                /* kind of the result */
+   uint8_t src[ETNA_NUM_SRC];  /* kinds of the register sources (0: not known) */
+   bool from_nir;              /* emitted for an ALU instruction or a store */
+};
+
 struct etna_compile {
    nir_shader *nir;
    nir_function_impl *impl;
@@ -63,6 +73,17 @@ struct etna_compile {
 
    /* There was an error during compilation */
    bool error;
+
+   /* dual16: per emitted instruction, what its result and register sources
+    * hold, from the registers of the NIR sources of the instruction being
+    * emitted (dual16_record()) */
+   struct etna_d16_inst *d16;
+   uint8_t d16_dst;
+   bool d16_from_nir;
+   unsigned d16_nrec;
+   struct {
+      uint8_t reg, mask, kind;
+   } d16_rec[8];
 };
 
 #define compile_error(ctx, args...) ({ \
@@ -447,6 +468,26 @@ emit_inst(struct etna_compile *c, struct etna_inst *inst)
       c->code_alloc = alloc;
    }
 
+   if (c->d16) {
+      struct etna_d16_inst *d = &c->d16[c->inst_ptr];
+
+      d->dst = c->d16_dst;
+      d->from_nir = c->d16_from_nir;
+      for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+         const struct etna_inst_src *src = &inst->src[s];
+         unsigned mask = 0;
+
+         d->src[s] = 0;
+         if (!src->use || src->rgroup != ISA_REG_GROUP_TEMP)
+            continue;
+         for (unsigned j = 0; j < 4; j++)
+            mask |= 1 << ((src->swiz >> (2 * j)) & 3);
+         for (unsigned r = 0; r < c->d16_nrec; r++) {
+            if (c->d16_rec[r].reg == src->reg && (c->d16_rec[r].mask & mask))
+               d->src[s] |= c->d16_rec[r].kind;
+         }
+      }
+   }
    c->code[c->inst_ptr++] = *inst;
 }
 

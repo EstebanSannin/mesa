@@ -309,8 +309,8 @@ inline_immediate(uint32_t bits, unsigned *type, uint32_t *imm)
 static hw_src
 const_src(struct etna_compile *c, nir_const_value *value, unsigned num_components)
 {
-   /* use inline immediates if possible */
-   if (c->info->halti >= 2 && num_components == 1 &&
+   /* use inline immediates if possible (not in dual16 code) */
+   if (c->info->halti >= 2 && num_components == 1 && !c->variant->dual16 &&
        value[0].u64 >> 32 == ETNA_UNIFORM_CONSTANT) {
       unsigned type;
       uint32_t imm;
@@ -945,7 +945,8 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
       emit_inst(c, &(struct etna_inst) {
          .opcode = ISA_OPC_STORE,
          .type = nir_intrinsic_src_type(intr) == nir_type_uint8 ? ISA_TYPE_U8 :
-                 nir_intrinsic_src_type(intr) == nir_type_uint16 ? ISA_TYPE_U16 : ISA_TYPE_U32,
+                 nir_intrinsic_src_type(intr) == nir_type_uint16 ? ISA_TYPE_U16 :
+                 nir_intrinsic_src_type(intr) == nir_type_float16 ? ISA_TYPE_F16 : ISA_TYPE_U32,
          .denorm = 1,
          .left_shift = nir_intrinsic_offset_shift(intr),
          .dst = {
@@ -1024,9 +1025,77 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
    }
 }
 
+/* dual16: a 16-bit value, or a 32-bit copy of one (insert_vec_mov()), is
+ * packed halves */
+static bool
+dual16_packed_def(nir_def *def)
+{
+   if (def->bit_size == 16)
+      return true;
+
+   nir_instr *instr = nir_def_instr(def);
+   return instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == nir_op_mov &&
+          nir_instr_as_alu(instr)->src[0].src.ssa->bit_size == 16;
+}
+
+static bool
+dual16_record_src(nir_src *src, void *data)
+{
+   struct etna_compile *c = data;
+   nir_instr *parent = nir_def_instr(src->ssa);
+   bool temp = parent->type == nir_instr_type_alu;
+
+   if (parent->type == nir_instr_type_intrinsic) {
+      const nir_intrinsic_op op = nir_instr_as_intrinsic(parent)->intrinsic;
+      temp = op == nir_intrinsic_load_input || op == nir_intrinsic_load_reg;
+   }
+   if (!temp || c->d16_nrec >= ARRAY_SIZE(c->d16_rec))
+      return true;
+
+   hw_src h = get_src(c, src);
+   if (!h.use || h.rgroup != ISA_REG_GROUP_TEMP)
+      return true;
+
+   unsigned mask = 0;
+   for (unsigned j = 0; j < 4; j++)
+      mask |= 1 << ((h.swiz >> (2 * j)) & 3);
+   c->d16_rec[c->d16_nrec].reg = h.reg;
+   c->d16_rec[c->d16_nrec].mask = mask;
+   c->d16_rec[c->d16_nrec].kind = dual16_packed_def(src->ssa) ? ETNA_D16_P : ETNA_D16_W;
+   c->d16_nrec++;
+   return true;
+}
+
+/* dual16: the kinds of the result and the register sources of the
+ * instructions emitted for instr (see emit_inst()) */
+static void
+dual16_record(struct etna_compile *c, nir_instr *instr)
+{
+   c->d16_nrec = 0;
+   c->d16_dst = ETNA_D16_W;
+   c->d16_from_nir = false;
+
+   /* a vecN or a modifier folded into its users emits nothing, and the
+    * values written straight into a vecN's register have none of their own */
+   if (instr->type == nir_instr_type_alu && is_dead_instruction(instr))
+      return;
+
+   if (instr->type == nir_instr_type_alu) {
+      c->d16_dst = dual16_packed_def(&nir_instr_as_alu(instr)->def) ? ETNA_D16_P : ETNA_D16_W;
+      c->d16_from_nir = true;
+   } else if (instr->type == nir_instr_type_intrinsic &&
+              nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_global_etna) {
+      c->d16_from_nir = true;
+   }
+   if (c->d16_from_nir)
+      nir_foreach_src(instr, dual16_record_src, c);
+}
+
 static void
 emit_instr(struct etna_compile *c, nir_instr * instr)
 {
+   if (c->d16)
+      dual16_record(c, instr);
    switch (instr->type) {
    case nir_instr_type_alu:
       emit_alu(c, nir_instr_as_alu(instr));
@@ -1048,6 +1117,8 @@ emit_instr(struct etna_compile *c, nir_instr * instr)
       compile_error(c, "Unhandled NIR instruction type: %d\n", instr->type);
       break;
    }
+   c->d16_from_nir = false;
+   c->d16_nrec = 0;
 }
 
 static void
@@ -1351,6 +1422,12 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
             break;
          case nir_instr_type_load_const: {
             nir_load_const_instr *load_const = nir_instr_as_load_const(instr);
+            /* dual16: a half constant goes up as a float, which packed
+             * instructions read as a half */
+            if (c->variant->dual16 && load_const->def.bit_size == 16) {
+               for (unsigned i = 0; i < load_const->def.num_components; i++)
+                  load_const->value[i].u64 = fui(_mesa_half_to_float(load_const->value[i].u16));
+            }
             for (unsigned  i = 0; i < load_const->def.num_components; i++)
                load_const->value[i] = CONST(load_const->value[i].u32);
          } break;
@@ -1567,7 +1644,7 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
    nir_foreach_block(block, c->impl) {
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
-         if (def && (def->bit_size == 8 || def->bit_size == 16) &&
+         if (def && (def->bit_size == 8 || (def->bit_size == 16 && !c->variant->dual16)) &&
              instr->type != nir_instr_type_load_const) {
             char *str = nir_instr_as_str(instr, NULL);
             compile_error(c, "%u-bit value not lowered: %s\n", def->bit_size, str);
@@ -3295,6 +3372,14 @@ lower_ssbo_access(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
       break;
    case nir_intrinsic_store_global:
       split_global_address(b, intr->src[1].ssa, &base, &offset);
+      /* dual16: STORE.f16 stores each work-item's half */
+      if (data && ((const struct etna_shader_variant *)data)->dual16 &&
+          intr->src[0].ssa->bit_size == 16) {
+         nir_store_global_etna(b, intr->src[0].ssa, base, offset,
+                               .write_mask = nir_intrinsic_write_mask(intr),
+                               .src_type = nir_type_float16);
+         break;
+      }
       nir_store_global_etna(b, store_value32(b, intr->src[0].ssa), base, offset,
                             .write_mask = nir_intrinsic_write_mask(intr),
                             .src_type = store_type(intr->src[0].ssa));
@@ -3446,8 +3531,464 @@ lower_helper_invocation(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *
    return true;
 }
 
+/* Dual16 ----------------------------------------------------------------
+ *
+ * In dual16 mode (SH_CONFIG DUAL16) a hardware thread carries two work-items,
+ * T0 and T1. A register component holds two halves, T0's in bits 0-15 and
+ * T1's in bits 16-31, and an instruction without a thread select works on
+ * both: half arithmetic at twice the rate. An instruction with a thread select
+ * (.t0/.t1) runs for one work-item; it reads its half of a component (t) or
+ * the full 32 bits (th), and writes its half (converted to fp16) or, with .hp,
+ * the full 32 bits. The hardware puts id slot s of work-item t in register
+ * 2s + t. Packed instructions round to nearest even and flush half denormals
+ * (RMODE 0; RMODE 1 rounds toward zero). See cl/pk/dual16-notes.md.
+ */
+
+static bool
+dual16_reject(const struct etna_compile *c, const char *why, const char *what)
+{
+   if (DBG_ENABLED(ETNA_DBG_COMPILER_MSGS)) {
+      fprintf(stderr, "etnaviv: dual16: %s not taken: %s %s\n",
+              nir_shader_get_entrypoint(c->nir)->function->name, why, what ? what : "");
+   }
+   return false;
+}
+
+/* 8- and 64-bit values are out; a half is a float, and only the operations
+ * below handle one: arithmetic whose dual16 results were checked (mad is
+ * OpenCL mad() or a contracted x * y + z: unfused, each rounded), moves, and
+ * conversions to half rounding to nearest even. ffma (fma() must be fused),
+ * division, sqrt, compares and the rest stay in single mode. */
+static bool
+dual16_alu_ok(const struct etna_compile *c, const nir_alu_instr *alu, bool *has_half)
+{
+   const char *name = nir_op_infos[alu->op].name;
+   const unsigned n = nir_op_infos[alu->op].num_inputs;
+   bool half = alu->def.bit_size == 16;
+
+   if (alu->def.bit_size == 8 || alu->def.bit_size == 64)
+      return dual16_reject(c, "8- or 64-bit alu", name);
+   for (unsigned i = 0; i < n; i++) {
+      const unsigned b = alu->src[i].src.ssa->bit_size;
+      if (b == 8 || b == 64)
+         return dual16_reject(c, "8- or 64-bit alu source", name);
+      half |= b == 16;
+   }
+   if (!half)
+      return true;
+
+   *has_half = true;
+   switch (alu->op) {
+   case nir_op_fadd:
+   case nir_op_fmul:
+   case nir_op_fmad:
+   case nir_op_mov:
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+   case nir_op_vec5:
+   case nir_op_vec8:
+   case nir_op_vec16:
+   case nir_op_fneg:
+   case nir_op_fabs:
+      for (unsigned i = 0; i < n; i++) {
+         if (alu->src[i].src.ssa->bit_size != 16)
+            return dual16_reject(c, "half op with a wider source", name);
+      }
+      return alu->def.bit_size == 16 || dual16_reject(c, "half op with a wider result", name);
+   case nir_op_f2f16:
+      /* the kernel's rounding of half conversions, which is round to nearest
+       * even unless it asks for round toward zero */
+      if (c->nir->info.float_controls_execution_mode & FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16)
+         return dual16_reject(c, "rounding mode", name);
+      FALLTHROUGH;
+   case nir_op_f2f16_rtne:
+   case nir_op_u2f16:
+   case nir_op_i2f16:
+      return alu->src[0].src.ssa->bit_size == 32 || dual16_reject(c, "conversion", name);
+   case nir_op_f2f32:
+      return alu->src[0].src.ssa->bit_size == 16 || dual16_reject(c, "conversion", name);
+   default:
+      return dual16_reject(c, "half op", name);
+   }
+}
+
+/* values that can differ between the two work-items of a thread: the ids
+ * (the two can even be in different workgroups) and what is computed from
+ * them; the rest comes from constants and arguments */
+static bool
+dual16_varying_intrinsic(nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_uniform:
+   case nir_intrinsic_load_kernel_input:
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_workgroup_size:
+   case nir_intrinsic_load_num_workgroups:
+   case nir_intrinsic_load_base_global_invocation_id:
+   case nir_intrinsic_load_base_workgroup_id:
+   case nir_intrinsic_load_work_dim:
+      return false;
+   default:
+      return true;
+   }
+}
+
+static bool
+dual16_varying_src(nir_src *src, void *data)
+{
+   const BITSET_WORD *varying = data;
+   return !BITSET_TEST(varying, src->ssa->index);
+}
+
+/* every branch condition is the same for both work-items of a thread: one
+ * branch serves both */
+static bool
+dual16_uniform_cf(const struct etna_compile *c, nir_shader *s)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   bool ok = true, progress;
+
+   nir_index_ssa_defs(impl);
+   BITSET_WORD *varying = rzalloc_array(NULL, BITSET_WORD, BITSET_WORDS(impl->ssa_alloc));
+   if (!varying)
+      return false;
+
+   do {
+      progress = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_def *def = nir_instr_def(instr);
+            if (!def || BITSET_TEST(varying, def->index))
+               continue;
+
+            bool v = false;
+            switch (instr->type) {
+            case nir_instr_type_intrinsic:
+               v = dual16_varying_intrinsic(nir_instr_as_intrinsic(instr)) ||
+                   !nir_foreach_src(instr, dual16_varying_src, varying);
+               break;
+            case nir_instr_type_alu:
+            case nir_instr_type_phi:
+               v = !nir_foreach_src(instr, dual16_varying_src, varying);
+               break;
+            default:
+               break;
+            }
+            if (v) {
+               BITSET_SET(varying, def->index);
+               progress = true;
+            }
+         }
+      }
+   } while (progress);
+
+   nir_foreach_block(block, impl) {
+      nir_if *nif = nir_block_get_following_if(block);
+      if (nif && BITSET_TEST(varying, nif->condition.ssa->index)) {
+         ok = dual16_reject(c, "branch that differs between work-items", NULL);
+         break;
+      }
+   }
+
+   ralloc_free(varying);
+   return ok;
+}
+
+/* the NIR rusticl hands over (late: the NIR to emit): an OpenCL kernel with
+ * half arithmetic, no loads, atomics, barrier, shared or private memory, and
+ * uniform control flow */
+static bool
+dual16_check(const struct etna_compile *c, nir_shader *s, bool late)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   bool has_half = false;
+
+   if (s->info.stage != MESA_SHADER_COMPUTE || !s->info.cs.ptr_size ||
+       DBG_ENABLED(ETNA_DBG_NO_DUAL16))
+      return false;
+   if (s->info.uses_control_barrier || s->info.shared_size || s->scratch_size ||
+       s->info.cs.has_variable_shared_mem)
+      return dual16_reject(c, "barrier, shared or private memory", NULL);
+   if (!exec_list_is_singular(&impl->body)) {
+      if (DBG_ENABLED(ETNA_DBG_NO_DUAL16_CF))
+         return dual16_reject(c, "control flow", NULL);
+      if (!dual16_uniform_cf(c, s))
+         return false;
+   }
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_load_const:
+         case nir_instr_type_undef:
+         case nir_instr_type_phi:
+            if (nir_instr_def(instr)->bit_size == 8 || nir_instr_def(instr)->bit_size == 64)
+               return dual16_reject(c, "8- or 64-bit value", NULL);
+            break;
+         case nir_instr_type_jump:
+            if (nir_instr_as_jump(instr)->type != nir_jump_break &&
+                nir_instr_as_jump(instr)->type != nir_jump_continue)
+               return dual16_reject(c, "jump", NULL);
+            break;
+         case nir_instr_type_alu: {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            /* wide vectors are split before emission (as in single mode) */
+            if (late && nir_op_is_vec(alu->op) && alu->def.num_components > 4)
+               return dual16_reject(c, "wide vector", NULL);
+            if (!dual16_alu_ok(c, alu, &has_half))
+               return false;
+            break;
+         }
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const char *name = nir_intrinsic_infos[intr->intrinsic].name;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_global_invocation_id:
+            case nir_intrinsic_load_local_invocation_id:
+            case nir_intrinsic_load_workgroup_id:
+            case nir_intrinsic_load_local_invocation_index:
+            case nir_intrinsic_load_base_global_invocation_id:
+            case nir_intrinsic_load_kernel_input:
+            case nir_intrinsic_load_ubo:
+            case nir_intrinsic_load_work_dim:
+               if (late)
+                  return dual16_reject(c, "intrinsic after lowering", name);
+               break;
+            case nir_intrinsic_load_input:
+               if (!late)
+                  return dual16_reject(c, "intrinsic", name);
+               break;
+            case nir_intrinsic_load_workgroup_size:
+            case nir_intrinsic_load_num_workgroups:
+            case nir_intrinsic_load_base_workgroup_id:
+               break;
+            case nir_intrinsic_load_uniform:
+               if (late && !nir_src_is_const(intr->src[0]))
+                  return dual16_reject(c, "indirect uniform", NULL);
+               break;
+            case nir_intrinsic_store_global:
+            case nir_intrinsic_store_global_etna:
+               if ((intr->intrinsic == nir_intrinsic_store_global_etna) != late)
+                  return dual16_reject(c, "intrinsic", name);
+               if (intr->src[0].ssa->bit_size == 8 || intr->src[0].ssa->bit_size == 64)
+                  return dual16_reject(c, "8- or 64-bit store", NULL);
+               break;
+            default:
+               return dual16_reject(c, "intrinsic", name);
+            }
+            if (nir_intrinsic_infos[intr->intrinsic].has_dest && intr->def.bit_size != 32)
+               return dual16_reject(c, "not 32-bit", name);
+            break;
+         }
+         default:
+            return dual16_reject(c, "instruction type", NULL);
+         }
+      }
+   }
+
+   if (!late && !has_half)
+      return dual16_reject(c, "no half arithmetic", NULL);
+   return true;
+}
+
+static bool
+dual16_early(const struct etna_compile *c, nir_shader *s)
+{
+   if (!dual16_check(c, s, false))
+      return false;
+   if (DBG_ENABLED(ETNA_DBG_COMPILER_MSGS))
+      fprintf(stderr, "etnaviv: dual16: %s taken\n", nir_shader_get_entrypoint(s)->function->name);
+   return true;
+}
+
+/* The single-mode code, with halves in 32-bit register components, becomes
+ * dual16 code. Single-mode register r holds its packed halves in p0(r), its
+ * 32-bit values in p0(r) for T0 and p1(r) for T1; the id registers
+ * (r < cs_input_count) are the hardware's, slot r of T0 in 2r and of T1 in
+ * 2r + 1 (CL_CONFIG value order 3: global id, local id, workgroup id; two
+ * slots at least, as NXP's dual16 dispatches). A single-mode register
+ * component never holds a half and a 32-bit value at the same time, so the
+ * map is the same at every instruction. An instruction runs once (packed) if
+ * its result and register sources are halves, else once per work-item:
+ * 32-bit sources through th, a 32-bit result with .hp. A branch runs once on
+ * T0's condition: a boolean (0 or ~0, alike in both halves) that both
+ * work-items share (dual16_uniform_cf()). Branch targets move with the code. */
+static bool
+dual16_rewrite(struct etna_compile *c, struct etna_shader_variant *v, unsigned num_blocks)
+{
+   const unsigned ic = v->cs_input_count;
+   const unsigned n = MAX2(v->num_temps, ic);
+   const unsigned slots = MAX2(ic, 2);
+   const unsigned base = 2 * slots;
+   const unsigned total = base + 2 * (n - ic);
+   const char *e = getenv("ETNA_DUAL16_RMODE");
+   const unsigned rmode = e ? atoi(e) & 3 : 0;
+
+   if (ic > 3 || total > 63)
+      return dual16_reject(c, "registers", NULL);
+
+#define P0(r) ((r) < ic ? 2 * (r) : base + (r) - ic)
+#define P1(r) ((r) < ic ? 2 * (r) + 1 : base + (n - ic) + (r) - ic)
+#define PT(r, t) ((t) ? P1(r) : P0(r))
+
+   struct etna_inst *out = malloc(2 * (c->inst_ptr + 1) * sizeof(*out));
+   unsigned *at = malloc((c->inst_ptr + 1) * sizeof(*at));
+   unsigned m = 0;
+   const char *why = NULL;
+
+   if (!out || !at) {
+      free(out);
+      free(at);
+      return false;
+   }
+
+   for (int i = 0; i < c->inst_ptr && !why; i++) {
+      const struct etna_inst *in = &c->code[i];
+      const struct etna_d16_inst *d = &c->d16[i];
+      const bool packed_result = d->dst == ETNA_D16_P;
+      bool any_w = false, p_on_dst = false;
+
+      at[i] = m;
+
+      switch (in->opcode) {
+      case ISA_OPC_NOP:
+      case ISA_OPC_BRANCH:
+         out[m++] = *in;
+         continue;
+      case ISA_OPC_BRANCH_UNARY: {
+         struct etna_inst o = *in;
+         if (o.src[0].use && o.src[0].rgroup == ISA_REG_GROUP_TEMP) {
+            if (o.src[0].amode || o.src[0].reg >= n) {
+               why = "branch";
+               break;
+            }
+            o.src[0].reg = P0(in->src[0].reg);
+         }
+         out[m++] = o;
+         continue;
+      }
+      default:
+         break;
+      }
+      if (why)
+         break;
+
+      if (!d->from_nir || in->dst.amode || (in->dst.use && in->dst.reg >= n)) {
+         why = "instruction";
+         break;
+      }
+      for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+         const struct etna_inst_src *src = &in->src[s];
+         if (!src->use)
+            continue;
+         if (src->rgroup == ISA_REG_GROUP_IMMED && (src->imm_type == 0 || src->imm_type == 3)) {
+            why = "float immediate";
+            break;
+         }
+         if (src->rgroup != ISA_REG_GROUP_TEMP)
+            continue;
+         if (src->amode || src->reg >= n ||
+             (d->src[s] != ETNA_D16_P && d->src[s] != ETNA_D16_W)) {
+            why = "register source";
+            break;
+         }
+         any_w |= d->src[s] == ETNA_D16_W;
+         p_on_dst |= d->src[s] == ETNA_D16_P && in->dst.use && src->reg == in->dst.reg;
+      }
+      if (why)
+         break;
+
+      if (packed_result && !any_w && in->opcode != ISA_OPC_STORE) {
+         struct etna_inst o = *in;
+         if (o.dst.use)
+            o.dst.reg = P0(in->dst.reg);
+         for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+            if (o.src[s].use && o.src[s].rgroup == ISA_REG_GROUP_TEMP)
+               o.src[s].reg = P0(in->src[s].reg);
+         }
+         if (!o.rounding)
+            o.rounding = rmode;
+         out[m++] = o;
+         continue;
+      }
+
+      /* a 32-bit result of T0 overwrites both halves of its component: if a
+       * packed source shares the register, T1 goes first */
+      const bool t1_first = !packed_result && p_on_dst;
+      for (unsigned k = 0; k < 2; k++) {
+         const unsigned t = t1_first ? 1 - k : k;
+         struct etna_inst o = *in;
+         o.thread = t ? ISA_THREAD_T1 : ISA_THREAD_T0;
+         if (o.dst.use && in->opcode != ISA_OPC_STORE) {
+            o.dst.reg = packed_result ? P0(in->dst.reg) : PT(in->dst.reg, t);
+            o.dst_full = !packed_result;
+         }
+         for (unsigned s = 0; s < ETNA_NUM_SRC; s++) {
+            if (!o.src[s].use || o.src[s].rgroup != ISA_REG_GROUP_TEMP)
+               continue;
+            if (d->src[s] == ETNA_D16_W) {
+               o.src[s].rgroup = ISA_REG_GROUP_TH;
+               o.src[s].reg = PT(in->src[s].reg, t);
+            } else {
+               o.src[s].reg = P0(in->src[s].reg);
+            }
+         }
+         out[m++] = o;
+      }
+   }
+
+#undef PT
+#undef P1
+#undef P0
+
+   if (!why && m > ETNA_MAX_SHADER_INSTRUCTIONS)
+      why = "too long";
+   if (why) {
+      free(out);
+      free(at);
+      return dual16_reject(c, why, NULL);
+   }
+
+   at[c->inst_ptr] = m;
+   for (unsigned b = 0; b < num_blocks; b++) {
+      if (c->block_ptr[b] <= (unsigned)c->inst_ptr)
+         c->block_ptr[b] = at[c->block_ptr[b]];
+   }
+
+   if (DBG_ENABLED(ETNA_DBG_COMPILER_MSGS))
+      fprintf(stderr, "etnaviv: dual16: %s: %u instructions -> %u, %u temporaries -> %u, %u id slots\n",
+              nir_shader_get_entrypoint(c->nir)->function->name, (unsigned)c->inst_ptr, m,
+              v->num_temps, total, slots);
+
+   free(at);
+   free(c->code);
+   c->code = out;
+   c->code_alloc = 2 * (c->inst_ptr + 1);
+   c->inst_ptr = m;
+   v->num_temps = total;
+   v->dual16_inputs = slots;
+   return true;
+}
+
+static bool
+compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop);
+
+/* a dual16 compile that fails is retried in single mode */
 static bool
 compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop)
+{
+   if (compile_shader_one(v, spill_constants, fold, fold_loop))
+      return true;
+   if (!v || !v->dual16)
+      return false;
+
+   v->dual16_off = true;
+   return compile_shader_one(v, spill_constants, fold, fold_loop);
+}
+
+static bool
+compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop)
 {
    if (unlikely(!v))
       return false;
@@ -3514,6 +4055,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    if (s->info.stage == MESA_SHADER_COMPUTE) {
       v->uses_discard = false;
       v->cs_fold = 1;
+      v->dual16 = fold <= 1 && !v->dual16_off && !v->key.cs_single && dual16_early(c, s);
 
       if (fold > 1) {
          if (!etna_nir_fold_workgroup(s, fold, fold_loop, &v->cs_scratch_slots)) {
@@ -3568,14 +4110,16 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       NIR_PASS(narrow, s, nir_shader_instructions_pass, widen_16bit_image_access,
                nir_metadata_control_flow, NULL);
       NIR_PASS(narrow, s, nir_lower_mem_access_bit_sizes, &mem_opts);
-      NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
-      NIR_PASS(narrow, s, carry_half_phis_as_float);
-      NIR_PASS(narrow, s, fold_half_round_trips);
-      NIR_PASS(narrow, s, nir_opt_dce);
-      NIR_PASS(narrow, s, nir_shader_alu_pass, gather_half_conversions, nir_metadata_control_flow, NULL);
-      NIR_PASS(narrow, s, nir_shader_alu_pass, lower_fp16_conversion, nir_metadata_none, NULL);
-      NIR_PASS(narrow, s, nir_lower_fp16_casts, nir_lower_fp16_all);
-      NIR_PASS(narrow, s, nir_shader_alu_pass, lower_pack_32_2x16, nir_metadata_control_flow, NULL);
+      if (!v->dual16) { /* dual16: halves stay 16-bit */
+         NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
+         NIR_PASS(narrow, s, carry_half_phis_as_float);
+         NIR_PASS(narrow, s, fold_half_round_trips);
+         NIR_PASS(narrow, s, nir_opt_dce);
+         NIR_PASS(narrow, s, nir_shader_alu_pass, gather_half_conversions, nir_metadata_control_flow, NULL);
+         NIR_PASS(narrow, s, nir_shader_alu_pass, lower_fp16_conversion, nir_metadata_none, NULL);
+         NIR_PASS(narrow, s, nir_lower_fp16_casts, nir_lower_fp16_all);
+         NIR_PASS(narrow, s, nir_shader_alu_pass, lower_pack_32_2x16, nir_metadata_control_flow, NULL);
+      }
       NIR_PASS(narrow, s, nir_shader_alu_pass, fold_narrow_conversion,
                nir_metadata_control_flow, NULL);
       if (narrow) {
@@ -3599,7 +4143,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_image_access,
             nir_metadata_control_flow, &v->key);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_ssbo_access,
-            nir_metadata_control_flow, NULL);
+            nir_metadata_control_flow, v);
 
    /* setup input linking */
    struct etna_shader_io_file *sf = &v->infile;
@@ -3720,7 +4264,7 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
     * optimization loop: lower the narrow values left, as in compile_shader() */
    NIR_PASS(_, s, nir_shader_instructions_pass, widen_16bit_image_access,
             nir_metadata_control_flow, NULL);
-   for (unsigned i = 0; i < 8; i++) {
+   for (unsigned i = 0; i < 8 && !v->dual16; i++) {
       bool narrow = false;
       NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
       NIR_PASS(narrow, s, carry_half_phis_as_float);
@@ -3756,6 +4300,16 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
    /* needs to be the last pass that touches pass_flags! */
    NIR_PASS(_, s, etna_nir_lower_to_source_mods);
 
+   if (v->dual16) {
+      if (!dual16_check(c, s, true)) {
+         ralloc_free(c->nir);
+         free(c->code);
+         FREE(c);
+         return false;
+      }
+      c->d16 = rzalloc_array(c->nir, struct etna_d16_inst, ETNA_MAX_SHADER_INSTRUCTIONS);
+   }
+
    if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS))
       nir_print_shader(s, stdout);
 
@@ -3764,6 +4318,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    unsigned num_consts;
    bool ok = emit_shader(c, &v->num_temps, &num_consts);
+   if (ok && v->dual16)
+      ok = dual16_rewrite(c, v, ARRAY_SIZE(block_ptr));
    if (!ok || num_consts > max_uniforms(v)) {
       ralloc_free(c->nir);
       free(c->code);

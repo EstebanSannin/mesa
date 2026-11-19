@@ -82,6 +82,11 @@ static const struct etna_op_info etna_ops[] = {
    OPCT(f2u8,  F2I, TRUE, U8),
    OPCT(f2f16, CONV, TRUE, F16),
    OPCT(f2f32, CONV, TRUE, F32),
+   /* only in dual16 code, once per work-item, which writes its half of the
+    * result (see dual16_rewrite()) */
+   OPCT(f2f16_rtne, MOV, TRUE, F32),
+   UOP(u2f16, I2F),
+   IOP(i2f16, I2F),
    UOP(b2f32, AND), /* AND with fui(1.0f) */
    UOP(b2i32, AND), /* AND with 1 */
    UOP(b2i8, AND),  /* AND with 1 */
@@ -254,6 +259,16 @@ etna_emit_alu(struct etna_compile *c, nir_alu_instr *alu, struct etna_inst_dst d
       break;
    default:
       break;
+   }
+
+   /* dual16: a conversion between half and float is a move once per
+    * work-item, which reads its half of a packed register or its own full
+    * register (th) and writes its half or (.hp) a full register */
+   if (c->variant->dual16 &&
+       (op == nir_op_f2f16 || op == nir_op_f2f16_rtne || op == nir_op_f2f32)) {
+      inst.opcode = ISA_OPC_MOV;
+      inst.type = ISA_TYPE_F32;
+      inst.src[1] = (struct etna_inst_src){ 0 };
    }
 
    /* set the "true" value for CMP instructions */

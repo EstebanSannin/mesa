@@ -82,6 +82,11 @@ struct etna_shader_variant {
    struct etna_bo *bo; /* cached code memory bo handle (for icache) */
    struct etna_bo *constant_bo; /* uploaded copy of constant_data */
 
+   /* compute: compile in single mode (the dual16 compile failed) */
+   bool dual16_off;
+   /* compute: the state of a dual16 dispatch was printed (compiler_msgs) */
+   bool dual16_shown;
+
    /*
     * Below here is serialized when written to disk cache:
     */
@@ -162,6 +167,12 @@ struct etna_shader_variant {
 
    /* shader uses pixel kill/discard */
    bool uses_discard;
+
+   /* compute: two work-items per hardware thread, their halves packed
+    * (SH_CONFIG DUAL16, see dual16_rewrite()), and the id slots the hardware
+    * fills, two registers each */
+   bool dual16;
+   uint8_t dual16_inputs;
 };
 
 struct etna_varying {

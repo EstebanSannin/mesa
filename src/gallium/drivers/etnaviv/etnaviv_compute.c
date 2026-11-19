@@ -717,6 +717,15 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          goto out;
    }
 
+   /* dual16 runs work-items in pairs: an odd workgroup takes the single-mode
+    * variant */
+   if (v->dual16 && ((info->block[0] * info->block[1] * info->block[2]) & 1)) {
+      key.cs_single = 1;
+      v = etna_shader_variant(shader, &key, &ctx->base.debug, true);
+      if (!v)
+         goto out;
+   }
+
    ctx->shader.cs = v;
 
    uint32_t part[3];
@@ -825,7 +834,8 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
          resource_read(ctx, cb->cb[i].buffer);
    }
 
-   const unsigned input_count = MAX2(v->cs_input_count, 1);
+   /* dual16: id slots, two registers each (see dual16_rewrite()) */
+   const unsigned input_count = v->dual16 ? v->dual16_inputs : MAX2(v->cs_input_count, 1);
    /* a folded variant runs the workgroup as a row of ceil(block / fold)
     * threads */
    const unsigned fold = MAX2(v->cs_fold, 1);
@@ -838,9 +848,22 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    /* Threads of a workgroup that are resident at the same time, in units of
     * 4-wide threads per shader core. Too few and barrier() does not wait for the
     * whole workgroup; found by experiment on GC7000 r6204. */
+   /* dual16: two work-items per thread, half the threads (as NXP's driver) */
    const unsigned thread_alloc = ctx->compute_thread_alloc ? ctx->compute_thread_alloc :
-      DIV_ROUND_UP(block_size, 4 * ctx->screen->info->gpu.shader_core_count);
-   const unsigned num_temps = MAX3(v->num_temps, input_count, ctx->compute_min_temps);
+      DIV_ROUND_UP(block_size, (v->dual16 ? 8 : 4) * ctx->screen->info->gpu.shader_core_count);
+   const unsigned num_temps = MAX3(v->num_temps, v->dual16 ? 2 * input_count : input_count,
+                                   ctx->compute_min_temps);
+   /* dual16: PS_INPUT_COUNT DUAL16, and bit 24 as NXP's driver sets it */
+   const uint32_t input_dual16 = v->dual16 ? VIVS_PS_INPUT_COUNT_DUAL16 | 0x01000000 : 0;
+
+   if (v->dual16 && !v->dual16_shown && DBG_ENABLED(ETNA_DBG_COMPILER_MSGS)) {
+      v->dual16_shown = true;
+      fprintf(stderr, "etnaviv: dual16 dispatch: block %u, SH_CONFIG 0x%x, PS_INPUT_COUNT 0x%x, "
+              "PS_TEMP_REGISTER_CONTROL %u, CL_THREAD_ALLOCATION %u\n", block_size,
+              VIVS_SH_CONFIG_RTNE_ROUNDING | VIVS_SH_CONFIG_DUAL16,
+              VIVS_PS_INPUT_COUNT_COUNT(input_count) | VIVS_PS_INPUT_COUNT_UNK8(31) | input_dual16,
+              num_temps, thread_alloc);
+   }
    const unsigned num_inst = v->code_size / 4;
 
    /* With barrier() the whole workgroup must be resident at once, and the
@@ -930,13 +953,14 @@ etna_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       .bo = v->bo,
       .flags = ETNA_RELOC_READ,
    });
-   etna_set_state(stream, VIVS_SH_CONFIG, VIVS_SH_CONFIG_RTNE_ROUNDING);
+   etna_set_state(stream, VIVS_SH_CONFIG, VIVS_SH_CONFIG_RTNE_ROUNDING |
+                  COND(v->dual16, VIVS_SH_CONFIG_DUAL16));
    etna_set_state(stream, VIVS_SH_ICACHE_CONTROL, VIVS_SH_ICACHE_CONTROL_ENABLE);
    etna_set_state(stream, VIVS_PS_ICACHE_COUNT, num_inst - 1);
    etna_set_state(stream, VIVS_VS_ICACHE_INVALIDATE, 0x1f);
    etna_set_state(stream, VIVS_PS_INPUT_COUNT,
                   VIVS_PS_INPUT_COUNT_COUNT(input_count) |
-                  VIVS_PS_INPUT_COUNT_UNK8(31));
+                  VIVS_PS_INPUT_COUNT_UNK8(31) | input_dual16);
    etna_set_state(stream, VIVS_PS_TEMP_REGISTER_CONTROL,
                   VIVS_PS_TEMP_REGISTER_CONTROL_NUM_TEMPS(num_temps));
    etna_set_state(stream, VIVS_PS_CONTROL, VIVS_PS_CONTROL_RT_COUNT(7) | 0x800);
