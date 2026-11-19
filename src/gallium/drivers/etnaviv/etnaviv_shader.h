@@ -108,6 +108,10 @@ struct etna_shader_key
    unsigned tex_img_sampled : 32;
    unsigned tex_img_border : 32;
    unsigned tex_img_border_a1 : 32;
+   /* of tex_img_sampled, the textures clamped to the edge whose image
+    * descriptor clamps (class 3, see etna_image_format_word()): the shader
+    * loads at the texel as it is (imghwclamp.py) */
+   unsigned tex_img_hwclamp : 32;
    /* of tex_img_read, the textures of one level with an OpenCL sampler but
     * tex_img_sampled's, whose samples the shader does with that sampler (in
     * tex_il_*) as for the interleaved layout (lower_tex2d_il()), with the

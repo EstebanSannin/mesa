@@ -368,6 +368,17 @@ etna_compute_key_img_textures(const struct etna_context *ctx, const struct etna_
 
       if (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE) {
          key->tex_img_sampled |= BITFIELD_BIT(t);
+         /* the descriptor of a read-only normalized format has class 3,
+          * which clamps to the edge (NXP's clamp-to-edge descriptors) */
+         switch (sv->format) {
+         case PIPE_FORMAT_R8G8B8A8_UNORM:
+         case PIPE_FORMAT_R8G8B8A8_SNORM:
+         case PIPE_FORMAT_R16G16B16A16_UNORM:
+            key->tex_img_hwclamp |= BITFIELD_BIT(t);
+            break;
+         default:
+            break;
+         }
       } else if (ss->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER &&
                  !memcmp(&ss->border_color, &no_border, sizeof(no_border))) {
          key->tex_img_sampled |= BITFIELD_BIT(t);
