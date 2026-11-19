@@ -941,7 +941,7 @@ impl DeviceBase {
     }
 
     pub fn fp16_supported(&self) -> bool {
-        self.shader_caps().fp16
+        self.shader_caps().fp16 || self.screen.compute_caps().fp16
     }
 
     pub fn fp64_supported(&self) -> bool {
