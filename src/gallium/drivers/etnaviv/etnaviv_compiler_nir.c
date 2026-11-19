@@ -4311,6 +4311,17 @@ dual16_rewrite(struct etna_compile *c, struct etna_shader_variant *v, unsigned n
 
    if (!why && m > ETNA_MAX_SHADER_INSTRUCTIONS)
       why = "too long";
+   /* Two work-items per thread pay only where the code for both is clearly
+    * shorter than twice the code for one: packed half arithmetic. A kernel
+    * whose work is fp32 (clpeak's mixed precision: half conversions around
+    * fp32 multiply-adds) runs that work once per work-item, which doubles
+    * it for nothing. */
+   if (!why && 4 * m > 7 * (unsigned)c->inst_ptr)
+      why = "not shorter than single mode";
+   /* GC7000UL r6204 hangs on dual16 code longer than about 1024
+    * instructions (see ETNA_DUAL16_MAX_INSTRUCTIONS) */
+   if (!why && m > ETNA_DUAL16_MAX_INSTRUCTIONS)
+      why = "longer than the GPU runs in dual16";
    if (why) {
       free(out);
       free(at);
@@ -4341,7 +4352,8 @@ dual16_rewrite(struct etna_compile *c, struct etna_shader_variant *v, unsigned n
 static bool
 compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop);
 
-/* a dual16 compile that fails is retried in single mode */
+/* a dual16 compile that fails, or that dual16_rewrite() refuses, is retried
+ * in single mode */
 static bool
 compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fold, bool fold_loop)
 {

@@ -461,6 +461,12 @@ etna_ra_finish(struct etna_compile *c);
  * instruction count and ICACHE_COUNT within 16 bits */
 #define ETNA_MAX_SHADER_INSTRUCTIONS (65535)
 
+/* the longest dual16 code to emit (dual16_rewrite()): on GC7000UL r6204,
+ * dual16 code hangs the GPU above about 1024 instructions (one launch of
+ * straight-line packed half MADs ran at 1011, hung at 1031); 960 keeps a
+ * margin. Single-mode code has no such limit. */
+#define ETNA_DUAL16_MAX_INSTRUCTIONS 960
+
 static inline void
 emit_inst(struct etna_compile *c, struct etna_inst *inst)
 {
