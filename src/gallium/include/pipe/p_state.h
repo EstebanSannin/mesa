@@ -513,6 +513,9 @@ struct pipe_sampler_view
    unsigned swizzle_g:3;         /**< PIPE_SWIZZLE_x for green component */
    unsigned swizzle_b:3;         /**< PIPE_SWIZZLE_x for blue component */
    unsigned swizzle_a:3;         /**< PIPE_SWIZZLE_x for alpha component */
+   /** For YUV formats that the driver samples natively: */
+   enum pipe_yuv_color_space yuv_color_space:2; /**< PIPE_YUV_COLOR_SPACE_x */
+   bool yuv_full_range:1;        /**< full instead of narrow (video) range */
    struct pipe_resource *texture; /**< texture into which this is a view  */
    struct pipe_context *context; /**< context this view belongs to */
    union {

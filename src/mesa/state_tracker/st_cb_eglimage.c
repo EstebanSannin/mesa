@@ -685,10 +685,12 @@ st_bind_egl_image(struct gl_context *ctx,
    /* Cache whether the extra YUV plane-view / lowering setup in
     * st_get_sampler_views() and st_get_external_sampler_key() must run for
     * this texture. st_finalize_texture() returns early for surface_based
-    * textures without computing this.
+    * textures without computing this. A YUV format that the driver samples
+    * natively needs neither.
     */
    texObj->needs_yuv_plane_views = (stimg->format != texObj->pt->format ||
-                                    util_format_is_yuv(stimg->format));
+                                    (util_format_is_yuv(stimg->format) &&
+                                     !native_supported));
 
    switch (stimg->yuv_color_space) {
    case __DRI_YUV_COLOR_SPACE_ITU_REC709:

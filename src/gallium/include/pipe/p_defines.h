@@ -154,6 +154,13 @@ enum pipe_tex_compare {
    PIPE_TEX_COMPARE_R_TO_TEXTURE,
 };
 
+/** YUV to RGB conversion of a YUV format that the driver samples natively */
+enum pipe_yuv_color_space {
+   PIPE_YUV_COLOR_SPACE_BT601,
+   PIPE_YUV_COLOR_SPACE_BT709,
+   PIPE_YUV_COLOR_SPACE_BT2020,
+};
+
 enum pipe_tex_reduction_mode {
    PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE,
    PIPE_TEX_REDUCTION_MIN,
