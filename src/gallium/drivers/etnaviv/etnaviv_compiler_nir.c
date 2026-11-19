@@ -612,6 +612,9 @@ ra_def(struct etna_compile *c, nir_def *def, unsigned *p_swiz)
    };
 }
 
+static nir_if *
+branch_compare(const struct etna_compile *c, nir_alu_instr *alu);
+
 static void
 emit_alu(struct etna_compile *c, nir_alu_instr * alu)
 {
@@ -619,6 +622,10 @@ emit_alu(struct etna_compile *c, nir_alu_instr * alu)
 
    /* marked as dead instruction (vecN and other bypassed instr) */
    if (is_dead_instruction(&alu->instr))
+      return;
+
+   /* emitted by emit_if() as the branch */
+   if (branch_compare(c, alu))
       return;
 
    assert(!(alu->op >= nir_op_vec2 && alu->op <= nir_op_vec4));
@@ -1142,10 +1149,84 @@ emit_block(struct etna_compile *c, nir_block * block)
 static void
 emit_cf_list(struct etna_compile *c, struct exec_list *list);
 
+/* an integer compare the backend fuses into the branch of the if it is the
+ * condition of (see split_branch_compares()): the opposite test, which
+ * branches to the else block */
+static bool
+branch_compare_op(nir_op op, enum isa_cond *cond, enum isa_type *type)
+{
+   switch (op) {
+   case nir_op_ilt32: *cond = ISA_COND_GE; *type = ISA_TYPE_S32; return true;
+   case nir_op_ige32: *cond = ISA_COND_LT; *type = ISA_TYPE_S32; return true;
+   case nir_op_ult32: *cond = ISA_COND_GE; *type = ISA_TYPE_U32; return true;
+   case nir_op_uge32: *cond = ISA_COND_LT; *type = ISA_TYPE_U32; return true;
+   case nir_op_ieq32: *cond = ISA_COND_NE; *type = ISA_TYPE_U32; return true;
+   case nir_op_ine32: *cond = ISA_COND_EQ; *type = ISA_TYPE_U32; return true;
+   default: return false;
+   }
+}
+
+/* the if whose branch alu becomes: alu is a 32-bit scalar integer compare
+ * without source modifiers, the last instruction of its block, and only the
+ * condition of the if right after that block (single-mode code) */
+static nir_if *
+branch_compare(const struct etna_compile *c, nir_alu_instr *alu)
+{
+   enum isa_cond cond;
+   enum isa_type type;
+
+   if (c->nir->info.stage != MESA_SHADER_COMPUTE || c->variant->dual16 ||
+       (c->variant->cs_fold > 1 && !c->variant->cs_fold_loop) ||
+       !branch_compare_op(alu->op, &cond, &type) ||
+       alu->def.num_components != 1 || nir_src_bit_size(alu->src[0].src) != 32 ||
+       !list_is_singular(&alu->def.uses) || !nir_def_used_by_if(&alu->def) ||
+       nir_instr_next(&alu->instr))
+      return NULL;
+
+   for (unsigned i = 0; i < 2; i++) {
+      if (is_src_mod_neg(&alu->instr, i) || is_src_mod_abs(&alu->instr, i))
+         return NULL;
+   }
+
+   nir_cf_node *next = nir_cf_node_next(&alu->instr.block->cf_node);
+   if (!next || next->type != nir_cf_node_if)
+      return NULL;
+
+   nir_if *nif = nir_cf_node_as_if(next);
+   return nif->condition.ssa == &alu->def ? nif : NULL;
+}
+
 static void
 emit_if(struct etna_compile *c, nir_if * nif)
 {
-   etna_emit_jump(c, nir_if_first_else_block(nif)->index, get_src(c, &nif->condition));
+   nir_instr *cond_instr = nir_def_instr(nif->condition.ssa);
+   nir_alu_instr *cmp = cond_instr->type == nir_instr_type_alu ? nir_instr_as_alu(cond_instr) : NULL;
+   enum isa_cond cond;
+   enum isa_type type;
+
+   if (cmp && branch_compare(c, cmp) == nif && branch_compare_op(cmp->op, &cond, &type)) {
+      struct etna_inst inst = {
+         .opcode = ISA_OPC_BRANCH_BINARY,
+         .cond = cond,
+         .type = type,
+         .imm = nir_if_first_else_block(nif)->index,
+      };
+      for (unsigned i = 0; i < 2; i++) {
+         inst.src[i] = src_swizzle(get_src(c, &cmp->src[i].src), ALU_SWIZ(&cmp->src[i]));
+         if (inst.src[i].rgroup != ISA_REG_GROUP_IMMED)
+            inst.src[i].swiz = INST_SWIZ_BROADCAST(inst.src[i].swiz & 3);
+      }
+      /* an immediate goes second, as in NXP's code: the mirrored test */
+      if (inst.src[0].rgroup == ISA_REG_GROUP_IMMED) {
+         const struct etna_inst_src t = inst.src[0];
+         inst.src[0] = inst.src[1];
+         inst.src[1] = t;
+         inst.cond = cond == ISA_COND_GE ? ISA_COND_LE : cond == ISA_COND_LT ? ISA_COND_GT : cond;
+      }
+      emit_inst(c, &inst);
+   } else {
+      etna_emit_jump(c, nir_if_first_else_block(nif)->index, get_src(c, &nif->condition));
+   }
    emit_cf_list(c, &nif->then_list);
 
    /* jump at end of then_list to skip else_list
@@ -3721,6 +3802,92 @@ fold_imad_chain(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return false;
 }
 
+/* a single-use 32-bit scalar integer compare (see branch_compare_op()) */
+static nir_alu_instr *
+fusable_compare(nir_def *def)
+{
+   if (def->num_components != 1 || !list_is_singular(&def->uses) || !nir_def_is_alu(def))
+      return NULL;
+
+   nir_alu_instr *alu = nir_def_as_alu(def);
+   switch (alu->op) {
+   case nir_op_ilt32:
+   case nir_op_ige32:
+   case nir_op_ult32:
+   case nir_op_uge32:
+   case nir_op_ieq32:
+   case nir_op_ine32:
+      return nir_src_bit_size(alu->src[0].src) == 32 ? alu : NULL;
+   default:
+      return NULL;
+   }
+}
+
+/* The ifs that branch_compare() turns into compare-and-branches: if (a && b)
+ * with an empty else and no phi after it becomes if (a) { if (b) }, and the
+ * compare an if tests moves to the end of the block before the if, from
+ * earlier in that block (or from before the outer if of a split). */
+static bool
+split_branch_compares(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      bool impl_progress = false;
+      bool again = true;
+
+      while (again) {
+         again = false;
+         nir_foreach_block(block, impl) {
+            nir_if *nif = nir_block_get_following_if(block);
+            if (!nif)
+               continue;
+
+            nir_def *cond = nif->condition.ssa;
+            nir_alu_instr *cmp = fusable_compare(cond);
+
+            if (!cmp && nir_def_is_alu(cond) && list_is_singular(&cond->uses) &&
+                nir_def_as_alu(cond)->op == nir_op_iand && cond->num_components == 1) {
+               nir_alu_instr *and = nir_def_as_alu(cond);
+               nir_alu_instr *a = fusable_compare(and->src[0].src.ssa);
+               nir_alu_instr *b = fusable_compare(and->src[1].src.ssa);
+               nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
+
+               if (!a || !b || a == b || and->src[0].swizzle[0] || and->src[1].swizzle[0] ||
+                   !nir_cf_list_is_empty_block(&nif->else_list) || (nir_block_first_instr(after) &&
+                   nir_block_first_instr(after)->type == nir_instr_type_phi))
+                  continue;
+
+               nir_builder bld = nir_builder_at(nir_before_cf_node(&nif->cf_node));
+               nir_if *outer = nir_push_if(&bld, &a->def);
+               nir_pop_if(&bld, outer);
+
+               nir_src_rewrite(&nif->condition, &b->def);
+               nir_instr_remove(&and->instr);
+
+               nir_cf_list list;
+               nir_cf_extract(&list, nir_before_cf_node(&nif->cf_node), nir_after_cf_node(&nif->cf_node));
+               nir_cf_reinsert(&list, nir_after_cf_list(&outer->then_list));
+
+               nir_instr_move(nir_before_cf_node(&nif->cf_node), &b->instr);
+               nir_instr_move(nir_before_cf_node(&outer->cf_node), &a->instr);
+               impl_progress = again = true;
+               break;
+            }
+
+            if (cmp && cmp->instr.block == block && nir_instr_next(&cmp->instr)) {
+               nir_instr_move(nir_after_block(block), &cmp->instr);
+               impl_progress = true;
+            }
+         }
+      }
+
+      progress |= nir_progress(impl_progress, impl, nir_metadata_none);
+   }
+
+   return progress;
+}
+
 /* STORE.u8/u16 writes the low byte or half of its value: a mask of the
  * value that keeps those bits (the widening of an 8- or 16-bit value) is
  * not needed */
@@ -4909,6 +5076,13 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
    if (spill_constants)
       NIR_PASS(_, s, etna_nir_spill_constants);
 
+   /* compare-and-branch: single-mode compute code (dual16_rewrite() maps
+    * unary branches only; vertex and fragment shaders keep theirs), not
+    * folded by unrolling (OpenCV's GaussianBlur filters were slower with it
+    * on the board) */
+   if (s->info.stage == MESA_SHADER_COMPUTE && !v->dual16 && !(v->cs_fold > 1 && !v->cs_fold_loop))
+      NIR_PASS(_, s, split_branch_compares);
+
    /* needs to be the last pass that touches pass_flags! */
    NIR_PASS(_, s, etna_nir_lower_to_source_mods);
 
@@ -4925,6 +5099,12 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
    if (DBG_ENABLED(ETNA_DBG_DUMP_SHADERS))
       nir_print_shader(s, stdout);
 
+   /* block_ptr is indexed by block->index at emission: index the blocks
+    * now, split_branch_compares() added some after the last indexing (a
+    * stale num_blocks sized this array too small: the emission wrote past
+    * it on the stack, unless something such as the NIR printer of
+    * dump_shaders had indexed the blocks again) */
+   nir_metadata_require(nir_shader_get_entrypoint(s), nir_metadata_block_index);
    unsigned block_ptr[nir_shader_get_entrypoint(s)->num_blocks];
    c->block_ptr = block_ptr;
 
