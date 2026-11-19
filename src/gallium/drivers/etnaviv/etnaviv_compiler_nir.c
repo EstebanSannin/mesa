@@ -2800,6 +2800,63 @@ lower_fp16_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+/* OpenCL read_imageh and write_imageh: the texture unit and the image
+ * instructions work on 32-bit values. A 16-bit result is the 32-bit one
+ * converted (to nearest even: a texel of a half format converts exactly, one
+ * of an 8-bit normalized format rounds), a 16-bit value to store is widened
+ * first (exactly). */
+static bool
+widen_16bit_image_access(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   nir_def *def;
+   nir_alu_type type;
+
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (tex->def.bit_size != 16)
+         return false;
+      def = &tex->def;
+      type = nir_alu_type_get_base_type(tex->dest_type);
+      tex->dest_type = type | 32;
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_image_load:
+      case nir_intrinsic_image_deref_load:
+      case nir_intrinsic_bindless_image_load:
+         if (intr->def.bit_size != 16)
+            return false;
+         def = &intr->def;
+         type = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr));
+         nir_intrinsic_set_dest_type(intr, type | 32);
+         break;
+      case nir_intrinsic_image_store:
+      case nir_intrinsic_image_deref_store:
+      case nir_intrinsic_bindless_image_store: {
+         nir_def *value = intr->src[3].ssa;
+         if (value->bit_size != 16)
+            return false;
+         type = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
+         b->cursor = nir_before_instr(instr);
+         nir_src_rewrite(&intr->src[3], nir_type_convert(b, value, type | 16, type | 32,
+                                                         nir_rounding_mode_undef));
+         nir_intrinsic_set_src_type(intr, type | 32);
+         return true;
+      }
+      default:
+         return false;
+      }
+   } else {
+      return false;
+   }
+
+   def->bit_size = 32;
+   b->cursor = nir_after_instr(instr);
+   nir_def *narrow = nir_type_convert(b, def, type | 32, type | 16, nir_rounding_mode_undef);
+   nir_def_rewrite_uses_after(def, narrow);
+   return true;
+}
+
 /* no 8- or 16-bit arithmetic: do it in 32 bits */
 static unsigned
 etna_lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
@@ -3508,6 +3565,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
       }
 
       bool narrow = false;
+      NIR_PASS(narrow, s, nir_shader_instructions_pass, widen_16bit_image_access,
+               nir_metadata_control_flow, NULL);
       NIR_PASS(narrow, s, nir_lower_mem_access_bit_sizes, &mem_opts);
       NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
       NIR_PASS(narrow, s, carry_half_phis_as_float);
@@ -3659,6 +3718,8 @@ compile_shader(struct etna_shader_variant *v, bool spill_constants, unsigned fol
 
    /* private arrays of 8- and 16-bit values (OpenCL) only reach SSA in the
     * optimization loop: lower the narrow values left, as in compile_shader() */
+   NIR_PASS(_, s, nir_shader_instructions_pass, widen_16bit_image_access,
+            nir_metadata_control_flow, NULL);
    for (unsigned i = 0; i < 8; i++) {
       bool narrow = false;
       NIR_PASS(narrow, s, nir_lower_bit_size, etna_lower_bit_size_cb, NULL);
