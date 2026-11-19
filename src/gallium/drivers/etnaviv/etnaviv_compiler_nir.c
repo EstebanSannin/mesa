@@ -4119,6 +4119,246 @@ alu_width_cb(const nir_instr *instr, UNUSED const void *cb_data)
    return 4;
 }
 
+static uint8_t
+etna_vectorize_cb(const nir_instr *instr, UNUSED const void *data);
+
+static bool
+block_in_loop(nir_block *block, nir_loop *loop)
+{
+   for (nir_cf_node *n = &block->cf_node; n; n = n->parent) {
+      if (n == &loop->cf_node)
+         return true;
+   }
+   return false;
+}
+
+/* one phi for the phis of group (num_comps components in all): sources are
+ * vecs of theirs, their uses channels of it */
+static void
+pack_phi_group(nir_builder *b, nir_block *header, nir_loop *loop, nir_phi_instr **group,
+               unsigned count, unsigned num_comps)
+{
+   nir_scalar fwd[4], back[4];
+   nir_block *fwd_pred = NULL, *back_pred = NULL;
+   unsigned k = 0;
+
+   for (unsigned i = 0; i < count; i++) {
+      nir_foreach_phi_src(src, group[i]) {
+         const bool in = block_in_loop(src->pred, loop);
+         for (unsigned c = 0; c < group[i]->def.num_components; c++) {
+            if (in)
+               back[k + c] = nir_get_scalar(src->src.ssa, c);
+            else
+               fwd[k + c] = nir_get_scalar(src->src.ssa, c);
+         }
+         if (in)
+            back_pred = src->pred;
+         else
+            fwd_pred = src->pred;
+      }
+      k += group[i]->def.num_components;
+   }
+
+   nir_phi_instr *phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&phi->instr, &phi->def, num_comps, 32);
+   b->cursor = nir_after_block_before_jump(fwd_pred);
+   nir_phi_instr_add_src(phi, fwd_pred, nir_vec_scalars(b, fwd, num_comps));
+   b->cursor = nir_after_block_before_jump(back_pred);
+   nir_phi_instr_add_src(phi, back_pred, nir_vec_scalars(b, back, num_comps));
+   nir_instr_insert(nir_before_block(header), &phi->instr);
+
+   b->cursor = nir_after_phis(header);
+   k = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const unsigned n = group[i]->def.num_components;
+      nir_def_replace(&group[i]->def, nir_channels(b, &phi->def, BITFIELD_RANGE(k, n)));
+      k += n;
+   }
+}
+
+/* Independent chains carried by a loop in phis of their own (clpeak's
+ * x0..x3 = a * xi + b): the same operations on different values, which
+ * nir_opt_vectorize() merges only once the values are components of one SSA
+ * def. Group the 32-bit phis of 1-3 components whose back-edge value is made
+ * by the same ALU opcode into phis of up to four. */
+static bool
+pack_loop_phis(nir_shader *s)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_builder b = nir_builder_create(impl);
+      bool impl_progress = false;
+      nir_index_instrs(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_cf_node *parent = block->cf_node.parent;
+         if (parent->type != nir_cf_node_loop ||
+             nir_loop_first_block(nir_cf_node_as_loop(parent)) != block)
+            continue;
+         nir_loop *loop = nir_cf_node_as_loop(parent);
+
+         nir_phi_instr *cand[32];
+         nir_op op[32];
+         unsigned first_use[32];
+         bool taken[32] = { false };
+         unsigned n = 0;
+         nir_foreach_phi(phi, block) {
+            if (n == ARRAY_SIZE(cand))
+               break;
+            if (phi->def.bit_size != 32 || phi->def.num_components > 3)
+               continue;
+            nir_phi_src *back = NULL;
+            unsigned srcs = 0, fwds = 0;
+            nir_foreach_phi_src(src, phi) {
+               srcs++;
+               if (block_in_loop(src->pred, loop))
+                  back = src;
+               else
+                  fwds++;
+            }
+            if (srcs != 2 || fwds != 1 || !back)
+               continue;
+            /* the opcode that makes every component of the back-edge value
+             * (through movs and vecs: the phi of x1..x3 gets vec3(x1, x2.x,
+             * x2.y) when the narrowing of x1 stayed apart) */
+            bool same = true;
+            nir_op back_op = nir_num_opcodes;
+            for (unsigned c = 0; c < phi->def.num_components && same; c++) {
+               nir_scalar sc = nir_scalar_chase_movs(nir_get_scalar(back->src.ssa, c));
+               if (!nir_scalar_is_alu(sc) || (c && nir_scalar_alu_op(sc) != back_op))
+                  same = false;
+               else
+                  back_op = nir_scalar_alu_op(sc);
+            }
+            if (!same)
+               continue;
+            /* in the program order of their back-edge values:
+             * nir_opt_vectorize() puts the components of what it merges in
+             * program order, and the back-edge source is then the merged
+             * value as it is, no swizzle */
+            unsigned first = 0;
+            for (unsigned c = 0; c < phi->def.num_components; c++)
+               first = MAX2(first, nir_def_instr(nir_scalar_chase_movs(nir_get_scalar(back->src.ssa, c)).def)->index);
+            unsigned at = n;
+            while (at && first_use[at - 1] > first) {
+               cand[at] = cand[at - 1];
+               op[at] = op[at - 1];
+               first_use[at] = first_use[at - 1];
+               at--;
+            }
+            cand[at] = phi;
+            op[at] = back_op;
+            first_use[at] = first;
+            n++;
+         }
+
+         for (unsigned i = 0; i < n; i++) {
+            if (taken[i])
+               continue;
+            nir_phi_instr *group[4];
+            unsigned count = 0, comps = 0;
+            for (unsigned j = i; j < n && comps < 4; j++) {
+               if (taken[j] || op[j] != op[i] || comps + cand[j]->def.num_components > 4)
+                  continue;
+               group[count++] = cand[j];
+               comps += cand[j]->def.num_components;
+               taken[j] = true;
+            }
+            if (count < 2)
+               continue;
+            pack_phi_group(&b, block, loop, group, count, comps);
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_none);
+   }
+   return progress;
+}
+
+/* the ALU instructions in loops, roughly as emitted: a vec one move per
+ * source that isn't in its place already, an operation the backend splits
+ * one per component */
+static unsigned
+loop_alu_cost(nir_shader *s, const struct etna_core_info *info)
+{
+   unsigned cost = 0;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         bool in_any_loop = false;
+         for (nir_cf_node *n = block->cf_node.parent; n && !in_any_loop; n = n->parent)
+            in_any_loop = n->type == nir_cf_node_loop;
+         if (!in_any_loop)
+            continue;
+
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (nir_op_is_vec(alu->op)) {
+               for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+                  if (i == 0 || alu->src[i].src.ssa != alu->src[0].src.ssa ||
+                      alu->src[i].swizzle[0] != alu->src[0].swizzle[0] + i)
+                     cost++;
+               }
+            } else if (etna_alu_to_scalar_late_filter_cb(instr, info) ||
+                       (alu->op == nir_op_iadd && alu->def.bit_size == 32 &&
+                        ((nir_def_is_alu(alu->src[0].src.ssa) &&
+                          nir_def_as_alu(alu->src[0].src.ssa)->op == nir_op_imul) ||
+                         (nir_def_is_alu(alu->src[1].src.ssa) &&
+                          nir_def_as_alu(alu->src[1].src.ssa)->op == nir_op_imul)))) {
+               /* a 32-bit iadd of an imul becomes a scalar IMADLO0 late */
+               cost += alu->def.num_components;
+            } else {
+               cost++;
+            }
+         }
+      }
+   }
+   return cost;
+}
+
+static void
+vectorize_and_clean(nir_shader *s)
+{
+   /* the channels of a packed phi are movs until copy propagation, and
+    * nir_opt_vectorize() only merges users of the same def */
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   while (OPT(s, nir_opt_vectorize, etna_vectorize_cb, NULL));
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_dce);
+   NIR_PASS(_, s, nir_opt_cse);
+}
+
+/* pack_loop_phis() on a clone, kept where the vectorized loops get shorter */
+static void
+etna_pack_loop_chains(nir_shader *s, const struct etna_core_info *info)
+{
+   bool has_loop = false;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl)
+         has_loop |= block->cf_node.parent->type == nir_cf_node_loop;
+   }
+   if (!has_loop)
+      return;
+
+   nir_shader *trial = nir_shader_clone(ralloc_parent(s), s);
+   bool packed = false;
+   NIR_PASS(packed, trial, pack_loop_phis);
+   if (!packed) {
+      ralloc_free(trial);
+      return;
+   }
+
+   vectorize_and_clean(trial);
+   vectorize_and_clean(s);
+   if (loop_alu_cost(trial, info) < loop_alu_cost(s, info))
+      nir_shader_replace(s, trial);
+   else
+      ralloc_free(trial);
+}
+
 /* An intrinsic takes a scalar operand as a whole value, so a vector op that
  * only computes addresses (loads and stores of single components) needs a mov
  * per component back out of the vector: keep those scalar */
@@ -5366,6 +5606,9 @@ compile_shader_one(struct etna_shader_variant *v, bool spill_constants, unsigned
       NIR_PASS(_, s, nir_lower_bool_to_int32);
    }
 
+   /* independent loop-carried chains into one vector (slpchain.py) */
+   if (mesa_shader_stage_is_compute(s->info.stage) && !v->dual16)
+      etna_pack_loop_chains(s, c->info);
    while( OPT(s, nir_opt_vectorize, etna_vectorize_cb, NULL) );
    NIR_PASS(_, s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
 
