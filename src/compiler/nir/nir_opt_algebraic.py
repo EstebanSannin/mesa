@@ -1267,16 +1267,25 @@ for s in [16, 32, 64]:
        (('fadd', ('b2f{}'.format(s), ('flt', 0.0, 'a@{}'.format(s))), ('fneg', ('b2f{}'.format(s), ('flt', 'a@{}'.format(s), 0.0)))), ('fsign', a), match_fsign_cond),
        (('iadd', ('b2i{}'.format(s), ('flt', 0, 'a@{}'.format(s))), ('ineg', ('b2i{}'.format(s), ('flt', 'a@{}'.format(s), 0)))), ('f2i{}'.format(s), ('fsign', a)), match_fsign_cond),
 
-       # float? -> float? -> floatS ==> float? -> floatS
-       (('~f2f{}'.format(s), ('f2f', a)), ('f2f{}'.format(s), a)),
+       # float? -> float? -> floatS ==> float? -> floatS, where the middle
+       # conversion widens. A narrowing one rounds, which OpenCL's
+       # convert_half() and (half) casts are required to do.
+       (('~f2f{}'.format(s), ('f2f(is_widening_conversion)', a)), ('f2f{}'.format(s), a)),
 
-       # int? -> float? -> floatS ==> int? -> floatS
-       (('~f2f{}'.format(s), ('u2f', a)), ('u2f{}'.format(s), a)),
-       (('~f2f{}'.format(s), ('i2f', a)), ('i2f{}'.format(s), a)),
+       # int? -> float? -> floatS ==> int? -> floatS, where the middle float
+       # holds the int exactly (by type or range), or, to half, where the
+       # middle is fp32 or wider: it rounds only values of 2^24 or more,
+       # which are infinite as a half however they were rounded.
+       (('~f2f{}'.format(s), ('u2f', 'a(int_fits_float)')), ('u2f{}'.format(s), a)),
+       (('~f2f{}'.format(s), ('i2f', 'a(int_fits_float)')), ('i2f{}'.format(s), a)),
+       (('~f2f{}'.format(s), ('u2f(is_float32_or_wider)', a)), ('u2f{}'.format(s), a), 'true' if s == 16 else 'false'),
+       (('~f2f{}'.format(s), ('i2f(is_float32_or_wider)', a)), ('i2f{}'.format(s), a), 'true' if s == 16 else 'false'),
 
-       # float? -> float? -> intS ==> float? -> intS
-       (('~f2u{}'.format(s), ('f2f', a)), ('f2u{}'.format(s), a)),
-       (('~f2i{}'.format(s), ('f2f', a)), ('f2i{}'.format(s), a)),
+       # float? -> float? -> intS ==> float? -> intS, where the middle
+       # conversion widens (convert_int(convert_half(x)) rounds x to a half
+       # first).
+       (('~f2u{}'.format(s), ('f2f(is_widening_conversion)', a)), ('f2u{}'.format(s), a)),
+       (('~f2i{}'.format(s), ('f2f(is_widening_conversion)', a)), ('f2i{}'.format(s), a)),
 
        # HLSL's sign function returns an integer
        (('i2f{}'.format(s), ('f2i', ('fsign', 'a@{}'.format(s)))), ('fsign', a)),
