@@ -52,6 +52,10 @@ etna_compiler_create(const struct etna_core_info *info)
       .lower_mul_high = info->halti < 2,
       /* IMADLO0: a * b + c in one instruction, where IMULLO0 and ADD take two */
       .has_imad32 = true,
+      /* no fused multiply-add, an unfused MAD, and no fp32 denormals: vtn
+       * emulates OpenCL fma() inline, where libclc takes about twice the
+       * instructions and scalarizes vectors */
+      .emulate_ffma32_ftz = info->halti >= 2,
       .lower_hadd = true,
       .lower_uadd_sat = true,
       .lower_usub_sat = true,

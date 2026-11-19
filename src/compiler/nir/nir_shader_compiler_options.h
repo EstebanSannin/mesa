@@ -295,6 +295,14 @@ typedef struct nir_shader_compiler_options {
    nir_float_muladd_support float_mul_add16;
    nir_float_muladd_support float_mul_add32;
    nir_float_muladd_support float_mul_add64;
+   /**
+    * OpenCL fma() of fp32 without a fused multiply-add (float_mul_add32
+    * without has_ffma) is emulated inline by vtn, correctly rounded, instead
+    * of calling libclc. Only for a backend whose fp32 fmul and fadd round to
+    * nearest even, whose fmad is unfused, and which flushes fp32 denormal
+    * inputs and results to zero: the emulation relies on all three.
+    */
+   bool emulate_ffma32_ftz;
    bool lower_flrp16;
    bool lower_flrp32;
    /** Lowers flrp when it does not support doubles */

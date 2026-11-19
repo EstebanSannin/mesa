@@ -670,6 +670,183 @@ fma_pow2(nir_builder *nb, nir_def **srcs)
    return NULL;
 }
 
+/* One operand of fma_soft_ftz(): its exponent field e, the operand with
+ * the exponent 1 (x1, in [2, 4) with its sign), x1's upper 12 significand
+ * bits (xh) and the rest (xl), and e - 2^23 (xm, at least 0x7f000000 for
+ * zero, denormal, infinite or NaN). Halves of 12 bits make all four partial
+ * products of the exact product exact, and each of their partial sums. */
+struct fma_operand {
+   nir_def *e, *x1, *xh, *xl, *xm;
+};
+
+/* the scalar of a scalar or of a vector with the same one in every
+ * component (warpAffine's fma(v, (float3)ax, c)), NULL otherwise */
+static nir_def *
+fma_splat(nir_builder *nb, nir_def *x)
+{
+   nir_scalar s = nir_scalar_resolved(x, 0);
+   for (unsigned i = 1; i < x->num_components; i++) {
+      nir_scalar si = nir_scalar_resolved(x, i);
+      if (si.def != s.def || si.comp != s.comp)
+         return NULL;
+   }
+   return nir_channel(nb, s.def, s.comp);
+}
+
+static struct fma_operand
+fma_operand(nir_builder *nb, nir_def *x)
+{
+   struct fma_operand o;
+   nir_def *s = fma_splat(nb, x);
+
+   if (s) {
+      /* the three masks are one instruction, and so are x1, xh and xm (an
+       * add, which sets clear bits only); vector users swizzle them */
+      static const unsigned xxx[3] = {0, 0, 0};
+      nir_def *w = nir_iand(nb, nir_swizzle(nb, s, xxx, 3),
+                            nir_imm_ivec3(nb, 0x807fffff, 0x807ff000, 0x7f800000));
+      nir_def *v = nir_iadd(nb, w, nir_imm_ivec3(nb, 0x40000000, 0x40000000, -0x00800000));
+      o.e = nir_channel(nb, w, 2);
+      o.x1 = nir_channel(nb, v, 0);
+      o.xh = nir_channel(nb, v, 1);
+      o.xm = nir_channel(nb, v, 2);
+   } else {
+      o.e = nir_iand_imm(nb, x, 0x7f800000);
+      o.x1 = nir_ior_imm(nb, nir_iand_imm(nb, x, 0x807fffff), 0x40000000);
+      o.xh = nir_iand_imm(nb, o.x1, 0xfffff000);
+      o.xm = nir_iadd_imm(nb, o.e, -0x00800000);
+   }
+   o.xl = nir_fsub(nb, o.x1, o.xh);
+   return o;
+}
+
+/* fma() of fp32 for hardware without a fused multiply-add whose fp32 fmul
+ * and fadd round to nearest even, whose fmad is unfused, and which flushes
+ * fp32 denormal inputs and results to zero (emulate_ffma32_ftz).
+ *
+ * Boldo and Melquiond, "Emulation of FMA and correctly rounded sums: proved
+ * algorithms using rounding to odd" (IEEE TC 57(4), 2008), algorithm 5: the
+ * exact product uh + ul, TwoSum(c, uh) = th + tl, v = tl + ul rounded to odd,
+ * and th + v rounded to nearest is the correctly rounded a b + c, as long as
+ * nothing overflows or underflows. So a and b first get the exponent 1, and
+ * c is scaled by the same power of two.
+ *
+ * Branch-free and without an integer multiply, so that a vector fma() stays
+ * a vector on hardware whose integer multiply is scalar. On GC7000: about 48
+ * instructions for a scalar fma(), about 60 for a float3 or float4 one,
+ * where libclc's emulation with 32-bit operations takes 92 per component. */
+static nir_def *
+fma_soft_ftz(nir_builder *nb, nir_def **srcs)
+{
+   nir_def *a = srcs[0], *b = srcs[1], *c = srcs[2];
+   const unsigned n = c->num_components;
+   static const unsigned xx[2] = {0, 0};
+   const unsigned save_math_ctrl = nb->fp_math_ctrl;
+   nb->fp_math_ctrl = nir_fp_no_fast_math;
+
+   struct fma_operand oa = fma_operand(nb, a), ob = fma_operand(nb, b);
+   const bool scalar = oa.e->num_components == 1 && ob.e->num_components == 1;
+
+   /* a b = a1 b1 2^(p - 2), with p = Ea + Eb - 254. f1 f2 = 2^p: two normal
+    * factors (exponent fields floor and ceil of (Ea + Eb) / 2) on the same
+    * side of 1, so that a scaling by both over- or underflows only where the
+    * whole one does. g = f ^ 0x7f800000 is 2 / f, so g1 g2 = 2^(2 - p). */
+   nir_def *s = nir_iadd(nb, oa.e, ob.e);
+   nir_def *f1, *f2;
+   if (scalar) {
+      /* (Ea + Eb, Ea + Eb + 1) 2^23 & 0xff000000 is (floor, ceil)(.. / 2) 2^24 */
+      nir_def *f = nir_ushr_imm(nb, nir_iand_imm(nb, nir_iadd(nb, nir_swizzle(nb, s, xx, 2),
+                                                              nir_imm_ivec2(nb, 0, 0x00800000)),
+                                                 0xff000000), 1);
+      f1 = nir_channel(nb, f, 0);
+      f2 = nir_channel(nb, f, 1);
+   } else {
+      f1 = nir_ushr_imm(nb, nir_iand_imm(nb, s, 0xff000000), 1);
+      f2 = nir_iadd(nb, f1, nir_iand_imm(nb, s, 0x00800000));
+   }
+   nir_def *g1 = nir_ixor(nb, f1, nir_imm_int(nb, 0x7f800000));
+   nir_def *g2 = nir_ixor(nb, f2, nir_imm_int(nb, 0x7f800000));
+
+   /* c1 = c 2^(2 - p), plus tiny: c clamped to +-2^-100. tiny vanishes in
+    * any c1 that can change the rounding of a1 b1 + c1 (a multiple of
+    * 2^-44), and keeps the sign of a smaller c, which only decides a tie,
+    * when it is flushed. A zero or denormal c gives 0. c1 is infinite or NaN
+    * where c is, or is too large for a b to matter. The clamp needs no NaN
+    * rules: a NaN c makes c1 NaN anyway. */
+   nb->fp_math_ctrl = nir_fp_fast_math;
+   nir_def *tiny = nir_fmax_imm(nb, nir_fmin_imm(nb, c, 0x1p-100), -0x1p-100);
+   nb->fp_math_ctrl = nir_fp_no_fast_math;
+   nir_def *c1 = nir_fadd(nb, nir_fmul(nb, nir_fmul(nb, c, g1), g2), tiny);
+
+   /* uh + ul = a1 b1 */
+   nir_def *uh = nir_fmul(nb, oa.x1, ob.x1);
+   nir_def *t = nir_fsub(nb, nir_fmul(nb, oa.xh, ob.xh), uh);
+   t = nir_fadd(nb, nir_fmul(nb, oa.xh, ob.xl), t);
+   t = nir_fadd(nb, nir_fmul(nb, oa.xl, ob.xh), t);
+   nir_def *ul = nir_fadd(nb, nir_fmul(nb, oa.xl, ob.xl), t);
+
+   /* th + tl = c1 + uh */
+   nir_def *th = nir_fadd(nb, c1, uh);
+   nir_def *bb = nir_fsub(nb, th, c1);
+   nir_def *tl = nir_fadd(nb, nir_fsub(nb, c1, nir_fsub(nb, th, bb)), nir_fsub(nb, uh, bb));
+
+   /* v = tl + ul rounded to odd: sv + e = tl + ul, and an inexact sv moves
+    * one step toward e (bits - 1 where the signs differ) and gets an odd
+    * last bit. e is never -0: the second term of its sum never is. */
+   nir_def *sv = nir_fadd(nb, tl, ul);
+   nir_def *b2 = nir_fsub(nb, sv, tl);
+   nir_def *e = nir_fadd(nb, nir_fsub(nb, tl, nir_fsub(nb, sv, b2)), nir_fsub(nb, ul, b2));
+   nir_def *odd = nir_ior_imm(nb, nir_iadd(nb, sv, nir_ishr_imm(nb, nir_ixor(nb, sv, e), 31)), 1);
+   nir_def *v = nir_bcsel(nb, nir_ine_imm(nb, e, 0), odd, sv);
+   nir_def *r = nir_fadd(nb, th, v);
+
+   /* r 2^(p - 2): exact, or the infinity of the result, or below FLT_MIN.
+    * There the result is 0 (flushed), but a multiply rounds to the denormal
+    * grid before it flushes: a 24-bit 2^-126 - 2^-150 becomes FLT_MIN. The
+    * same scaling of |r| without its last bit is then an exact denormal and
+    * flushed, and so is any other value below FLT_MIN, where it is FLT_MIN
+    * or more for every result that is: where it is +0, so is the result.
+    * x = r 0.25 f1 has the last bit of r: below the normal range it would
+    * need a result below 2^-127 with f2 > 1, so p > 0, and then the result
+    * is a multiple of 2^-44 times something far larger. */
+   nir_def *x = nir_fmul(nb, nir_fmul_imm(nb, r, 0.25), f1);
+   nir_def *rs = nir_fmul(nb, x, f2);
+   nir_def *re = nir_fmul(nb, nir_iand_imm(nb, x, 0x7ffffffe), f2);
+   nir_def *res = nir_bcsel(nb, nir_ine_imm(nb, re, 0), rs, re);
+   /* c infinite, NaN, or too large for a b to matter: c. r is NaN there
+    * (c1 - c1), and res is NaN just where r is. */
+   res = nir_bcsel(nb, nir_feq(nb, res, res), res, c);
+   /* a or b zero, denormal, infinite or NaN: the multiply-add is exact */
+   res = nir_bcsel(nb, nir_uge_imm(nb, nir_umax(nb, oa.xm, ob.xm), 0x7f000000),
+                   nir_fadd(nb, nir_fmul(nb, a, b), c), res);
+
+   nb->fp_math_ctrl = save_math_ctrl;
+   assert(res->num_components == n);
+   return res;
+}
+
+/* fma_soft_ftz() in pieces of up to four components, one after the other: a
+ * float8 or float16 at once needs more registers than there are */
+static nir_def *
+fma_soft_ftz_vec(nir_builder *nb, nir_def **srcs)
+{
+   const unsigned n = srcs[0]->num_components;
+   if (n <= 4)
+      return fma_soft_ftz(nb, srcs);
+
+   nir_def *res[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < n; i += 4) {
+      const unsigned k = MIN2(4, n - i);
+      nir_def *part[3];
+      for (unsigned j = 0; j < 3; j++)
+         part[j] = nir_channels(nb, srcs[j], BITFIELD_RANGE(i, k));
+      nir_def *r = fma_soft_ftz(nb, part);
+      for (unsigned j = 0; j < k; j++)
+         res[i + j] = nir_channel(nb, r, j);
+   }
+   return nir_vec(nb, res, n);
+}
+
 static nir_def *
 handle_special(struct vtn_builder *b, uint32_t opcode,
                unsigned num_srcs, nir_def **srcs, struct vtn_type **src_types,
@@ -771,6 +948,8 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
             nb->fp_math_ctrl = save_math_ctrl;
             if (res)
                return res;
+            if (nb->shader->options->emulate_ffma32_ftz)
+               return fma_soft_ftz_vec(nb, srcs);
          }
          break;
       }
