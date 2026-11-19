@@ -449,6 +449,48 @@ has_multiple_uses(const nir_search_state *state, const nir_alu_instr *instr,
           !list_is_singular(&instr->def.uses);
 }
 
+/* a conversion whose result is at least as wide as its source (exact for
+ * float to float) */
+static inline bool
+is_widening_conversion(const nir_alu_instr *instr)
+{
+   return instr->def.bit_size >= instr->src[0].src.ssa->bit_size;
+}
+
+static inline bool
+is_float32_or_wider(const nir_alu_instr *instr)
+{
+   return instr->def.bit_size >= 32;
+}
+
+/* The source of the int-to-float conversion instr is an int that the float
+ * holds exactly: by its type (it fits the float's significand, 11, 24 or 53
+ * bits), or by its range (from 0 to below 2^significand, as an image
+ * coordinate or an id). */
+static inline bool
+int_fits_float(UNUSED const nir_search_state *state, const nir_alu_instr *instr,
+               unsigned src, unsigned num_components, const uint8_t *swizzle)
+{
+   const unsigned significand = instr->def.bit_size == 16 ? 11 : instr->def.bit_size == 32 ? 24 :
+                                instr->def.bit_size == 64 ? 53 : 0;
+   const unsigned bits = nir_src_bit_size(instr->src[src].src);
+
+   if (bits == 1 || bits <= significand)
+      return true;
+   if (!significand || significand >= 32 || bits > 32)
+      return false;
+
+   nir_shader *shader = nir_cf_node_get_function(&instr->instr.block->cf_node)->function->shader;
+   struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+   bool fits = true;
+   for (unsigned i = 0; i < num_components && fits; i++) {
+      const nir_scalar s = nir_get_scalar(instr->src[src].src.ssa, swizzle[i]);
+      fits = nir_unsigned_upper_bound(shader, range_ht, s) < (1u << significand);
+   }
+   _mesa_hash_table_destroy(range_ht, NULL);
+   return fits;
+}
+
 static inline bool
 is_used_once(const nir_alu_instr *instr)
 {

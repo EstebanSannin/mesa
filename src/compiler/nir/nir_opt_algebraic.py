@@ -1256,27 +1256,38 @@ for s in [16, 32, 64]:
        # "the conversion doesn't happen at all."
        (('~i2f{}'.format(s), ('f2i', 'a@{}'.format(s))), ('ftrunc', a)),
 
-       # Ironically, mark these as imprecise because removing the conversions may
-       # preserve more precision than doing the conversions (e.g.,
-       # uint(float(0x81818181u)) == 0x81818200).
-       (('~f2i{}'.format(s), ('i2f', 'a@{}'.format(s))), a),
-       (('~f2i{}'.format(s), ('u2f', 'a@{}'.format(s))), a),
-       (('~f2u{}'.format(s), ('i2f', 'a@{}'.format(s))), a),
-       (('~f2u{}'.format(s), ('u2f', 'a@{}'.format(s))), a),
+       # int -> float -> int ==> int, where the float holds the int exactly
+       # (by its type, or by its range: an image coordinate, an id).
+       # Otherwise the conversion to float rounds (OpenCL's
+       # convert_int(convert_float(16777217)) is 16777216), and dropping it
+       # changes the result.
+       (('~f2i{}'.format(s), ('i2f', 'a@{}(int_fits_float)'.format(s))), a),
+       (('~f2i{}'.format(s), ('u2f', 'a@{}(int_fits_float)'.format(s))), a),
+       (('~f2u{}'.format(s), ('i2f', 'a@{}(int_fits_float)'.format(s))), a),
+       (('~f2u{}'.format(s), ('u2f', 'a@{}(int_fits_float)'.format(s))), a),
 
        (('fadd', ('b2f{}'.format(s), ('flt', 0.0, 'a@{}'.format(s))), ('fneg', ('b2f{}'.format(s), ('flt', 'a@{}'.format(s), 0.0)))), ('fsign', a), match_fsign_cond),
        (('iadd', ('b2i{}'.format(s), ('flt', 0, 'a@{}'.format(s))), ('ineg', ('b2i{}'.format(s), ('flt', 'a@{}'.format(s), 0)))), ('f2i{}'.format(s), ('fsign', a)), match_fsign_cond),
 
-       # float? -> float? -> floatS ==> float? -> floatS
-       (('~f2f{}'.format(s), ('f2f', a)), ('f2f{}'.format(s), a)),
+       # float? -> float? -> floatS ==> float? -> floatS, where the middle
+       # conversion widens. A narrowing one rounds, which OpenCL's
+       # convert_half() and (half) casts are required to do.
+       (('~f2f{}'.format(s), ('f2f(is_widening_conversion)', a)), ('f2f{}'.format(s), a)),
 
-       # int? -> float? -> floatS ==> int? -> floatS
-       (('~f2f{}'.format(s), ('u2f', a)), ('u2f{}'.format(s), a)),
-       (('~f2f{}'.format(s), ('i2f', a)), ('i2f{}'.format(s), a)),
+       # int? -> float? -> floatS ==> int? -> floatS, where the middle float
+       # holds the int exactly (by type or range), or, to half, where the
+       # middle is fp32 or wider: it rounds only values of 2^24 or more,
+       # which are infinite as a half however they were rounded.
+       (('~f2f{}'.format(s), ('u2f', 'a(int_fits_float)')), ('u2f{}'.format(s), a)),
+       (('~f2f{}'.format(s), ('i2f', 'a(int_fits_float)')), ('i2f{}'.format(s), a)),
+       (('~f2f{}'.format(s), ('u2f(is_float32_or_wider)', a)), ('u2f{}'.format(s), a), 'true' if s == 16 else 'false'),
+       (('~f2f{}'.format(s), ('i2f(is_float32_or_wider)', a)), ('i2f{}'.format(s), a), 'true' if s == 16 else 'false'),
 
-       # float? -> float? -> intS ==> float? -> intS
-       (('~f2u{}'.format(s), ('f2f', a)), ('f2u{}'.format(s), a)),
-       (('~f2i{}'.format(s), ('f2f', a)), ('f2i{}'.format(s), a)),
+       # float? -> float? -> intS ==> float? -> intS, where the middle
+       # conversion widens (convert_int(convert_half(x)) rounds x to a half
+       # first).
+       (('~f2u{}'.format(s), ('f2f(is_widening_conversion)', a)), ('f2u{}'.format(s), a)),
+       (('~f2i{}'.format(s), ('f2f(is_widening_conversion)', a)), ('f2i{}'.format(s), a)),
 
        # HLSL's sign function returns an integer
        (('i2f{}'.format(s), ('f2i', ('fsign', 'a@{}'.format(s)))), ('fsign', a)),
@@ -3951,6 +3962,20 @@ late_optimizations.extend([
    # Round to the nearest integer using ffloor and ffract, and on a half break
    # the tie towards the even neighbour. Kept in late_optimizations so that
    # is_integral() can remove the roundEven first.
+   # The sign of a goes into the result: a zero result keeps it (rint(-0.5) is
+   # -0.0), and a nonzero one has it already.
+   # With a rounding conversion to integer, below 2^23 (above, a float is an
+   # integer already, and NaN and infinities stay as they are).
+   (('fround_even', 'a@32'), ('bcsel', ('flt', ('fabs', a), 8388608.0),
+                              ('ior', ('i2f32', ('f2i32_rtne', a)), ('iand', a, 0x80000000)),
+                              a), 'options->lower_fround_even && options->has_f2i32_rtne'),
+   (('fround_even', 'a@32'), ('ior', ('fadd', ('ffloor', a),
+                                     ('bcsel', ('flt', 0.5, ('ffract', a)),
+                                      1.0,
+                                      ('bcsel', ('feq', ('ffract', a), 0.5),
+                                       ('fmul', ('ffract', ('fmul', ('ffloor', a), 0.5)), 2.0),
+                                       0.0))),
+                             ('iand', a, 0x80000000)), 'options->lower_fround_even'),
    (('fround_even', a), ('fadd', ('ffloor', a),
                          ('bcsel', ('flt', 0.5, ('ffract', a)),
                           1.0,
