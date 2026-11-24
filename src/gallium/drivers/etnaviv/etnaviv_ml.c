@@ -1523,8 +1523,12 @@ etna_ml_subgraph_invoke(struct pipe_context *pctx, struct pipe_ml_subgraph *psub
    struct etna_context *ctx = etna_context(pctx);
    unsigned tp_core_count = etna_ml_get_core_info(ctx->screen)->tp_core_count;
    struct etna_ml_subgraph *subgraph = (struct etna_ml_subgraph *)(psubgraph);
-   struct etna_cmd_stream *stream = ctx->stream;
+   struct etna_cmd_stream *stream;
    static bool is_initialized = false;
+
+   /* a compute-only context starts on the GPU when it can run compute shaders */
+   etna_context_use_npu(ctx);
+   stream = ctx->stream;
 
    if (!is_initialized) {
       init_npu(pctx);
